@@ -90,29 +90,35 @@ pub fn fork_and_exec(
             redirect_stdio(&log_dir);
 
             if let Err(e) = do_pivot_root(&rootfs) {
-                eprintln!("pivot_root failed: {e}");
-                std::process::exit(1);
+                let msg = format!("pivot_root failed: {e}\n");
+                unsafe {
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(1);
+                }
             }
 
             if let Some(ref h) = hostname {
                 let _ = nix::unistd::sethostname(h);
             }
 
-            for (key, _) in std::env::vars() {
-                std::env::remove_var(&key);
-            }
-            for var in &env_vars {
-                let s = var.to_string_lossy();
-                if let Some((k, v)) = s.split_once('=') {
-                    std::env::set_var(k, v);
+            // Set environment using libc directly — std::env::* are NOT
+            // async-signal-safe (they hold a global mutex that may be held
+            // by another thread in the parent process after fork).
+            unsafe {
+                libc::clearenv();
+                for var in &env_vars {
+                    libc::putenv(var.as_ptr() as *mut libc::c_char);
                 }
             }
 
             let _ = nix::unistd::chdir(cwd_cstr.as_c_str());
 
             let err = nix::unistd::execvp(&c_args[0], &c_args);
-            eprintln!("execvp failed: {err:?}");
-            std::process::exit(127);
+            let msg = format!("execvp failed: {err:?}\n");
+            unsafe {
+                let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                libc::_exit(127);
+            }
         }
         ForkResult::Parent { child } => {
             drop(pipe_rd);

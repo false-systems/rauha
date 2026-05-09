@@ -64,6 +64,15 @@ pub fn fork_and_exec_pty(
         .map(|e| CString::new(e.as_str()).unwrap())
         .collect();
 
+    // Pre-allocate the TERM fallback before fork so the child can putenv it
+    // without allocating. Only use it if the caller didn't already provide TERM.
+    let has_term = env.iter().any(|e| e.starts_with("TERM="));
+    let term_fallback: Option<CString> = if !has_term {
+        Some(CString::new("TERM=xterm-256color").unwrap())
+    } else {
+        None
+    };
+
     match unsafe { unistd::fork() }? {
         ForkResult::Child => {
             drop(pty.master);
@@ -84,28 +93,33 @@ pub fn fork_and_exec_pty(
 
             // Chroot into container rootfs.
             if let Err(e) = nix::unistd::chroot(&rootfs) {
-                eprintln!("chroot failed: {e}");
-                std::process::exit(1);
+                let msg = format!("chroot failed: {e}\n");
+                unsafe {
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(1);
+                }
             }
             let _ = nix::unistd::chdir("/");
 
-            // Set environment.
-            for (key, _) in std::env::vars() {
-                std::env::remove_var(&key);
-            }
-            for var in &c_env {
-                let s = var.to_string_lossy();
-                if let Some((k, v)) = s.split_once('=') {
-                    std::env::set_var(k, v);
+            // Set environment using libc directly — std::env::* are NOT
+            // async-signal-safe (they hold a global mutex that may be held
+            // by another thread in the parent process after fork).
+            unsafe {
+                libc::clearenv();
+                for var in &c_env {
+                    libc::putenv(var.as_ptr() as *mut libc::c_char);
                 }
-            }
-            if std::env::var("TERM").is_err() {
-                std::env::set_var("TERM", "xterm-256color");
+                if let Some(ref t) = term_fallback {
+                    libc::putenv(t.as_ptr() as *mut libc::c_char);
+                }
             }
 
             let err = nix::unistd::execvp(&c_args[0], &c_args);
-            eprintln!("execvp failed: {err:?}");
-            std::process::exit(127);
+            let msg = format!("execvp failed: {err:?}\n");
+            unsafe {
+                let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                libc::_exit(127);
+            }
         }
         ForkResult::Parent { child } => {
             drop(pty.slave);
