@@ -2,15 +2,34 @@
 
 Honest documentation of what Rauha can and cannot guarantee.
 
+Rauha is an agent sandbox runtime built on controlled execution zones. It owns
+zone lifecycle, container/task execution, policy loading, metadata, networking,
+logs, and user-facing event surfaces.
+
+Rauha creates the zones. Syva makes the Linux kernel respect them.
+
+The Linux kernel enforcement code currently lives in this repository as a
+transitional implementation. Architecturally, those eBPF LSM programs, BPF
+maps, ring buffer events, counters, and kernel self-tests belong behind the
+Syva enforcement boundary. This distinction matters: Rauha is the runtime and
+zone control plane, not the kernel enforcement product.
+
 ## Isolation Models
 
-Rauha uses fundamentally different enforcement on each platform.
+Rauha exposes fundamentally different isolation models on each platform.
 They are **not equivalent** — each has different strengths and weaknesses.
 
-### Linux: Per-Syscall Software Policy (eBPF LSM)
+### Linux: Per-Syscall Software Policy (Syva/eBPF LSM)
 
-Every security-relevant syscall (file_open, kill, ptrace, exec, cgroup_attach)
-is intercepted by eBPF programs that check zone membership in BPF maps.
+On Linux, zone boundaries can be enforced by eBPF LSM programs that check
+zone membership in BPF maps on security-relevant operations such as
+file_open, exec, ptrace, signal delivery, cgroup attach, capability checks,
+and socket connect.
+
+In the current transitional codebase, `rauhad` still loads and manages these
+programs directly from `rauhad/src/backend/linux/` and `rauha-ebpf/`.
+The target architecture moves this behind Syva while keeping Rauha as the
+runtime API and event surface.
 
 **Strengths:**
 - Granular observability — every denied operation is visible
@@ -60,6 +79,11 @@ protocol as the Linux shim.
 status or interprets enforcement events **must** check this field.
 A report from Linux and macOS cannot be compared directly.
 
+Agent sandbox results should treat enforcement events as an optional stream:
+Linux/Syva-backed zones can populate them, macOS VM-backed zones may expose
+different audit information, and unsupported/degraded Linux hosts may have no
+kernel enforcement events at all.
+
 ## Known Limitations
 
 ### Shim Privilege Window (Linux, Phase 3)
@@ -71,10 +95,10 @@ necessary but creates a privilege window:
 1. Shim starts in host namespace with elevated privileges
 2. Shim creates zone namespace infrastructure
 3. Shim forks container process into zone
-4. eBPF enforcement is fully active
+4. Syva/eBPF enforcement is fully active
 
 Between steps 1-3, a compromised shim can manipulate zone setup before
-eBPF enforcement is in place. Mitigations planned:
+kernel enforcement is in place. Mitigations planned:
 - Minimize shim capabilities to only what's needed for setup
 - Drop privileges immediately after namespace setup
 - Validate zone state before marking it Ready (verify_isolation check)
@@ -95,34 +119,35 @@ This is a known hard problem. containerd and gVisor both learned this:
 - containerd uses pid namespaces (structural) + procfs masking (defense-in-depth)
 - gVisor reimplements procfs entirely (expensive, complete)
 
-Rauha's approach: pid namespaces provide the structural isolation, eBPF
-proc filtering is defense-in-depth. We document it as such, not as primary
-enforcement.
+Rauha's approach: pid namespaces provide the structural isolation, and
+Syva/eBPF proc filtering is defense-in-depth. We document it as such, not as
+primary isolation.
 
-### BPF Map / Metadata Consistency (Linux)
+### Kernel Enforcement / Metadata Consistency (Linux)
 
-BPF maps (in-kernel enforcement state) and redb (persisted policy) are
-separate stores. If rauhad crashes between updating one and the other,
-they can diverge.
+BPF maps (current in-kernel enforcement state) and redb (Rauha's persisted
+zone/policy metadata) are separate stores. If rauhad crashes between updating
+one and the other, they can diverge.
 
 **Recovery:** On startup, rauhad reconciles by treating redb as the source
-of truth. It re-pushes all zone policies to BPF maps, re-creates missing
-cgroups and network namespaces, and cleans up orphaned kernel state.
+of truth. It re-pushes all zone policies to the current kernel enforcement
+boundary, re-creates missing cgroups and network namespaces, and cleans up
+orphaned kernel state.
 See `ZoneRegistry::reconcile()`.
 
 **Remaining gap:** During the window between rauhad crash and restart,
-stale BPF maps continue enforcing the old policy. This is acceptable
+stale kernel enforcement maps continue enforcing the old policy. This is acceptable
 because stale policy is either correct (crash happened before redb write)
 or more restrictive than intended (crash happened after redb write but
-before BPF update relaxed a policy). Policy updates are never less
+before the kernel-enforcement update relaxed a policy). Policy updates are never less
 restrictive during this window.
 
 ### ptrace and signal Guards (Linux)
 
-The ptrace_access_check and task_kill eBPF guards are incomplete. They
-can identify the calling process's zone but cannot reliably determine the
-target process's zone without CO-RE BTF support for cross-kernel
-`task_struct` field access.
+The ptrace_access_check and task_kill guards in the current in-repo eBPF
+implementation are incomplete. They can identify the calling process's zone
+but cannot reliably determine the target process's zone without CO-RE BTF
+support for cross-kernel `task_struct` field access.
 
 Current state: these guards check if the caller is in a zone with ptrace
 allowed, but do not verify the target is in the same zone. Full cross-zone
@@ -146,9 +171,11 @@ daemon crash — there is no way to reattach to a VM that was destroyed.
 
 ### Kernel Version Sensitivity (Linux)
 
-eBPF programs use hardcoded struct offsets (e.g., `struct file->f_inode`
-at offset 32). These are correct for Linux 6.1+ but may break on future
-kernels that change struct layouts.
+The current in-repo eBPF programs use hardcoded struct offsets (e.g.,
+`struct file->f_inode` at offset 32). These are correct for Linux 6.1+ but
+may break on future kernels that change struct layouts.
 
 Fix: migrate to CO-RE (Compile Once, Run Everywhere) using BTF-based
-field access. Aya supports this but it adds build complexity.
+field access. Aya supports this but it adds build complexity. Longer-term,
+this kernel compatibility work belongs in Syva, with Rauha consuming the
+result through an enforcement boundary.
