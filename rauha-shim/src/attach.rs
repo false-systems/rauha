@@ -215,8 +215,11 @@ pub fn fork_and_exec_pty(
 
             // Chroot into container rootfs.
             if let Err(e) = nix::unistd::chroot(&rootfs) {
-                eprintln!("chroot failed: {e}");
-                std::process::exit(1);
+                let msg = format!("chroot failed: {e}\n");
+                unsafe {
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(1);
+                }
             }
             let _ = nix::unistd::chdir("/");
 
@@ -234,8 +237,11 @@ pub fn fork_and_exec_pty(
             }
 
             let err = nix::unistd::execvp(&c_args[0], &c_args);
-            eprintln!("execvp failed: {err:?}");
-            std::process::exit(127);
+            let msg = format!("execvp failed: {err:?}\n");
+            unsafe {
+                let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                libc::_exit(127);
+            }
         }
         ForkResult::Parent { child } => {
             drop(pipe_rd);
