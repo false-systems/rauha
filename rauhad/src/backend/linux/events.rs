@@ -1,6 +1,6 @@
 //! Enforcement event reader — drains the BPF ring buffer in a background task.
 //!
-//! Deny events from all 5 LSM hooks are streamed here, logged via tracing,
+//! Deny events from all 7 LSM hooks are streamed here, logged via tracing,
 //! and broadcast to any gRPC WatchEvents subscribers.
 
 use std::time::Duration;

@@ -1,8 +1,9 @@
-//! rauha-enforce — standalone eBPF enforcement agent.
+//! rauha-enforce — workload discovery and zone-mapping agent.
 //!
-//! Drops kernel-level zone enforcement onto existing containerd/Docker clusters.
-//! No runtime replacement needed. Watches container events, maps workloads to
-//! zones by label, and populates BPF maps.
+//! Watches existing containerd/Docker workloads, maps them to Rauha zones, and
+//! programs the current kernel enforcement boundary. Architecturally, that
+//! boundary belongs to Syva: Rauha creates zones, Syva makes the Linux kernel
+//! respect them.
 //!
 //! Usage:
 //!   rauha-enforce --policy-dir /etc/rauha/policies/
@@ -24,7 +25,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "rauha-enforce", about = "eBPF enforcement agent for container isolation")]
+#[command(name = "rauha-enforce", about = "Map existing workloads to Rauha zones")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -218,7 +219,7 @@ fn print_status_summary(
         .collect();
 
     tracing::info!(
-        programs = "5/5",
+        programs = "7/7",
         zones = zone_names.len(),
         containers_enforced = enforced,
         "enforcement active"

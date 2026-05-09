@@ -5,9 +5,11 @@ use crate::zone::{IsolationModel, IsolationReport, ZoneConfig, ZoneHandle, ZoneP
 
 /// The core abstraction for platform-specific isolation.
 ///
-/// Both Linux (eBPF + namespaces) and macOS (Virtualization.framework + sandbox)
-/// backends implement this trait. `rauhad` uses `dyn IsolationBackend` to remain
-/// platform-agnostic.
+/// Linux and macOS backends implement this trait. `rauhad` uses
+/// `dyn IsolationBackend` to remain platform-agnostic while Rauha keeps
+/// ownership of user-facing zone lifecycle. Linux kernel enforcement currently
+/// lives in this repository, but the architectural boundary is Syva-backed:
+/// Rauha creates zones; Syva makes the Linux kernel respect them.
 pub trait IsolationBackend: Send + Sync {
     /// Create a new isolation zone.
     fn create_zone(&self, config: &ZoneConfig) -> Result<ZoneHandle>;

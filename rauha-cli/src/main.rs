@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use commands::output::OutputMode;
 
 #[derive(Parser)]
-#[command(name = "rauha", version, about = "Zones-like container runtime")]
+#[command(name = "rauha", version, about = "Agent sandbox runtime built on controlled execution zones")]
 struct Cli {
     /// Output JSON instead of human-readable text
     #[arg(long, global = true)]
