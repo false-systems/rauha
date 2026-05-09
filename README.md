@@ -10,7 +10,7 @@ Rauha adds what's missing. Five eBPF LSM hooks run inside the kernel on every `o
 
 - **Rauha runtime** — a standalone container runtime where zones are first-class. Zones unify cgroups, namespaces, and eBPF enforcement under one API. Integrates with Kubernetes via a containerd shim v2. Linux uses eBPF LSM; macOS uses Virtualization.framework VMs.
 
-- **Rauha enforce** *(coming soon)* — a lightweight agent that drops eBPF enforcement onto existing clusters. No runtime replacement needed. It watches containerd events, maps workloads to zones by label, and populates the same BPF maps. Your containers get kernel-level isolation enforcement without changing how you deploy them.
+- **[Syvä](https://github.com/false-systems/syva)** — the drop-on enforcement layer for existing clusters has been extracted into its own product. Different audience, different brand: keep your stack, Syvä adds eBPF enforcement on top.
 
 **Why this matters for AI infrastructure:**
 
@@ -194,7 +194,7 @@ trait IsolationBackend: Send + Sync {
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, separate build) |
 | `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF and userspace |
 | `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd to rauhad for Kubernetes |
-| `rauha-enforce` | Standalone eBPF enforcement agent — drops onto existing clusters |
+| `rauha-enforce` | *Legacy.* Superseded by [Syvä](https://github.com/false-systems/syva) — a separate product. |
 | `xtask` | Build helper for eBPF compilation |
 
 ### Kubernetes Integration
@@ -209,7 +209,7 @@ Sandbox creation maps to Rauha zone creation. Container operations map to Rauha 
 
 ### Enforcement Observability
 
-Every deny decision from the 5 LSM hooks is emitted to a BPF ring buffer and streamed to userspace. Each event carries the timestamp, PID, caller zone, target zone, and hook-specific context (inode for file access, cgroup ID for cgroup escape attempts).
+Every deny decision from the 7 LSM hooks is emitted to a BPF ring buffer and streamed to userspace. Each event carries the timestamp, PID, caller zone, target zone, and hook-specific context (inode for file access, cgroup ID for cgroup escape attempts).
 
 This provides:
 - **Audit trails** — provable evidence that a workload never escaped its zone
