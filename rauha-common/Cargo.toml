@@ -13,3 +13,6 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 postcard = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
