@@ -133,7 +133,11 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
             },
         },
         ShimRequest::GetState { id } => match state.get_state(&id) {
-            Some((pid, status)) => ShimResponse::State { pid, status },
+            Some((pid, status, exit_code)) => ShimResponse::State {
+                pid,
+                status,
+                exit_code,
+            },
             None => ShimResponse::Error {
                 message: format!("container {id} not found"),
             },

@@ -118,10 +118,10 @@ impl ShimState {
     }
 
     /// Get the state of a container.
-    pub fn get_state(&self, id: &str) -> Option<(u32, String)> {
+    pub fn get_state(&self, id: &str) -> Option<(u32, String, Option<i32>)> {
         self.containers
             .get(id)
-            .map(|p| (p.pid, p.status.to_string()))
+            .map(|p| (p.pid, p.status.to_string(), p.exit_code))
     }
 
     /// Reap exited child processes.
