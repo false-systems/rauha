@@ -428,6 +428,52 @@ impl ZoneRegistry {
         Ok(())
     }
 
+    /// Query the zone shim for container state and persist stopped metadata.
+    #[allow(dead_code)] // Used by sandbox wait support in the next PR.
+    pub async fn get_container_state(&self, container_id: &Uuid) -> Result<(String, Option<i32>)> {
+        let container = self
+            .metadata
+            .get_container(container_id)?
+            .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))?;
+
+        let zone_name = self
+            .zone_name_for_container(&container.zone_id)
+            .await
+            .ok_or_else(|| RauhaError::ZoneNotFound(container.zone_id.to_string()))?;
+
+        let response = self
+            .shim_request(
+                &zone_name,
+                &rauha_common::shim::ShimRequest::GetState {
+                    id: container_id.to_string(),
+                },
+            )
+            .await?;
+
+        match response {
+            rauha_common::shim::ShimResponse::State {
+                status, exit_code, ..
+            } => {
+                if status == "stopped" {
+                    let mut updated = container;
+                    updated.state = ContainerState::Stopped;
+                    updated.finished_at.get_or_insert_with(Utc::now);
+                    updated.exit_code = exit_code;
+                    self.metadata.put_container(&updated)?;
+                }
+                Ok((status, exit_code))
+            }
+            rauha_common::shim::ShimResponse::Error { message } => Err(RauhaError::ShimError {
+                zone: zone_name,
+                message,
+            }),
+            other => Err(RauhaError::ShimError {
+                zone: zone_name,
+                message: format!("unexpected shim response to GetState: {other:?}"),
+            }),
+        }
+    }
+
     /// Delete a container, stopping it first if needed.
     pub async fn delete_container(&self, container_id: &Uuid, force: bool) -> Result<()> {
         let container = self
