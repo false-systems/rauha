@@ -73,11 +73,22 @@ Structured output should look like:
 }
 ```
 
-Status: planned. The repository currently has zone and container lifecycle
-commands, plus a structured sandbox result type in `rauha-common`, but it does
-not yet have a synchronous `rauha sandbox` command that creates a task zone,
-runs a command, captures stdout/stderr/exit code, and cleans up. The current
-`rauha run` command starts a container in a zone and returns the container ID.
+Status: API contract landed, runtime execution planned. The `rauha sandbox`
+CLI command, the `rauha.sandbox.v1.SandboxService` gRPC service, and the
+`SandboxExecResult` types in `rauha-common` are wired through the daemon and
+CLI. Calling the command today returns:
+
+```
+Error: sandbox execution is not implemented yet; use zone/run/exec commands or see docs/sandbox-runtime.md
+```
+
+The runtime path — allocating a task zone, starting a container, waiting,
+capturing stdout/stderr/exit code, collecting enforcement events, and cleaning
+up — is the next PR. Once that lands, the JSON result shape above will be
+populated from real execution without changing the user-facing contract.
+
+The current `rauha run` command starts a container in a zone and returns the
+container ID; it is asynchronous container lifecycle, not task-level execution.
 
 ## What Is a Zone?
 

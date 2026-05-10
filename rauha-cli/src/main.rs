@@ -21,6 +21,8 @@ enum Commands {
         #[command(subcommand)]
         action: commands::zone::ZoneAction,
     },
+    /// Run an agent task in a sandbox zone (API contract; runtime planned)
+    Sandbox(commands::sandbox::SandboxArgs),
     /// Run a container in a zone
     Run(commands::run::RunArgs),
     /// List containers
@@ -91,6 +93,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Zone { action } => commands::zone::handle(action, out).await,
+        Commands::Sandbox(args) => commands::sandbox::handle_sandbox(args, out).await,
         Commands::Run(args) => commands::run::handle_run(args, out).await,
         Commands::Ps(args) => commands::run::handle_ps(args, out).await,
         Commands::Stop(args) => commands::run::handle_stop(args, out).await,
