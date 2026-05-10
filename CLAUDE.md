@@ -4,7 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Rauha is an isolation-first container runtime. Zones are the core concept — a first-class isolation boundary that unifies cgroups, namespaces, and eBPF enforcement under one API. Linux uses eBPF LSM hooks for per-syscall enforcement; macOS uses Virtualization.framework VMs.
+Rauha is an agent sandbox runtime built on controlled execution zones. A zone is the task/workload boundary that ties together filesystem view, processes, networking, resources, policy, logs, audit events, and optional enforcement events.
+
+The product hierarchy is load-bearing:
+
+1. Agent sandbox runtime.
+2. Zone-based runtime foundation.
+3. Kubernetes/containerd and existing-workload deployment paths.
+
+Do not present Rauha as primarily an eBPF project or a Kubernetes runtime. Rauha creates the zones. Syva makes the Linux kernel respect them. Current Linux eBPF code may still live in this repository, but architecturally it belongs behind the Syva enforcement boundary.
 
 ## Build & Test Commands
 

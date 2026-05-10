@@ -1,9 +1,12 @@
-//! Linux isolation backend: eBPF LSM + cgroups v2 + network namespaces.
+//! Linux isolation backend: cgroups v2 + namespaces + current eBPF LSM support.
 //!
-//! Orchestrates three subsystems:
-//! - eBPF LSM programs enforce zone boundaries at the syscall level
+//! Orchestrates the Linux pieces behind Rauha zones:
 //! - cgroup v2 hierarchy provides resource limits and process grouping
 //! - Network namespaces + veth pairs isolate network stacks
+//! - current in-repo eBPF LSM programs enforce zone boundaries at syscall level
+//!
+//! Architecturally, the kernel enforcement piece belongs behind the Syva
+//! boundary: Rauha creates zones; Syva makes the Linux kernel respect them.
 
 mod cgroup;
 mod ebpf;
