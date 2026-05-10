@@ -25,6 +25,7 @@ struct AgentState {
 struct ContainerProcess {
     pid: u32,
     status: ContainerStatus,
+    exit_code: Option<i32>,
     spec_json: String,
 }
 
@@ -53,6 +54,7 @@ impl AgentState {
             ContainerProcess {
                 pid: 0,
                 status: ContainerStatus::Created,
+                exit_code: None,
                 spec_json: spec_json.to_string(),
             },
         );
@@ -89,14 +91,14 @@ impl AgentState {
         container::send_signal(proc.pid, signal).map_err(|e| e.to_string())
     }
 
-    fn get_state(&self, id: &str) -> Option<(u32, String)> {
+    fn get_state(&self, id: &str) -> Option<(u32, String, Option<i32>)> {
         self.containers.get(id).map(|p| {
             let status = match p.status {
                 ContainerStatus::Created => "created",
                 ContainerStatus::Running => "running",
                 ContainerStatus::Stopped => "stopped",
             };
-            (p.pid, status.to_string())
+            (p.pid, status.to_string(), p.exit_code)
         })
     }
 
@@ -105,8 +107,9 @@ impl AgentState {
             if proc.status != ContainerStatus::Running || proc.pid == 0 {
                 continue;
             }
-            if let Some(_exit_code) = container::try_wait(proc.pid) {
+            if let Some(exit_code) = container::try_wait(proc.pid) {
                 proc.status = ContainerStatus::Stopped;
+                proc.exit_code = Some(exit_code);
             }
         }
     }
@@ -137,7 +140,11 @@ fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse 
             }
         }
         ShimRequest::GetState { id } => match state.get_state(&id) {
-            Some((pid, status)) => ShimResponse::State { pid, status },
+            Some((pid, status, exit_code)) => ShimResponse::State {
+                pid,
+                status,
+                exit_code,
+            },
             None => ShimResponse::Error {
                 message: format!("container {id} not found"),
             },
@@ -173,8 +180,8 @@ fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse 
 
             // Verify container exists and is running.
             match state.get_state(&id) {
-                Some((_pid, status)) if status == "running" => {}
-                Some((_, status)) => {
+                Some((_pid, status, _exit_code)) if status == "running" => {}
+                Some((_, status, _)) => {
                     return ShimResponse::Error {
                         message: format!("container {id} is in {status} state, not running"),
                     };

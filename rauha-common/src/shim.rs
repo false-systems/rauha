@@ -53,7 +53,11 @@ pub enum ShimRequest {
 pub enum ShimResponse {
     Ok,
     Created { pid: u32 },
-    State { pid: u32, status: String },
+    State {
+        pid: u32,
+        status: String,
+        exit_code: Option<i32>,
+    },
     Error { message: String },
     /// Zone-level resource usage statistics.
     Stats {
@@ -212,6 +216,12 @@ mod tests {
             ShimResponse::State {
                 pid: 999,
                 status: "running".into(),
+                exit_code: None,
+            },
+            ShimResponse::State {
+                pid: 999,
+                status: "stopped".into(),
+                exit_code: Some(42),
             },
             ShimResponse::Error {
                 message: "something failed".into(),
