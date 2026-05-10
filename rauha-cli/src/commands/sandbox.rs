@@ -17,6 +17,18 @@ use pb::sandbox::sandbox_service_client::SandboxServiceClient;
 
 use super::output::OutputMode;
 
+fn parse_env_pair(value: &str) -> Result<(String, String), String> {
+    let (key, value) = value
+        .split_once('=')
+        .ok_or_else(|| "environment variables must use KEY=VALUE".to_string())?;
+
+    if key.is_empty() {
+        return Err("environment variable key must not be empty".to_string());
+    }
+
+    Ok((key.to_string(), value.to_string()))
+}
+
 #[derive(Args)]
 pub struct SandboxArgs {
     /// Container image to run the task in.
@@ -26,8 +38,8 @@ pub struct SandboxArgs {
     #[arg(long)]
     pub name: Option<String>,
     /// Host path to expose into the zone as a read/write source.
-    #[arg(long)]
-    pub repo: Option<String>,
+    #[arg(long, alias = "repo")]
+    pub repo_path: Option<String>,
     /// Working directory inside the zone.
     #[arg(long)]
     pub workdir: Option<String>,
@@ -37,6 +49,9 @@ pub struct SandboxArgs {
     /// Soft timeout in seconds. 0 means no timeout.
     #[arg(long, default_value = "0")]
     pub timeout: u32,
+    /// Extra environment variable for the task, in KEY=VALUE form.
+    #[arg(long = "env", short = 'e', value_parser = parse_env_pair)]
+    pub env: Vec<(String, String)>,
     /// Task command. Use `--` before it to disambiguate from sandbox flags.
     #[arg(trailing_var_arg = true, required = true)]
     pub command: Vec<String>,
@@ -50,11 +65,11 @@ pub async fn handle_sandbox(args: SandboxArgs, _out: OutputMode) -> anyhow::Resu
         image: args.image,
         command: args.command,
         name: args.name.unwrap_or_default(),
-        repo_path: args.repo.unwrap_or_default(),
+        repo_path: args.repo_path.unwrap_or_default(),
         workdir: args.workdir.unwrap_or_default(),
         keep_zone: args.keep_zone,
         timeout_seconds: args.timeout,
-        env: Default::default(),
+        env: args.env.into_iter().collect(),
     };
 
     // Strip the tonic Status wrapper so the user sees the daemon's message
@@ -88,15 +103,9 @@ mod tests {
 
     #[test]
     fn parses_image_and_trailing_command() {
-        let parsed = TestCli::try_parse_from([
-            "sandbox",
-            "--image",
-            "alpine:latest",
-            "--",
-            "echo",
-            "hello",
-        ])
-        .expect("parse");
+        let parsed =
+            TestCli::try_parse_from(["sandbox", "--image", "alpine:latest", "--", "echo", "hello"])
+                .expect("parse");
         let TestCmd::Sandbox(args) = parsed.cmd;
         assert_eq!(args.image, "alpine:latest");
         assert_eq!(args.command, vec!["echo".to_string(), "hello".to_string()]);
@@ -113,10 +122,14 @@ mod tests {
             "python:3.12",
             "--name",
             "task-1",
-            "--repo",
+            "--repo-path",
             ".",
             "--workdir",
             "/workspace",
+            "--env",
+            "RUST_LOG=debug",
+            "-e",
+            "EMPTY=",
             "--keep-zone",
             "--timeout",
             "300",
@@ -128,11 +141,21 @@ mod tests {
         let TestCmd::Sandbox(args) = parsed.cmd;
         assert_eq!(args.image, "python:3.12");
         assert_eq!(args.name.as_deref(), Some("task-1"));
-        assert_eq!(args.repo.as_deref(), Some("."));
+        assert_eq!(args.repo_path.as_deref(), Some("."));
         assert_eq!(args.workdir.as_deref(), Some("/workspace"));
+        assert_eq!(
+            args.env,
+            vec![
+                ("RUST_LOG".to_string(), "debug".to_string()),
+                ("EMPTY".to_string(), String::new()),
+            ]
+        );
         assert!(args.keep_zone);
         assert_eq!(args.timeout, 300);
-        assert_eq!(args.command, vec!["pytest".to_string(), "tests/".to_string()]);
+        assert_eq!(
+            args.command,
+            vec!["pytest".to_string(), "tests/".to_string()]
+        );
     }
 
     #[test]
@@ -145,5 +168,35 @@ mod tests {
     fn rejects_missing_image() {
         let result = TestCli::try_parse_from(["sandbox", "--", "echo", "hello"]);
         assert!(result.is_err(), "image should be required");
+    }
+
+    #[test]
+    fn accepts_repo_alias() {
+        let parsed = TestCli::try_parse_from([
+            "sandbox",
+            "--image",
+            "python:3.12",
+            "--repo",
+            ".",
+            "--",
+            "pytest",
+        ])
+        .expect("parse");
+        let TestCmd::Sandbox(args) = parsed.cmd;
+        assert_eq!(args.repo_path.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn rejects_malformed_env() {
+        let result = TestCli::try_parse_from([
+            "sandbox",
+            "--image",
+            "alpine:latest",
+            "--env",
+            "NOPE",
+            "--",
+            "env",
+        ]);
+        assert!(result.is_err(), "env should require KEY=VALUE");
     }
 }

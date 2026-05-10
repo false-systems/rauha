@@ -5,7 +5,7 @@ Rauha's primary product shape is an agent sandbox runtime.
 The target command is:
 
 ```bash
-rauha sandbox --image python:3.12 --repo . -- pytest tests/
+rauha sandbox --image python:3.12 --repo-path . --env RUST_LOG=debug -- pytest tests/
 ```
 
 ## Current State
@@ -74,7 +74,7 @@ real execution. Step list:
 1. Create or select a zone for the task (temporary by default, named if
    `--name`/`name` is set).
 2. Create and start a container inside the zone, with the configured image,
-   command, env, and workdir.
+   command, environment, and workdir.
 3. Wait for the container's primary process to exit (respecting
    `timeout_seconds`).
 4. Capture stdout, stderr, exit code, and wall-clock duration.

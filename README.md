@@ -53,7 +53,7 @@ Kubernetes integration as one deployment path.
 The intended task-level user experience is:
 
 ```bash
-rauha sandbox --image python:3.12 --repo . -- pytest tests/
+rauha sandbox --image python:3.12 --repo-path . -- pytest tests/
 ```
 
 Structured output should look like:

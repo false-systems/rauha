@@ -70,7 +70,7 @@ message EnforcementEventSummary {
     // One of: "allow", "deny", "error".
     string decision = 4;
     string message = 5;
-    uint32 pid = 6;
+    optional uint32 pid = 6;
     string source_zone = 7;
     string target_zone = 8;
     string object = 9;

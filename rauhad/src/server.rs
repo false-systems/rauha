@@ -976,3 +976,26 @@ impl SandboxService for SandboxServiceImpl {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    #[tokio::test]
+    async fn sandbox_service_returns_unimplemented_contract() {
+        let service = SandboxServiceImpl::new();
+        let request = Request::new(pb::sandbox::RunSandboxRequest::default());
+
+        let status = service
+            .run_sandbox(request)
+            .await
+            .expect_err("sandbox runtime should not be implemented in this PR");
+
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(
+            status.message(),
+            "sandbox execution is not implemented yet; use zone/run/exec commands or see docs/sandbox-runtime.md"
+        );
+    }
+}
