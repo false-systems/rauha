@@ -454,12 +454,20 @@ impl ZoneRegistry {
             rauha_common::shim::ShimResponse::State {
                 status, exit_code, ..
             } => {
-                if status == "stopped" {
+                if status == "stopped"
+                    && (container.state != ContainerState::Stopped
+                        || container.exit_code != exit_code)
+                {
                     let mut updated = container;
                     updated.state = ContainerState::Stopped;
                     updated.finished_at.get_or_insert_with(Utc::now);
                     updated.exit_code = exit_code;
                     self.metadata.put_container(&updated)?;
+                    tracing::info!(
+                        container = %container_id,
+                        exit_code = ?exit_code,
+                        "container exit captured"
+                    );
                 }
                 Ok((status, exit_code))
             }
