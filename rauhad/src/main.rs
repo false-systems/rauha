@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 use server::pb::zone::zone_service_server::ZoneServiceServer;
 use server::pb::container::container_service_server::ContainerServiceServer;
 use server::pb::image::image_service_server::ImageServiceServer;
+use server::pb::sandbox::sandbox_service_server::SandboxServiceServer;
 
 const DEFAULT_ROOT: &str = if cfg!(target_os = "macos") {
     "/tmp/rauha"
@@ -79,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
     let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone());
     let container_svc = server::ContainerServiceImpl::new(registry.clone());
     let image_svc = server::ImageServiceImpl::new(image_service);
+    let sandbox_svc = server::SandboxServiceImpl::new();
 
     let addr = "[::1]:9876".parse()?;
     tracing::info!(%addr, "listening on gRPC");
@@ -103,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(ZoneServiceServer::new(zone_svc))
         .add_service(ContainerServiceServer::new(container_svc))
         .add_service(ImageServiceServer::new(image_svc))
+        .add_service(SandboxServiceServer::new(sandbox_svc))
         .serve_with_shutdown(addr, shutdown)
         .await;
 

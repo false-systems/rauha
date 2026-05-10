@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package rauha.sandbox.v1;
+
+// Task-level sandbox execution.
+//
+// Rauha's primary product shape is an agent sandbox runtime: each task runs in
+// its own zone, with stdout/stderr/exit-code captured into a single result.
+// This proto defines the public contract; the runtime implementation lands in
+// a later PR. The daemon currently returns Unimplemented for RunSandbox.
+service SandboxService {
+    rpc RunSandbox(RunSandboxRequest) returns (SandboxResult);
+}
+
+message RunSandboxRequest {
+    // Container image to run the task in. Required.
+    string image = 1;
+    // Task command (argv-style). Required, non-empty.
+    repeated string command = 2;
+    // Optional zone name. If empty, the daemon allocates a temporary zone.
+    string name = 3;
+    // Optional host path to expose into the zone as a read/write source.
+    string repo_path = 4;
+    // Optional working directory inside the zone.
+    string workdir = 5;
+    // If true, leave the task zone behind for debugging after the run.
+    bool keep_zone = 6;
+    // Soft timeout in seconds. 0 means no timeout.
+    uint32 timeout_seconds = 7;
+    // Extra environment variables.
+    map<string, string> env = 8;
+}
+
+message SandboxResult {
+    // Stable task identifier assigned by the daemon.
+    string task_id = 1;
+    // Zone the task ran in (temporary or named).
+    string zone_id = 2;
+    // Effective command that was executed.
+    repeated string command = 3;
+    // One of: "succeeded", "failed", "timed_out", "runtime_error".
+    // Matches rauha_common::sandbox::SandboxStatus snake_case serialization.
+    string status = 4;
+    // Process exit code if the task ran to completion.
+    optional int32 exit_code = 5;
+    // Captured standard streams.
+    string stdout = 6;
+    string stderr = 7;
+    // Wall-clock duration of the task.
+    uint64 duration_ms = 8;
+    // RFC3339 timestamps. Empty string when not available.
+    string started_at = 9;
+    string finished_at = 10;
+    // User-facing event summaries collected during the task.
+    repeated SandboxEventSummary events = 11;
+    // Kernel enforcement events (Syvä-backed on Linux when wired up).
+    repeated EnforcementEventSummary enforcement_events = 12;
+}
+
+message SandboxEventSummary {
+    string timestamp = 1;
+    string kind = 2;
+    string message = 3;
+}
+
+message EnforcementEventSummary {
+    string timestamp = 1;
+    string hook = 2;
+    string action = 3;
+    // One of: "allow", "deny", "error".
+    string decision = 4;
+    string message = 5;
+    optional uint32 pid = 6;
+    string source_zone = 7;
+    string target_zone = 8;
+    string object = 9;
+}

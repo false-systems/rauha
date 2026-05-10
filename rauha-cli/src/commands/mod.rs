@@ -4,6 +4,7 @@ pub mod logs;
 pub mod output;
 pub mod policy;
 pub mod run;
+pub mod sandbox;
 pub mod setup;
 pub mod trace;
 pub mod zone;

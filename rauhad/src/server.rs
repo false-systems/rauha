@@ -44,11 +44,15 @@ pub mod pb {
     pub mod image {
         tonic::include_proto!("rauha.image.v1");
     }
+    pub mod sandbox {
+        tonic::include_proto!("rauha.sandbox.v1");
+    }
 }
 
 use pb::zone::zone_service_server::ZoneService;
 use pb::container::container_service_server::ContainerService;
 use pb::image::image_service_server::ImageService;
+use pb::sandbox::sandbox_service_server::SandboxService;
 
 // --- Zone Service ---
 
@@ -936,5 +940,62 @@ impl ImageService for ImageServiceImpl {
             config_json: inspection.config_json,
             layers: inspection.layers,
         }))
+    }
+}
+
+// --- Sandbox Service ---
+//
+// Task-level sandbox execution. The runtime path (allocate zone, start
+// container, wait, capture stdout/stderr/exit, collect events, clean up)
+// is not implemented yet — this impl exists to land the public contract.
+// The next PR replaces the Unimplemented body with a real implementation
+// built on top of existing zone/container primitives.
+
+pub struct SandboxServiceImpl;
+
+impl SandboxServiceImpl {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SandboxServiceImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxService for SandboxServiceImpl {
+    async fn run_sandbox(
+        &self,
+        _request: Request<pb::sandbox::RunSandboxRequest>,
+    ) -> Result<Response<pb::sandbox::SandboxResult>, Status> {
+        Err(Status::unimplemented(
+            "sandbox execution is not implemented yet; use zone/run/exec commands or see docs/sandbox-runtime.md",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    #[tokio::test]
+    async fn sandbox_service_returns_unimplemented_contract() {
+        let service = SandboxServiceImpl::new();
+        let request = Request::new(pb::sandbox::RunSandboxRequest::default());
+
+        let status = service
+            .run_sandbox(request)
+            .await
+            .expect_err("sandbox runtime should not be implemented in this PR");
+
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(
+            status.message(),
+            "sandbox execution is not implemented yet; use zone/run/exec commands or see docs/sandbox-runtime.md"
+        );
     }
 }
