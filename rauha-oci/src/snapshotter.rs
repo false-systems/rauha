@@ -293,6 +293,15 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rauha_common::error::RauhaError;
+
+    fn is_unprivileged_mount_error(err: &RauhaError) -> bool {
+        matches!(
+            err,
+            RauhaError::RootfsError { message }
+                if message.contains("EPERM") || message.contains("Operation not permitted")
+        )
+    }
 
     #[test]
     fn prepare_layers_creates_layer_dirs() {
@@ -365,9 +374,16 @@ mod tests {
             .unwrap();
 
         let container_root = dir.path().join("containers").join("test-container");
-        let merged = snap
-            .mount_overlay("test-container", &layer_paths, &container_root)
-            .unwrap();
+        let merged = match snap.mount_overlay("test-container", &layer_paths, &container_root) {
+            Ok(merged) => merged,
+            Err(err) if cfg!(target_os = "linux") && is_unprivileged_mount_error(&err) => {
+                assert!(container_root.join("upper").exists());
+                assert!(container_root.join("work").exists());
+                assert!(container_root.join("merged").exists());
+                return;
+            }
+            Err(err) => panic!("mount_overlay failed: {err}"),
+        };
 
         assert!(container_root.join("upper").exists());
         assert!(container_root.join("work").exists());
@@ -386,6 +402,10 @@ mod tests {
 
         let snap = OverlayfsSnapshotter::new(dir.path());
         // Should not error even if not actually mounted (non-Linux is always a no-op).
-        snap.unmount_overlay(&container_root).unwrap();
+        match snap.unmount_overlay(&container_root) {
+            Ok(()) => {}
+            Err(err) if cfg!(target_os = "linux") && is_unprivileged_mount_error(&err) => {}
+            Err(err) => panic!("unmount_overlay failed: {err}"),
+        }
     }
 }
