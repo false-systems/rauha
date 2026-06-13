@@ -119,7 +119,7 @@ pub struct LinuxBackend {
     /// Cancellation token for the enforcement event reader task.
     event_reader_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Broadcast sender for enforcement events (gRPC WatchEvents subscribes here).
-    event_tx: Option<tokio::sync::broadcast::Sender<events::DecodedEvent>>,
+    event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
     /// IP address allocator for zone networking.
     ip_allocator: Mutex<IpAllocator>,
 }
@@ -214,7 +214,7 @@ impl LinuxBackend {
     }
 
     /// Get a clone of the enforcement event broadcast sender, if available.
-    pub fn event_sender(&self) -> Option<tokio::sync::broadcast::Sender<events::DecodedEvent>> {
+    pub fn event_sender(&self) -> Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>> {
         self.event_tx.clone()
     }
 

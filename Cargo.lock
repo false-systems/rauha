@@ -2485,6 +2485,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rauha-evidence"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rauha-guest-agent"
 version = "0.1.0"
 dependencies = [
@@ -2561,6 +2574,7 @@ dependencies = [
  "prost 0.13.5",
  "rauha-common",
  "rauha-ebpf-common",
+ "rauha-evidence",
  "rauha-oci",
  "redb",
  "serde",
