@@ -184,4 +184,16 @@ deny = ["mount", "umount2"]
         assert_eq!(policy.network.allowed_zones, vec!["frontend"]);
         assert_eq!(policy.syscalls.deny, vec!["mount", "umount2"]);
     }
+
+    #[test]
+    fn missing_capabilities_section_is_empty_allow_list() {
+        let toml = r#"
+[zone]
+name = "minimal"
+type = "non-global"
+"#;
+
+        let (_zone_type, policy) = parse_policy(toml, "/var/lib/rauha").unwrap();
+        assert!(policy.capabilities.allowed.is_empty());
+    }
 }

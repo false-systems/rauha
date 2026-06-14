@@ -379,11 +379,17 @@ mod tests {
     }
 
     #[test]
-    fn policy_to_kernel_default_has_no_flags() {
+    fn policy_to_kernel_default_has_empty_capability_allow_list() {
         let k = policy_to_kernel(&ZonePolicy::default());
         assert_eq!(k.caps_mask, 0);
         assert_eq!(k.flags, 0);
         assert_eq!(k._pad, 0);
+    }
+
+    #[test]
+    fn policy_to_kernel_empty_capabilities_mean_allow_none() {
+        let k = policy_to_kernel(&default_policy_with_caps(vec![]));
+        assert_eq!(k.caps_mask, 0);
     }
 
     #[test]

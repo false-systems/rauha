@@ -44,21 +44,18 @@ fn try_capable(ctx: &LsmContext) -> Result<i32, i64> {
     // arg(2) is the capability number (int cap).
     let cap: i32 = unsafe { ctx.arg(2) };
     if cap < 0 || cap > 63 {
-        return Ok(0); // Invalid cap number — allow, don't break.
+        emit_deny_event(HOOK_CAPABLE, caller.zone_id, 0, cap as u64);
+        return Ok(-1);
     }
 
     // Check if this capability is permitted by the zone's policy.
     let policy = match unsafe { ZONE_POLICY.get(&caller.zone_id) } {
         Some(p) => p,
-        None => return Ok(0), // No policy → default allow.
+        None => {
+            emit_deny_event(HOOK_CAPABLE, caller.zone_id, 0, cap as u64);
+            return Ok(-1);
+        }
     };
-
-    // caps_mask == 0 means no capability restrictions configured.
-    // This is the default for policies without a [capabilities] section.
-    // Only enforce when the policy explicitly lists allowed capabilities.
-    if policy.caps_mask == 0 {
-        return Ok(0);
-    }
 
     let cap_bit = 1u64 << (cap as u64);
     if policy.caps_mask & cap_bit != 0 {

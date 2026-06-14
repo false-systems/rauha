@@ -28,7 +28,6 @@ pub fn cleanup_network() {
 }
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
@@ -129,32 +128,15 @@ impl LinuxBackend {
         let cgroup = CgroupManager::new()?;
         let ip_allocator = IpAllocator::default_subnet();
 
-        // Try to load eBPF programs. If it fails, log a warning and continue
-        // in degraded mode (no kernel enforcement).
-        let (ebpf, event_reader_cancel, event_tx) = match Self::try_load_ebpf(root) {
-            Ok(mut mgr) => {
-                tracing::info!("eBPF programs loaded — kernel enforcement active");
+        let mut ebpf = Self::try_load_ebpf(root)?;
+        tracing::info!("eBPF programs loaded — kernel enforcement active");
 
-                // Start the enforcement event reader (ring buffer → tracing logs).
-                let (cancel, event_tx) = match mgr.take_event_ring_buf() {
-                    Ok(ring_buf) => {
-                        let token = tokio_util::sync::CancellationToken::new();
-                        let tx = events::spawn_event_reader(ring_buf, token.clone());
-                        (Some(token), Some(tx))
-                    }
-                    Err(e) => {
-                        tracing::warn!(%e, "enforcement event ring buffer not available");
-                        (None, None)
-                    }
-                };
-
-                (Some(mgr), cancel, event_tx)
-            }
-            Err(e) => {
-                tracing::warn!(%e, "eBPF programs not loaded — running without kernel enforcement");
-                (None, None, None)
-            }
-        };
+        let ring_buf = ebpf.take_event_ring_buf().map_err(|e| RauhaError::EbpfError {
+            message: format!("enforcement event ring buffer not available: {e}"),
+            hint: "check the ENFORCEMENT_EVENTS ring buffer map was created".into(),
+        })?;
+        let event_reader_cancel = tokio_util::sync::CancellationToken::new();
+        let event_tx = events::spawn_event_reader(ring_buf, event_reader_cancel.clone());
 
         // Ensure the network bridge exists with a gateway IP.
         if let Err(e) = network::ensure_bridge(ip_allocator.gateway(), ip_allocator.prefix_len()) {
@@ -172,15 +154,15 @@ impl LinuxBackend {
 
         Ok(Self {
             root: root.into(),
-            ebpf: Mutex::new(ebpf),
+            ebpf: Mutex::new(Some(ebpf)),
             cgroup,
             next_zone_id: AtomicU32::new(1), // 0 is reserved for "no zone".
             zone_id_map: Mutex::new(HashMap::new()),
             zone_name_map: Mutex::new(HashMap::new()),
             shim_connections: Mutex::new(HashMap::new()),
             registered_inodes: Mutex::new(HashMap::new()),
-            event_reader_cancel,
-            event_tx,
+            event_reader_cancel: Some(event_reader_cancel),
+            event_tx: Some(event_tx),
             ip_allocator: Mutex::new(ip_allocator),
         })
     }
@@ -441,10 +423,9 @@ impl IsolationBackend for LinuxBackend {
             self.cgroup.create_zone_cgroup(&zone.name)?
         };
 
-        // Re-apply resource limits.
-        if let Err(e) = self.cgroup.apply_resources(&zone.name, &policy.resources) {
-            tracing::warn!(%e, zone = zone.name, "failed to re-apply resource limits during recovery");
-        }
+        // Re-apply resource limits. Recovery must fail closed if hard limits
+        // cannot be restored.
+        self.cgroup.apply_resources(&zone.name, &policy.resources)?;
 
         // Re-register IP in allocator if zone has network state.
         if let Some(ref net_state) = zone.network_state {
@@ -462,17 +443,17 @@ impl IsolationBackend for LinuxBackend {
             }
         }
 
-        // Re-populate BPF maps.
-        if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
-            if let Some(ref mut ebpf) = **ebpf_guard {
-                let bpf = ebpf.bpf_mut();
-                if let Err(e) = MapManager::add_zone_member(bpf, cgroup_id, zone_id, zone_type) {
-                    tracing::warn!(%e, zone = zone.name, "failed to re-add zone to BPF map during recovery");
-                }
-                if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, policy) {
-                    tracing::warn!(%e, zone = zone.name, "failed to re-set zone policy during recovery");
-                }
-            }
+        // Re-populate BPF maps. A recovered zone without BPF enforcement must
+        // not be treated as recovered.
+        {
+            let mut ebpf_guard = lock_or_abort(&self.ebpf);
+            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
+                message: "eBPF manager not available during zone recovery".into(),
+                hint: "restart rauhad after restoring eBPF LSM support".into(),
+            })?;
+            let bpf = ebpf.bpf_mut();
+            MapManager::add_zone_member(bpf, cgroup_id, zone_id, zone_type)?;
+            MapManager::set_zone_policy(bpf, zone_id, policy)?;
         }
 
         tracing::info!(zone = zone.name, zone_id, cgroup_id, "zone recovered");
@@ -570,26 +551,59 @@ impl IsolationBackend for LinuxBackend {
             None
         };
 
-        // Step 3: Populate BPF maps.
-        if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
-            if let Some(ref mut ebpf) = **ebpf_guard {
-                let bpf = ebpf.bpf_mut();
+        let rollback_zone = |reason: &str| {
+            tracing::warn!(zone = config.name, reason, "rolling back failed zone creation");
+            if let Some(ref net_state) = net_state {
+                let mut alloc = lock_or_abort(&self.ip_allocator);
+                alloc.release(net_state.ip());
+            }
+            let _ = network::destroy_veth_pair(&config.name);
+            let _ = namespace::destroy_netns(&config.name);
+            let _ = self.cgroup.destroy_zone_cgroup(&config.name);
+            self.remove_zone_id(&zone_uuid);
+            lock_or_abort(&self.zone_name_map).remove(&config.name);
+        };
 
-                if let Err(e) =
-                    MapManager::add_zone_member(bpf, cgroup_id, zone_id, config.zone_type)
-                {
-                    tracing::warn!(%e, "failed to add zone to BPF membership map");
+        // Step 3: Populate BPF maps. Missing enforcement is fatal.
+        {
+            let mut ebpf_guard = lock_or_abort(&self.ebpf);
+            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
+                message: "eBPF manager not available during zone creation".into(),
+                hint: "restart rauhad after restoring eBPF LSM support".into(),
+            });
+            let ebpf = match ebpf {
+                Ok(ebpf) => ebpf,
+                Err(e) => {
+                    rollback_zone("ebpf-unavailable");
+                    return Err(e);
                 }
+            };
 
-                if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, &config.policy) {
-                    tracing::warn!(%e, "failed to set zone policy in BPF map");
-                }
+            let bpf = ebpf.bpf_mut();
+            if let Err(e) = MapManager::add_zone_member(bpf, cgroup_id, zone_id, config.zone_type) {
+                rollback_zone("bpf-membership");
+                return Err(e);
+            }
+
+            if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, &config.policy) {
+                let _ = MapManager::remove_zone_member(bpf, cgroup_id);
+                rollback_zone("bpf-policy");
+                return Err(e);
             }
         }
 
         // Step 4: Apply cgroup resource limits.
         if let Err(e) = self.cgroup.apply_resources(&config.name, &config.policy.resources) {
-            tracing::warn!(%e, zone = config.name, "failed to apply resource limits");
+            if let Some(zone_id) = self.get_zone_id(&zone_uuid) {
+                let mut ebpf_guard = lock_or_abort(&self.ebpf);
+                if let Some(ref mut ebpf) = *ebpf_guard {
+                    let bpf = ebpf.bpf_mut();
+                    let _ = MapManager::remove_zone_member(bpf, cgroup_id);
+                    let _ = MapManager::remove_zone_policy(bpf, zone_id);
+                }
+            }
+            rollback_zone("resource-limits");
+            return Err(e);
         }
 
         tracing::info!(

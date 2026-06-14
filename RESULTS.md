@@ -228,6 +228,97 @@ Requires privileged/macOS CI verification:
   the changed hook error branches.
 - macOS Virtualization.framework VM lifecycle and vsock paths.
 
+## Phase 3: Linux Enforcement Setup Fails Closed
+
+Lever: Linux eBPF enforcement setup and capability allow-list semantics.
+
+Before:
+
+- `LinuxBackend::new` logged and continued when eBPF programs failed to load,
+  leaving `rauhad` able to run without kernel enforcement.
+- Missing enforcement event ring-buffer setup logged and continued.
+- Linux `create_zone` logged BPF membership/policy map failures and still
+  returned a zone handle.
+- Linux `create_zone` logged cgroup resource limit failures and still returned a
+  zone handle.
+- Linux `recover_zone` logged BPF map and resource-limit restore failures and
+  treated the zone as recovered.
+- The `capable` LSM hook treated a missing `ZONE_POLICY` entry or
+  `caps_mask == 0` as unrestricted capability use for zoned non-global callers.
+
+After:
+
+- `LinuxBackend::new` returns an `EbpfError` unless eBPF programs load and the
+  enforcement event ring buffer can be opened.
+- `create_zone` returns an error and rolls back cgroup, netns/veth, IP
+  allocation, and in-memory zone id/name state if BPF membership, BPF policy, or
+  hard cgroup resource setup fails.
+- `recover_zone` returns an error if hard cgroup limits or BPF map state cannot
+  be restored.
+- For zoned non-global callers, the `capable` hook denies invalid capability
+  numbers, missing `ZONE_POLICY`, and any capability not present in
+  `caps_mask`. A zero mask now means an empty allow-list.
+- Global and unzoned callers remain unchanged.
+
+Release binary size delta:
+
+| Binary | Before bytes | After bytes | Delta | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `rauhad` | 4,145,832 | 4,145,664 | -168 | -0.00% |
+| `rauha` | 2,437,688 | 2,437,688 | 0 | 0.00% |
+| `rauha-shim` | 2,037,376 | 2,037,376 | 0 | 0.00% |
+| `rauha-guest-agent` | 1,906,152 | 1,906,152 | 0 | 0.00% |
+| `rauha-enforce` | 2,634,968 | 2,634,968 | 0 | 0.00% |
+| `containerd-shim-rauha-v2` | 2,823,528 | 2,823,528 | 0 | 0.00% |
+
+eBPF object size delta:
+
+| Artifact | Before bytes | After bytes | Delta | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `rauha-ebpf` object | 11,192 | 11,440 | +248 | +2.22% |
+
+Commands:
+
+```sh
+CARGO_TARGET_DIR=$HOME/rauha-target-strict-pr cargo build --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-strict-pr cargo test --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-strict-pr cargo clippy --workspace --all-targets
+CARGO_TARGET_DIR=$HOME/rauha-target-strict-pr-release cargo build --release --bins
+CARGO_TARGET_DIR=$HOME/rauha-target-strict-pr-ebpf cargo run -p xtask -- build-ebpf
+```
+
+Correctness notes:
+
+- This strengthens fail-closed behavior and does not add a permissive fallback.
+- This change does not alter CLI grammar, gRPC contracts, sandbox types, or the
+  `IsolationBackend` trait.
+- `rauha sandbox` remains the explicit unimplemented contract.
+- The macOS backend is not behaviorally changed. macOS remains a hardware VM
+  boundary and was compile-checked on the host.
+
+Verification:
+
+- Linux `cargo build --workspace` passed.
+- Linux `cargo test --workspace` passed.
+- Linux `cargo clippy --workspace --all-targets` passed with existing warnings.
+- Linux release build `cargo build --release --bins` passed and produced the
+  size table above.
+- Lima eBPF build `cargo run -p xtask -- build-ebpf` passed and produced the
+  object-size table above.
+- macOS `cargo check -p rauhad` passed on the host with existing warnings.
+- Oracle suite in `eval/oracle` compiled, then failed before exercising Rauha:
+  all 55 cases failed at connection setup because no daemon was listening on
+  `http://[::1]:9876` (`Connection refused`). This requires a running privileged
+  Linux `rauhad` environment.
+
+Requires privileged/macOS CI verification:
+
+- Linux eBPF LSM load, verifier acceptance, hook attach, ring-buffer event
+  delivery, and runtime capability-deny behavior.
+- Linux privileged zone create/recover rollback behavior against real cgroups,
+  namespaces, BPF maps, and resource controllers.
+- macOS Virtualization.framework VM lifecycle and vsock paths.
+
 ## Phase 1: Tokio Feature Diet
 
 Lever: workspace direct Tokio dependency features only.
