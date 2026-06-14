@@ -456,8 +456,11 @@ impl IsolationBackend for LinuxBackend {
                 hint: "restart rauhad after restoring eBPF LSM support".into(),
             })?;
             let bpf = ebpf.bpf_mut();
-            MapManager::add_zone_member(bpf, cgroup_id, zone_id, zone_type)?;
+            // Policy before membership — a recovered cgroup may already hold
+            // running processes, so its ZONE_POLICY must exist before any of
+            // them can resolve as a zone member (else capable() fails closed).
             MapManager::set_zone_policy(bpf, zone_id, policy)?;
+            MapManager::add_zone_member(bpf, cgroup_id, zone_id, zone_type)?;
         }
 
         tracing::info!(zone = zone.name, zone_id, cgroup_id, "zone recovered");
@@ -592,14 +595,17 @@ impl IsolationBackend for LinuxBackend {
             };
 
             let bpf = ebpf.bpf_mut();
-            if let Err(e) = MapManager::add_zone_member(bpf, cgroup_id, zone_id, config.zone_type) {
-                rollback_zone("bpf-membership");
+            // Write the policy before membership: once a process resolves to a
+            // zone via ZONE_MEMBERSHIP, its ZONE_POLICY must already exist, or
+            // the fail-closed capable() hook would deny it in the gap.
+            if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, &config.policy) {
+                rollback_zone("bpf-policy");
                 return Err(e);
             }
 
-            if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, &config.policy) {
-                let _ = MapManager::remove_zone_member(bpf, cgroup_id);
-                rollback_zone("bpf-policy");
+            if let Err(e) = MapManager::add_zone_member(bpf, cgroup_id, zone_id, config.zone_type) {
+                let _ = MapManager::remove_zone_policy(bpf, zone_id);
+                rollback_zone("bpf-membership");
                 return Err(e);
             }
         }

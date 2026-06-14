@@ -186,7 +186,11 @@ deny = ["mount", "umount2"]
     }
 
     #[test]
-    fn missing_capabilities_section_is_empty_allow_list() {
+    fn missing_capabilities_section_means_unrestricted() {
+        // An omitted [capabilities] section parses to an empty allow list, which
+        // compiles to caps_mask == 0. The capable() LSM hook treats caps_mask == 0
+        // as "no capability restriction" (allow), NOT "deny every capability" —
+        // see rauha-ebpf/src/capable_guard.rs. Restriction is opt-in.
         let toml = r#"
 [zone]
 name = "minimal"

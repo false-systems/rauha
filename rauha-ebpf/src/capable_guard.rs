@@ -57,6 +57,16 @@ fn try_capable(ctx: &LsmContext) -> Result<i32, i64> {
         }
     };
 
+    // caps_mask == 0 means the policy has no [capabilities] section, i.e. it
+    // opts out of capability restriction. Treat as unrestricted (allow): the
+    // explicit allowlist is opt-in. Denying every capability for such a zone
+    // would break routine kernel capable() checks (CAP_DAC_OVERRIDE,
+    // CAP_SETUID, ...) and make any policy without a [capabilities] block
+    // unusable. The error path above still fails closed.
+    if policy.caps_mask == 0 {
+        return Ok(0);
+    }
+
     let cap_bit = 1u64 << (cap as u64);
     if policy.caps_mask & cap_bit != 0 {
         return Ok(0); // Capability explicitly permitted.
