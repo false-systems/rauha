@@ -54,21 +54,15 @@ pub fn fork_and_exec_pty(
     let master_fd = pty.master.as_raw_fd();
     let slave_fd = pty.slave.as_raw_fd();
 
-    let c_args: Vec<CString> = command
-        .iter()
-        .map(|a| CString::new(a.as_str()).unwrap())
-        .collect();
+    let c_args = cstring_vec(command, "exec.command")?;
 
-    let c_env: Vec<CString> = env
-        .iter()
-        .map(|e| CString::new(e.as_str()).unwrap())
-        .collect();
+    let c_env = cstring_vec(env, "exec.env")?;
 
     // Pre-allocate the TERM fallback before fork so the child can putenv it
     // without allocating. Only use it if the caller didn't already provide TERM.
     let has_term = env.iter().any(|e| e.starts_with("TERM="));
     let term_fallback: Option<CString> = if !has_term {
-        Some(CString::new("TERM=xterm-256color").unwrap())
+        Some(CString::new("TERM=xterm-256color")?)
     } else {
         None
     };
@@ -130,9 +124,38 @@ pub fn fork_and_exec_pty(
             // Prevent Rust from closing master_fd — the relay thread owns it.
             std::mem::forget(pty.master);
 
-            tracing::info!(pid = child_pid, container = container_id, "exec process forked with PTY");
+            tracing::info!(
+                pid = child_pid,
+                container = container_id,
+                "exec process forked with PTY"
+            );
             Ok((master_fd, child_pid))
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cstring_vec(values: &[String], field: &str) -> anyhow::Result<Vec<std::ffi::CString>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            std::ffi::CString::new(value.as_str())
+                .map_err(|_| anyhow::anyhow!("{field}[{idx}] contains an interior NUL byte"))
+        })
+        .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::cstring_vec;
+
+    #[test]
+    fn rejects_interior_nul_in_exec_command() {
+        let err = cstring_vec(&["/bin/echo\0bad".to_string()], "exec.command")
+            .expect_err("interior NUL must be rejected");
+
+        assert!(err.to_string().contains("exec.command[0]"));
     }
 }
 
@@ -183,7 +206,9 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
         )
     };
     if ret < 0 {
-        unsafe { libc::close(listen_fd); }
+        unsafe {
+            libc::close(listen_fd);
+        }
         anyhow::bail!(
             "failed to bind vsock port {vsock_port}: {}",
             std::io::Error::last_os_error()
@@ -192,7 +217,9 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
 
     let ret = unsafe { libc::listen(listen_fd, 1) };
     if ret < 0 {
-        unsafe { libc::close(listen_fd); }
+        unsafe {
+            libc::close(listen_fd);
+        }
         anyhow::bail!(
             "failed to listen on vsock port {vsock_port}: {}",
             std::io::Error::last_os_error()
@@ -243,9 +270,7 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
                 }
             }
 
-            let fd = unsafe {
-                libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut())
-            };
+            let fd = unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
             if fd >= 0 {
                 break fd;
             }
@@ -261,19 +286,28 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
             return;
         };
 
-        unsafe { libc::close(listen_fd); }
+        unsafe {
+            libc::close(listen_fd);
+        }
 
         // Set send/receive timeouts on the vsock connection to prevent
         // indefinite blocking if the peer stops reading or writing.
-        let timeout = libc::timeval { tv_sec: 30, tv_usec: 0 };
+        let timeout = libc::timeval {
+            tv_sec: 30,
+            tv_usec: 0,
+        };
         unsafe {
             libc::setsockopt(
-                conn_fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO,
+                conn_fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDTIMEO,
                 &timeout as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::timeval>() as u32,
             );
             libc::setsockopt(
-                conn_fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                conn_fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
                 &timeout as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::timeval>() as u32,
             );

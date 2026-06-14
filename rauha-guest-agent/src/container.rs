@@ -58,26 +58,19 @@ pub fn fork_and_exec(
 
     let (pipe_rd, pipe_wr) = nix::unistd::pipe()?;
 
-    let c_args: Vec<CString> = args
-        .iter()
-        .map(|a| CString::new(a.as_str()).unwrap())
-        .collect();
+    let c_args = cstring_vec(args, "process.args")?;
 
-    let env_vars: Vec<CString> = process
+    let env_vars = process
         .env()
         .as_ref()
-        .map(|vars| {
-            vars.iter()
-                .map(|e| CString::new(e.as_str()).unwrap())
-                .collect::<Vec<CString>>()
-        })
+        .map(|vars| cstring_vec(vars, "process.env"))
+        .transpose()?
         .unwrap_or_default();
 
     let cwd = process.cwd().to_string_lossy().to_string();
     let cwd_cstr = CString::new(cwd.as_str())?;
 
     let hostname = spec.hostname().clone();
-
 
     match unsafe { unistd::fork() }? {
         ForkResult::Child => {
@@ -128,6 +121,31 @@ pub fn fork_and_exec(
             tracing::info!(pid = child_pid, container = container_id, "child forked");
             Ok(child_pid)
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cstring_vec(values: &[String], field: &str) -> anyhow::Result<Vec<std::ffi::CString>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            std::ffi::CString::new(value.as_str())
+                .map_err(|_| anyhow::anyhow!("{field}[{idx}] contains an interior NUL byte"))
+        })
+        .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::cstring_vec;
+
+    #[test]
+    fn rejects_interior_nul_in_process_env() {
+        let err = cstring_vec(&["PATH=/bin\0extra".to_string()], "process.env")
+            .expect_err("interior NUL must be rejected");
+
+        assert!(err.to_string().contains("process.env[0]"));
     }
 }
 

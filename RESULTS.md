@@ -91,6 +91,86 @@ Verification:
   `http://[::1]:9876` (`Connection refused`). This requires a running privileged
   Linux `rauhad` environment.
 
+## Phase 3: Shim Request Input Panics Removed
+
+Lever: request-supplied C string construction in `rauha-shim` and
+`rauha-guest-agent`.
+
+Before:
+
+- OCI `process.args` and `process.env` values were converted with
+  `CString::new(...).unwrap()` before container fork/exec.
+- Exec `command` and `env` values were converted with
+  `CString::new(...).unwrap()` before PTY fork/exec.
+- Shim and guest-agent state updates used `get_mut(...).unwrap()` after
+  validating the container existed.
+
+After:
+
+- OCI and exec string vectors are converted through fallible helpers before
+  `fork()`. Interior NUL bytes now reject the start/exec request with an error
+  instead of panicking the runtime process.
+- The Linux shim keeps all allocation before `fork()`, including the default
+  `TERM=xterm-256color` value used by exec sessions.
+- Shim and guest-agent state updates now return explicit errors if the
+  container entry is unexpectedly missing after fork.
+
+Release binary size delta:
+
+| Binary | Before bytes | After bytes | Delta | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `rauhad` | 4,145,664 | 4,145,664 | 0 | 0.00% |
+| `rauha` | 2,437,688 | 2,437,688 | 0 | 0.00% |
+| `rauha-shim` | 2,037,376 | 2,102,912 | +65,536 | +3.22% |
+| `rauha-guest-agent` | 1,906,152 | 1,906,152 | 0 | 0.00% |
+| `rauha-enforce` | 2,700,504 | 2,700,504 | 0 | 0.00% |
+| `containerd-shim-rauha-v2` | 2,823,528 | 2,823,528 | 0 | 0.00% |
+
+Commands:
+
+```sh
+cargo check -p rauhad
+cargo check -p rauha-shim -p rauha-guest-agent
+CARGO_TARGET_DIR=$HOME/rauha-target-nul-strict cargo build --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-nul-strict cargo test --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-nul-strict cargo clippy --workspace --all-targets
+CARGO_TARGET_DIR=$HOME/rauha-target-nul-strict-release cargo build --release --bins
+CARGO_TARGET_DIR=$HOME/rauha-target-nul-strict-ebpf cargo run -p xtask -- build-ebpf
+```
+
+Correctness notes:
+
+- This strengthens fail-closed request handling. Malformed command/env data now
+  refuses the operation rather than unwinding in the shim or guest-agent.
+- No isolation checks, enforcement setup, namespace setup, policy validation, or
+  VM boundaries are relaxed.
+- This change does not alter CLI grammar, gRPC contracts, sandbox types, or the
+  `IsolationBackend` trait.
+- `rauha sandbox` remains the explicit unimplemented contract.
+- The macOS daemon backend is not behaviorally changed and was compile-checked
+  through `rauhad` on the host. The Linux guest-agent path compiled in Lima but
+  still requires macOS VM/vsock CI for runtime verification.
+
+Verification:
+
+- macOS `cargo check -p rauhad` passed on the host with existing warnings.
+- Host `cargo check -p rauha-shim -p rauha-guest-agent` passed with existing
+  warnings.
+- Linux `cargo build --workspace` passed.
+- Linux `cargo test --workspace` passed, including four focused NUL-rejection
+  tests across `rauha-shim` and `rauha-guest-agent`.
+- Linux `cargo clippy --workspace --all-targets` passed with existing warnings.
+- Linux release build `cargo build --release --bins` passed and produced the
+  size table above.
+- Lima eBPF build `cargo run -p xtask -- build-ebpf` passed. The local stat step
+  could not read a final `rauha-ebpf` artifact at the path printed by `xtask`;
+  Cargo fingerprint/object files were present under
+  `rauha-ebpf/target/bpfel-unknown-none/debug`.
+- Oracle suite in `eval/oracle` compiled, then failed before exercising Rauha:
+  all 55 cases failed at connection setup because no daemon was listening on
+  `http://[::1]:9876` (`Connection refused`). This requires a running privileged
+  Linux `rauhad` environment.
+
 ## Phase 1: Tracing Subscriber Feature Diet
 
 Lever: workspace direct `tracing-subscriber` dependency features only.

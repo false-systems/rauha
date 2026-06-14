@@ -82,14 +82,12 @@ impl ShimState {
 
         let spec_json = proc.spec_json.clone();
 
-        let pid = container::fork_and_exec(
-            &self.zone_name,
-            id,
-            &spec_json,
-            &self.rootfs_root,
-        )?;
+        let pid = container::fork_and_exec(&self.zone_name, id, &spec_json, &self.rootfs_root)?;
 
-        let proc = self.containers.get_mut(id).unwrap();
+        let proc = self
+            .containers
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("container {id} not found after fork"))?;
         proc.pid = pid;
         proc.status = ContainerStatus::Running;
 

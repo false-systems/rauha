@@ -57,8 +57,14 @@ pub fn serve_attach_session(
         let mut buf = [0u8; 4096];
         loop {
             let poll_fds = &mut [
-                PollFd::new(unsafe { BorrowedFd::borrow_raw(pty_master_fd) }, PollFlags::POLLIN),
-                PollFd::new(unsafe { BorrowedFd::borrow_raw(stream_fd) }, PollFlags::POLLIN),
+                PollFd::new(
+                    unsafe { BorrowedFd::borrow_raw(pty_master_fd) },
+                    PollFlags::POLLIN,
+                ),
+                PollFd::new(
+                    unsafe { BorrowedFd::borrow_raw(stream_fd) },
+                    PollFlags::POLLIN,
+                ),
             ];
 
             match poll(poll_fds, PollTimeout::from(500u16)) {
@@ -89,9 +95,13 @@ pub fn serve_attach_session(
                 if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
                     // One last read attempt to drain buffered data.
                     while let Ok(n) = nix::unistd::read(pty_master_fd, &mut buf) {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         tracing::debug!(bytes = n, "relay: PTY → socket (drain)");
-                        if write_all_fd(stream_fd, &buf[..n]).is_err() { break; }
+                        if write_all_fd(stream_fd, &buf[..n]).is_err() {
+                            break;
+                        }
                     }
                     break;
                 }
@@ -116,7 +126,9 @@ pub fn serve_attach_session(
         }
 
         // Close PTY master fd now that the relay is done.
-        unsafe { libc::close(pty_master_fd); }
+        unsafe {
+            libc::close(pty_master_fd);
+        }
 
         // Clean up socket.
         let _ = std::fs::remove_file(&socket_path);
@@ -174,15 +186,10 @@ pub fn fork_and_exec_pty(
     let master_fd = pty.master.as_raw_fd();
     let slave_fd = pty.slave.as_raw_fd();
 
-    let c_args: Vec<CString> = command
-        .iter()
-        .map(|a| CString::new(a.as_str()).unwrap())
-        .collect();
+    let c_args = cstring_vec(command, "exec.command")?;
 
-    let c_env: Vec<CString> = env
-        .iter()
-        .map(|e| CString::new(e.as_str()).unwrap())
-        .collect();
+    let c_env = cstring_vec(env, "exec.env")?;
+    let term = CString::new("TERM=xterm-256color")?;
 
     // Sync pipe for cgroup enrollment.
     let (pipe_rd, pipe_wr) = nix::unistd::pipe()?;
@@ -232,7 +239,6 @@ pub fn fork_and_exec_pty(
                     libc::putenv(var.as_ptr() as *mut libc::c_char);
                 }
                 // Set TERM if not already in env.
-                let term = c"TERM=xterm-256color";
                 libc::putenv(term.as_ptr() as *mut libc::c_char);
             }
 
@@ -250,9 +256,7 @@ pub fn fork_and_exec_pty(
             let child_pid = child.as_raw() as u32;
 
             // Enroll child in zone cgroup.
-            let cgroup_path = format!(
-                "/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs"
-            );
+            let cgroup_path = format!("/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs");
             if let Err(e) = std::fs::write(&cgroup_path, child_pid.to_string()) {
                 tracing::warn!(%e, cgroup = cgroup_path, "failed to enroll exec child in cgroup");
             }
@@ -266,9 +270,38 @@ pub fn fork_and_exec_pty(
             // when the session ends (see serve_attach_session).
             std::mem::forget(pty.master);
 
-            tracing::info!(pid = child_pid, container = container_id, "exec process forked with PTY");
+            tracing::info!(
+                pid = child_pid,
+                container = container_id,
+                "exec process forked with PTY"
+            );
             Ok((master_fd, child_pid))
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cstring_vec(values: &[String], field: &str) -> anyhow::Result<Vec<std::ffi::CString>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            std::ffi::CString::new(value.as_str())
+                .map_err(|_| anyhow::anyhow!("{field}[{idx}] contains an interior NUL byte"))
+        })
+        .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::cstring_vec;
+
+    #[test]
+    fn rejects_interior_nul_in_exec_env() {
+        let err = cstring_vec(&["KEY=value\0tail".to_string()], "exec.env")
+            .expect_err("interior NUL must be rejected");
+
+        assert!(err.to_string().contains("exec.env[0]"));
     }
 }
 
