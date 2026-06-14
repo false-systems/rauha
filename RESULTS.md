@@ -91,6 +91,77 @@ Verification:
   `http://[::1]:9876` (`Connection refused`). This requires a running privileged
   Linux `rauhad` environment.
 
+## Phase 1: Tracing Subscriber Feature Diet
+
+Lever: workspace direct `tracing-subscriber` dependency features only.
+
+Before:
+
+```toml
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+```
+
+After:
+
+```toml
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+```
+
+The selected feature set covers the workspace's direct subscriber usage:
+`tracing_subscriber::fmt()`, `EnvFilter::from_default_env()`,
+`with_env_filter(...)`, and `init()`. Rauha does not use subscriber-provided
+ANSI coloring, `tracing-log` bridging, JSON formatting, local time, or valuable
+support on these initialization paths.
+
+Commands:
+
+```sh
+CARGO_TARGET_DIR=$HOME/rauha-target-tracing-diet cargo build --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-tracing-diet-release cargo build --release --bins
+cargo tree -e features -i tracing-subscriber
+```
+
+Release binary size delta:
+
+| Binary | Before bytes | After bytes | Delta | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `rauhad` | 4,212,464 | 4,145,832 | -66,632 | -1.58% |
+| `rauha` | 2,438,776 | 2,437,688 | -1,088 | -0.04% |
+| `rauha-shim` | 2,104,000 | 2,037,376 | -66,624 | -3.17% |
+| `rauha-guest-agent` | 1,907,240 | 1,906,152 | -1,088 | -0.06% |
+| `rauha-enforce` | 2,701,600 | 2,634,968 | -66,632 | -2.47% |
+| `containerd-shim-rauha-v2` | 2,823,528 | 2,823,528 | 0 | 0.00% |
+
+Dependency notes:
+
+- `cargo tree -e features -i tracing-subscriber` no longer shows
+  `tracing-subscriber/default`, `ansi`, `nu-ansi-term`, `tracing-log`, or
+  `smallvec` requested by Rauha.
+- Remaining required subscriber features are `fmt`, `env-filter`, `registry`,
+  `std`, `thread_local`, `matchers`, `once_cell`, `sharded-slab`, and
+  `tracing`.
+- `containerd-shim-rauha-v2` did not shrink measurably under the final stripped
+  size profile; its heavier containerd/TTRPC dependency graph still dominates.
+
+Correctness notes:
+
+- This change does not alter CLI grammar, gRPC contracts, sandbox types, or the
+  `IsolationBackend` trait.
+- No enforcement, policy validation, lifecycle, or fail-closed path is changed.
+- Logging remains initialized with the same `fmt` subscriber and env filter
+  behavior, minus unused default formatting support.
+
+Verification:
+
+- Linux `cargo build --workspace` passed.
+- Linux `cargo test --workspace` passed.
+- Linux `cargo clippy --workspace --all-targets` passed with existing warnings.
+- macOS `cargo check -p rauhad` passed on the host with existing warnings.
+- Oracle suite in `eval/oracle` compiled, then failed before exercising Rauha:
+  all 55 cases failed at connection setup because no daemon was listening on
+  `http://[::1]:9876` (`Connection refused`). This requires a running privileged
+  Linux `rauhad` environment.
+
 Requires privileged/macOS CI verification:
 
 - eBPF LSM load, BPF maps, namespace setup, cgroups, and root integration tests.
