@@ -171,6 +171,79 @@ Verification:
   `http://[::1]:9876` (`Connection refused`). This requires a running privileged
   Linux `rauhad` environment.
 
+## Phase 3: Linux Backend Mutex Poisoning Fails Closed
+
+Lever: Linux backend daemon-state mutex poisoning on lifecycle and enforcement
+paths.
+
+Before:
+
+- `rauhad` aborted the whole process on several poisoned Linux backend mutexes.
+- Some BPF update paths used raw `self.ebpf.lock()` and silently skipped BPF
+  policy/inode work if the mutex was poisoned.
+
+After:
+
+- Linux backend locks go through a typed fail-closed helper that returns
+  `RauhaError::BackendError("linux backend state poisoned: ...")`.
+- Zone ID allocation/lookup/removal are fallible, so create/recover/destroy,
+  policy update, container start/stop, rootfs inode registration, and
+  `verify_isolation` refuse the operation on poisoned state instead of aborting
+  or skipping enforcement work.
+- Rollback remains best-effort, but poisoned rollback state is logged and does
+  not convert an enforcement/setup failure into a permissive success.
+
+Release binary size delta:
+
+| Binary | Before bytes | After bytes | Delta | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `rauhad` | 4,145,664 | 4,145,304 | -360 | -0.01% |
+| `rauha` | 2,437,688 | 2,437,688 | 0 | 0.00% |
+| `rauha-shim` | 2,102,912 | 2,102,912 | 0 | 0.00% |
+| `rauha-guest-agent` | 1,906,152 | 1,906,152 | 0 | 0.00% |
+| `rauha-enforce` | 2,700,504 | 2,700,504 | 0 | 0.00% |
+| `containerd-shim-rauha-v2` | 2,823,528 | 2,823,528 | 0 | 0.00% |
+
+Commands:
+
+```sh
+cargo check -p rauhad
+CARGO_TARGET_DIR=$HOME/rauha-target-lock-strict cargo build --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-lock-strict cargo test --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-lock-strict cargo clippy --workspace --all-targets
+CARGO_TARGET_DIR=$HOME/rauha-target-lock-strict-release cargo build --release --bins
+CARGO_TARGET_DIR=$HOME/rauha-target-lock-strict-ebpf cargo run -p xtask -- build-ebpf
+```
+
+Correctness notes:
+
+- This strengthens request/enforcement-path robustness: poisoned daemon state
+  now refuses the current operation instead of panicking/aborting the daemon or
+  silently skipping BPF updates.
+- No isolation checks, enforcement setup, namespace setup, policy validation, or
+  VM boundaries are relaxed.
+- This change does not alter CLI grammar, gRPC contracts, sandbox types, or the
+  `IsolationBackend` trait.
+- `rauha sandbox` remains the explicit unimplemented contract.
+- The macOS backend is not behaviorally changed and was compile-checked through
+  `rauhad` on the host.
+
+Verification:
+
+- macOS `cargo check -p rauhad` passed on the host with existing warnings.
+- Linux `cargo build --workspace` passed.
+- Linux `cargo test --workspace` passed, including
+  `backend::linux::tests::poisoned_backend_lock_returns_error`.
+- Linux `cargo clippy --workspace --all-targets` passed with existing warnings.
+- Linux release build `cargo build --release --bins` passed and produced the
+  size table above.
+- Lima eBPF build `cargo run -p xtask -- build-ebpf` passed with existing
+  warnings.
+- Oracle suite in `eval/oracle` compiled, then failed before exercising Rauha:
+  all 55 cases failed at connection setup because no daemon was listening on
+  `http://[::1]:9876` (`Connection refused`). This requires a running privileged
+  Linux `rauhad` environment.
+
 ## Phase 1: Tracing Subscriber Feature Diet
 
 Lever: workspace direct `tracing-subscriber` dependency features only.
