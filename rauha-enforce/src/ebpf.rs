@@ -11,7 +11,7 @@ use aya::maps::HashMap as AyaHashMap;
 use aya::maps::RingBuf;
 use aya::programs::Lsm;
 use aya::{Bpf, BpfLoader, Btf};
-use rauha_common::zone::{ZonePolicy, ZoneType};
+use rauha_common::zone::{capabilities_to_mask, ZonePolicy, ZoneType};
 use rauha_ebpf_common::*;
 
 const BPF_PIN_PATH: &str = "/sys/fs/bpf/rauha";
@@ -156,7 +156,7 @@ impl EnforceEbpf {
 
     /// Set enforcement policy for a zone.
     pub fn set_zone_policy(&mut self, zone_id: u32, policy: &ZonePolicy) -> anyhow::Result<()> {
-        let kernel_policy = policy_to_kernel(policy);
+        let kernel_policy = policy_to_kernel(policy)?;
 
         let mut map: AyaHashMap<_, u32, ZonePolicyKernel> = AyaHashMap::try_from(
             self.bpf.map_mut("ZONE_POLICY")
@@ -230,8 +230,8 @@ fn find_ebpf_object() -> anyhow::Result<PathBuf> {
     )
 }
 
-fn policy_to_kernel(policy: &ZonePolicy) -> ZonePolicyKernel {
-    let caps_mask = caps_to_mask(&policy.capabilities.allowed);
+fn policy_to_kernel(policy: &ZonePolicy) -> anyhow::Result<ZonePolicyKernel> {
+    let caps_mask = capabilities_to_mask(&policy.capabilities.allowed)?;
 
     let mut flags = 0u32;
     if policy.capabilities.allowed.iter().any(|c| {
@@ -245,11 +245,11 @@ fn policy_to_kernel(policy: &ZonePolicy) -> ZonePolicyKernel {
         flags |= POLICY_FLAG_ALLOW_HOST_NET;
     }
 
-    ZonePolicyKernel {
+    Ok(ZonePolicyKernel {
         caps_mask,
         flags,
         _pad: 0,
-    }
+    })
 }
 
 /// Offset definitions: (struct, field, global_name, default)

@@ -7,7 +7,7 @@ use aya::maps::HashMap as AyaHashMap;
 use aya::Bpf;
 
 use rauha_common::error::{RauhaError, Result};
-use rauha_common::zone::{ZonePolicy, ZoneType};
+use rauha_common::zone::{capabilities_to_mask, ZonePolicy, ZoneType};
 use rauha_ebpf_common::*;
 
 pub struct MapManager;
@@ -79,7 +79,7 @@ impl MapManager {
 
     /// Set the enforcement policy for a zone in the BPF map.
     pub fn set_zone_policy(bpf: &mut Bpf, zone_id: u32, policy: &ZonePolicy) -> Result<()> {
-        let kernel_policy = policy_to_kernel(policy);
+        let kernel_policy = policy_to_kernel(policy)?;
 
         let mut map: AyaHashMap<_, u32, ZonePolicyKernel> =
             AyaHashMap::try_from(bpf.map_mut("ZONE_POLICY").ok_or_else(|| {
@@ -344,8 +344,8 @@ pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> 
 /// Convert userspace ZonePolicy to kernel-side ZonePolicyKernel.
 ///
 /// Maps capability names to a bitmask and policy settings to flag bits.
-fn policy_to_kernel(policy: &ZonePolicy) -> ZonePolicyKernel {
-    let caps_mask = caps_to_mask(&policy.capabilities.allowed);
+fn policy_to_kernel(policy: &ZonePolicy) -> Result<ZonePolicyKernel> {
+    let caps_mask = capabilities_to_mask(&policy.capabilities.allowed)?;
 
     let mut flags = 0u32;
     // Allow ptrace if SYS_PTRACE capability is granted.
@@ -360,11 +360,11 @@ fn policy_to_kernel(policy: &ZonePolicy) -> ZonePolicyKernel {
         flags |= POLICY_FLAG_ALLOW_HOST_NET;
     }
 
-    ZonePolicyKernel {
+    Ok(ZonePolicyKernel {
         caps_mask,
         flags,
         _pad: 0,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn policy_to_kernel_default_has_empty_capability_allow_list() {
-        let k = policy_to_kernel(&ZonePolicy::default());
+        let k = policy_to_kernel(&ZonePolicy::default()).unwrap();
         assert_eq!(k.caps_mask, 0);
         assert_eq!(k.flags, 0);
         assert_eq!(k._pad, 0);
@@ -388,25 +388,25 @@ mod tests {
 
     #[test]
     fn policy_to_kernel_empty_capabilities_mean_allow_none() {
-        let k = policy_to_kernel(&default_policy_with_caps(vec![]));
+        let k = policy_to_kernel(&default_policy_with_caps(vec![])).unwrap();
         assert_eq!(k.caps_mask, 0);
     }
 
     #[test]
     fn policy_to_kernel_sets_ptrace_flag_from_cap() {
-        let k = policy_to_kernel(&default_policy_with_caps(vec!["CAP_SYS_PTRACE"]));
+        let k = policy_to_kernel(&default_policy_with_caps(vec!["CAP_SYS_PTRACE"])).unwrap();
         assert_ne!(k.flags & POLICY_FLAG_ALLOW_PTRACE, 0);
     }
 
     #[test]
     fn policy_to_kernel_sets_ptrace_flag_from_short_form() {
-        let k = policy_to_kernel(&default_policy_with_caps(vec!["SYS_PTRACE"]));
+        let k = policy_to_kernel(&default_policy_with_caps(vec!["SYS_PTRACE"])).unwrap();
         assert_ne!(k.flags & POLICY_FLAG_ALLOW_PTRACE, 0);
     }
 
     #[test]
     fn policy_to_kernel_ptrace_flag_case_insensitive() {
-        let k = policy_to_kernel(&default_policy_with_caps(vec!["cap_sys_ptrace"]));
+        let k = policy_to_kernel(&default_policy_with_caps(vec!["cap_sys_ptrace"])).unwrap();
         assert_ne!(k.flags & POLICY_FLAG_ALLOW_PTRACE, 0);
     }
 
@@ -414,27 +414,27 @@ mod tests {
     fn policy_to_kernel_host_network_sets_flag() {
         let mut p = ZonePolicy::default();
         p.network.mode = NetworkMode::Host;
-        let k = policy_to_kernel(&p);
+        let k = policy_to_kernel(&p).unwrap();
         assert_ne!(k.flags & POLICY_FLAG_ALLOW_HOST_NET, 0);
     }
 
     #[test]
     fn policy_to_kernel_isolated_network_no_flag() {
         let p = ZonePolicy::default(); // default is Isolated
-        let k = policy_to_kernel(&p);
+        let k = policy_to_kernel(&p).unwrap();
         assert_eq!(k.flags & POLICY_FLAG_ALLOW_HOST_NET, 0);
     }
 
     #[test]
     fn policy_to_kernel_caps_mask_correct() {
-        let k = policy_to_kernel(&default_policy_with_caps(vec!["CAP_NET_ADMIN", "CAP_SYS_ADMIN"]));
+        let k = policy_to_kernel(&default_policy_with_caps(vec!["CAP_NET_ADMIN", "CAP_SYS_ADMIN"]))
+            .unwrap();
         // CAP_NET_ADMIN = bit 12, CAP_SYS_ADMIN = bit 21
         assert_eq!(k.caps_mask, (1 << 12) | (1 << 21));
     }
 
     #[test]
-    fn policy_to_kernel_unknown_cap_ignored() {
-        let k = policy_to_kernel(&default_policy_with_caps(vec!["CAP_NONEXISTENT"]));
-        assert_eq!(k.caps_mask, 0);
+    fn policy_to_kernel_unknown_cap_rejected() {
+        assert!(policy_to_kernel(&default_policy_with_caps(vec!["CAP_NONEXISTENT"])).is_err());
     }
 }

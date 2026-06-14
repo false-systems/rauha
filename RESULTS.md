@@ -319,6 +319,88 @@ Requires privileged/macOS CI verification:
   namespaces, BPF maps, and resource controllers.
 - macOS Virtualization.framework VM lifecycle and vsock paths.
 
+## Phase 3: Strict Policy Parsing
+
+Lever: policy input validation only.
+
+Before:
+
+- TOML policy structs accepted unknown top-level and nested keys.
+- Unknown Linux capability names were accepted by policy parsing and silently
+  collapsed out of the kernel capability mask.
+- Programmatic `ZonePolicy` values with unknown capability names could reach
+  `rauhad` / `rauha-enforce` BPF map conversion and produce a narrower or empty
+  mask without an explicit validation error.
+
+After:
+
+- Policy TOML deserialization uses `deny_unknown_fields` for every policy
+  section.
+- Linux capability names are validated in `rauha-common`; short names and case
+  variation remain accepted (`net_admin`, `CAP_NET_ADMIN`, etc.).
+- Unknown capability names return `InvalidPolicy` before a policy reaches BPF
+  map conversion.
+- `rauhad` and `rauha-enforce` both use the shared validator when building
+  `ZonePolicyKernel`.
+
+Release binary size delta:
+
+| Binary | Before bytes | After bytes | Delta | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `rauhad` | 4,145,664 | 4,145,664 | 0 | 0.00% |
+| `rauha` | 2,437,688 | 2,437,688 | 0 | 0.00% |
+| `rauha-shim` | 2,037,376 | 2,037,376 | 0 | 0.00% |
+| `rauha-guest-agent` | 1,906,152 | 1,906,152 | 0 | 0.00% |
+| `rauha-enforce` | 2,634,968 | 2,700,504 | +65,536 | +2.49% |
+| `containerd-shim-rauha-v2` | 2,823,528 | 2,823,528 | 0 | 0.00% |
+
+eBPF object size delta:
+
+| Artifact | Before bytes | After bytes | Delta | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `rauha-ebpf` object | 11,440 | 11,440 | 0 | 0.00% |
+
+Commands:
+
+```sh
+cargo check -p rauhad
+CARGO_TARGET_DIR=$HOME/rauha-target-policy-strict cargo build --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-policy-strict cargo test --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-policy-strict cargo clippy --workspace --all-targets
+CARGO_TARGET_DIR=$HOME/rauha-target-policy-strict-release cargo build --release --bins
+CARGO_TARGET_DIR=$HOME/rauha-target-policy-strict-ebpf cargo run -p xtask -- build-ebpf
+```
+
+Correctness notes:
+
+- This strengthens strict parsing and deny-by-default policy semantics.
+- This change does not alter CLI grammar, gRPC contracts, sandbox types, or the
+  `IsolationBackend` trait.
+- `rauha sandbox` remains the explicit unimplemented contract.
+- The macOS backend is not behaviorally changed and was compile-checked through
+  `rauhad` on the host.
+
+Verification:
+
+- macOS `cargo check -p rauhad` passed on the host with existing warnings.
+- Linux `cargo build --workspace` passed.
+- Linux `cargo test --workspace` passed.
+- Linux `cargo clippy --workspace --all-targets` passed with existing warnings.
+- Linux release build `cargo build --release --bins` passed and produced the
+  size table above.
+- Lima eBPF build `cargo run -p xtask -- build-ebpf` passed and produced the
+  object-size table above.
+- Oracle suite in `eval/oracle` compiled, then failed before exercising Rauha:
+  all 55 cases failed at connection setup because no daemon was listening on
+  `http://[::1]:9876` (`Connection refused`). This requires a running privileged
+  Linux `rauhad` environment.
+
+Requires privileged/macOS CI verification:
+
+- Linux BPF map policy updates with rejected unknown capabilities through the
+  actual daemon lifecycle.
+- macOS Virtualization.framework VM lifecycle and vsock paths.
+
 ## Phase 1: Tokio Feature Diet
 
 Lever: workspace direct Tokio dependency features only.
