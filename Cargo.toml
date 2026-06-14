@@ -29,7 +29,7 @@ strip = "symbols"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", default-features = false, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 # gRPC
 tonic = "0.12"

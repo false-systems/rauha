@@ -95,3 +95,73 @@ Requires privileged/macOS CI verification:
 
 - eBPF LSM load, BPF maps, namespace setup, cgroups, and root integration tests.
 - macOS Virtualization.framework VM lifecycle and vsock paths.
+
+## Phase 1: Tokio Feature Diet
+
+Lever: workspace direct Tokio dependency features only.
+
+Before:
+
+```toml
+tokio = { version = "1", features = ["full"] }
+```
+
+After:
+
+```toml
+tokio = { version = "1", default-features = false, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+```
+
+The selected direct feature set covers the workspace's direct Tokio usage:
+`#[tokio::main]`, `#[tokio::test]`, `tokio::spawn`, `spawn_blocking`,
+`select!`, timers, signals, Unix streams, async stdio, async read/write
+helpers, and sync channels/locks.
+
+Commands:
+
+```sh
+CARGO_TARGET_DIR=$HOME/rauha-target-tokio-diet cargo build --workspace
+CARGO_TARGET_DIR=$HOME/rauha-target-tokio-diet-release cargo build --release --bins
+cargo tree -e features -i tokio
+```
+
+The release binary size delta is zero for this lever:
+
+| Binary | Before bytes | After bytes | Delta | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `rauhad` | 4,212,464 | 4,212,464 | 0 | 0.00% |
+| `rauha` | 2,438,776 | 2,438,776 | 0 | 0.00% |
+| `rauha-shim` | 2,104,000 | 2,104,000 | 0 | 0.00% |
+| `rauha-guest-agent` | 1,907,240 | 1,907,240 | 0 | 0.00% |
+| `rauha-enforce` | 2,701,600 | 2,701,600 | 0 | 0.00% |
+| `containerd-shim-rauha-v2` | 2,823,528 | 2,823,528 | 0 | 0.00% |
+
+Dependency notes:
+
+- Rauha no longer requests `tokio/full` directly from the workspace dependency.
+- `cargo tree -e features -i tokio` still shows `tokio/full` enabled
+  transitively by `containerd-shim v0.10.0`, including `fs`, `process`, and
+  `parking_lot`. That transitive dependency explains the zero-byte binary-size
+  result.
+- The next measurable dependency-size lever is likely around the
+  `containerd-shim`/TTRPC stack or feature-gating the shim binary, not Tokio
+  features in Rauha's direct dependency declaration.
+
+Correctness notes:
+
+- This change does not alter CLI grammar, gRPC contracts, sandbox types, or the
+  `IsolationBackend` trait.
+- No isolation checks, enforcement setup, policy validation, or fail-closed
+  paths are relaxed.
+- `rauha sandbox` remains the explicit unimplemented contract.
+
+Verification:
+
+- Linux `cargo build --workspace` passed.
+- Linux `cargo test --workspace` passed.
+- Linux `cargo clippy --workspace --all-targets` passed with existing warnings.
+- macOS `cargo check -p rauhad` passed on the host with existing warnings.
+- Oracle suite in `eval/oracle` compiled, then failed before exercising Rauha:
+  all 55 cases failed at connection setup because no daemon was listening on
+  `http://[::1]:9876` (`Connection refused`). This requires a running privileged
+  Linux `rauhad` environment.
