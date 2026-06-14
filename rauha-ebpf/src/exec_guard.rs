@@ -20,7 +20,7 @@ pub fn bprm_check_security(ctx: &LsmContext) -> i32 {
         Ok(ret) => (ret, false),
         Err(_) => {
             emit_error_event(HOOK_BPRM_CHECK);
-            (0, true)
+            (-1, true)
         }
     };
     count_decision(PROG_BPRM_CHECK, ret == 0, is_error);

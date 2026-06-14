@@ -24,7 +24,7 @@ pub fn file_open(ctx: &LsmContext) -> i32 {
         Ok(ret) => (ret, false),
         Err(_) => {
             emit_error_event(HOOK_FILE_OPEN);
-            (0, true)
+            (-1, true)
         }
     };
     count_decision(PROG_FILE_OPEN, ret == 0, is_error);

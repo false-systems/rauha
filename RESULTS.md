@@ -167,6 +167,67 @@ Requires privileged/macOS CI verification:
 - eBPF LSM load, BPF maps, namespace setup, cgroups, and root integration tests.
 - macOS Virtualization.framework VM lifecycle and vsock paths.
 
+## Phase 3: eBPF Hook Error Paths Fail Closed
+
+Lever: eBPF LSM hook internal error branches only.
+
+Before:
+
+- `file_open`, `bprm_check_security`, `ptrace_access_check`, `task_kill`,
+  `cgroup_attach_task`, and `capable` emitted an error event on internal
+  lookup/logic failure, then returned allow from the hook.
+
+After:
+
+- The same error branches still emit the error event, but return deny from the
+  hook. Explicit unzoned, global, same-zone, and allow-list paths are unchanged.
+- `socket_connect` remains unchanged because it is currently audit-only and
+  network enforcement is delegated outside this hook.
+
+eBPF object size delta:
+
+| Artifact | Before bytes | After bytes | Delta | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `rauha-ebpf` object | 11,152 | 11,192 | +40 | +0.36% |
+
+Commands:
+
+```sh
+CARGO_TARGET_DIR=$HOME/rauha-target-ebpf-before cargo run -p xtask -- build-ebpf
+CARGO_TARGET_DIR=$HOME/rauha-target-ebpf-after-obj cargo run -p xtask -- build-ebpf
+stat -c '%s' $HOME/rauha-target-ebpf-before/bpfel-unknown-none/debug/rauha-ebpf
+stat -c '%s' $HOME/rauha-target-ebpf-after-obj/bpfel-unknown-none/debug/rauha-ebpf
+```
+
+Correctness notes:
+
+- This strengthens fail-closed behavior and does not add a permissive fallback.
+- This change does not alter CLI grammar, gRPC contracts, sandbox types, or the
+  `IsolationBackend` trait.
+- `rauha sandbox` remains the explicit unimplemented contract.
+- Capability policy semantics for missing/zero policy entries are intentionally
+  left for a separate deny-by-default policy lever with focused tests.
+
+Verification:
+
+- Linux `cargo build --workspace` passed.
+- Linux `cargo test --workspace` passed.
+- Linux `cargo clippy --workspace --all-targets` passed with existing warnings.
+- macOS `cargo check -p rauhad` passed on the host with existing warnings.
+- Lima eBPF build `cargo run -p xtask -- build-ebpf` passed after installing
+  `rust-src` for nightly and `bpf-linker`. Host eBPF build failed because the
+  local `bpf-linker` could not find an LLVM shared library.
+- Oracle suite in `eval/oracle` compiled, then failed before exercising Rauha:
+  all 55 cases failed at connection setup because no daemon was listening on
+  `http://[::1]:9876` (`Connection refused`). This requires a running privileged
+  Linux `rauhad` environment.
+
+Requires privileged/macOS CI verification:
+
+- eBPF LSM load, verifier acceptance, hook attach, and runtime deny behavior for
+  the changed hook error branches.
+- macOS Virtualization.framework VM lifecycle and vsock paths.
+
 ## Phase 1: Tokio Feature Diet
 
 Lever: workspace direct Tokio dependency features only.

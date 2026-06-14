@@ -22,7 +22,7 @@ pub fn ptrace_access_check(ctx: &LsmContext) -> i32 {
         Ok(ret) => (ret, false),
         Err(_) => {
             crate::emit_error_event(HOOK_PTRACE_CHECK);
-            (0, true)
+            (-1, true)
         }
     };
     count_decision(PROG_PTRACE_CHECK, ret == 0, is_error);
