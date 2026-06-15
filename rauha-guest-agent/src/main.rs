@@ -74,7 +74,10 @@ impl AgentState {
         let pid = container::fork_and_exec(id, &spec_json, &self.rootfs_root)
             .map_err(|e| e.to_string())?;
 
-        let proc = self.containers.get_mut(id).unwrap();
+        let proc = self
+            .containers
+            .get_mut(id)
+            .ok_or_else(|| format!("container {id} not found after fork"))?;
         proc.pid = pid;
         proc.status = ContainerStatus::Running;
         Ok(pid)
@@ -127,18 +130,14 @@ fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse 
             Ok(pid) => ShimResponse::Created { pid },
             Err(e) => ShimResponse::Error { message: e },
         },
-        ShimRequest::StopContainer { id, signal } => {
-            match state.stop_container(&id, signal) {
-                Ok(()) => ShimResponse::Ok,
-                Err(e) => ShimResponse::Error { message: e },
-            }
-        }
-        ShimRequest::Signal { id, signal } => {
-            match state.stop_container(&id, signal) {
-                Ok(()) => ShimResponse::Ok,
-                Err(e) => ShimResponse::Error { message: e },
-            }
-        }
+        ShimRequest::StopContainer { id, signal } => match state.stop_container(&id, signal) {
+            Ok(()) => ShimResponse::Ok,
+            Err(e) => ShimResponse::Error { message: e },
+        },
+        ShimRequest::Signal { id, signal } => match state.stop_container(&id, signal) {
+            Ok(()) => ShimResponse::Ok,
+            Err(e) => ShimResponse::Error { message: e },
+        },
         ShimRequest::GetState { id } => match state.get_state(&id) {
             Some((pid, status, exit_code)) => ShimResponse::State {
                 pid,
@@ -196,17 +195,15 @@ fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse 
             let vsock_port = attach::allocate_session_port();
 
             match attach::fork_and_exec_pty(&state.rootfs_root, &id, &command, &env) {
-                Ok((master_fd, _pid)) => {
-                    match attach::serve_vsock_session(master_fd, vsock_port) {
-                        Ok(()) => ShimResponse::ExecReady {
-                            socket_path: None,
-                            vsock_port: Some(vsock_port),
-                        },
-                        Err(e) => ShimResponse::Error {
-                            message: format!("failed to create vsock session: {e}"),
-                        },
-                    }
-                }
+                Ok((master_fd, _pid)) => match attach::serve_vsock_session(master_fd, vsock_port) {
+                    Ok(()) => ShimResponse::ExecReady {
+                        socket_path: None,
+                        vsock_port: Some(vsock_port),
+                    },
+                    Err(e) => ShimResponse::Error {
+                        message: format!("failed to create vsock session: {e}"),
+                    },
+                },
                 Err(e) => ShimResponse::Error {
                     message: format!("exec failed: {e}"),
                 },
@@ -265,13 +262,7 @@ fn init_filesystems() {
 
     for (src, target, fstype, flags) in &mounts {
         let _ = std::fs::create_dir_all(target);
-        if let Err(e) = mount(
-            Some(*src),
-            *target,
-            Some(*fstype),
-            *flags,
-            None::<&str>,
-        ) {
+        if let Err(e) = mount(Some(*src), *target, Some(*fstype), *flags, None::<&str>) {
             eprintln!("  mount {target}: {e}");
         }
     }
@@ -319,7 +310,10 @@ fn listen_vsock(port: u16, state: &mut AgentState) -> anyhow::Result<()> {
 
     let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 {
-        anyhow::bail!("failed to create vsock socket: {}", std::io::Error::last_os_error());
+        anyhow::bail!(
+            "failed to create vsock socket: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     let addr = SockaddrVm {
@@ -338,14 +332,21 @@ fn listen_vsock(port: u16, state: &mut AgentState) -> anyhow::Result<()> {
         )
     };
     if ret < 0 {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         anyhow::bail!("failed to bind vsock: {}", std::io::Error::last_os_error());
     }
 
     let ret = unsafe { libc::listen(fd, 5) };
     if ret < 0 {
-        unsafe { libc::close(fd); }
-        anyhow::bail!("failed to listen on vsock: {}", std::io::Error::last_os_error());
+        unsafe {
+            libc::close(fd);
+        }
+        anyhow::bail!(
+            "failed to listen on vsock: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     tracing::info!(port, "vsock listening");
@@ -358,7 +359,8 @@ fn listen_vsock(port: u16, state: &mut AgentState) -> anyhow::Result<()> {
         }
 
         // Wrap the fd in a File for Read + Write.
-        let mut stream = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(client_fd) };
+        let mut stream =
+            unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(client_fd) };
 
         match shim::decode_from::<ShimRequest>(&mut stream) {
             Ok(request) => {
@@ -379,7 +381,9 @@ fn listen_vsock(port: u16, state: &mut AgentState) -> anyhow::Result<()> {
         state.reap_children();
     }
 
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
     Ok(())
 }
 
@@ -392,23 +396,21 @@ fn listen_unix(path: &str, state: &mut AgentState) -> anyhow::Result<()> {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
-                match shim::decode_from::<ShimRequest>(&mut stream) {
-                    Ok(request) => {
-                        let response = handle_request(state, request);
-                        if let Err(e) = shim::encode_to(&mut stream, &response) {
-                            tracing::error!(%e, "failed to send response");
-                        }
-                        if state.shutdown {
-                            tracing::info!("shutting down");
-                            break;
-                        }
+            Ok(mut stream) => match shim::decode_from::<ShimRequest>(&mut stream) {
+                Ok(request) => {
+                    let response = handle_request(state, request);
+                    if let Err(e) = shim::encode_to(&mut stream, &response) {
+                        tracing::error!(%e, "failed to send response");
                     }
-                    Err(e) => {
-                        tracing::error!(%e, "failed to decode request");
+                    if state.shutdown {
+                        tracing::info!("shutting down");
+                        break;
                     }
                 }
-            }
+                Err(e) => {
+                    tracing::error!(%e, "failed to decode request");
+                }
+            },
             Err(e) => {
                 tracing::error!(%e, "accept error");
             }

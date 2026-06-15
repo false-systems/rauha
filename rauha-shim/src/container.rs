@@ -63,19 +63,13 @@ pub fn fork_and_exec(
     let (pipe_rd, pipe_wr) = nix::unistd::pipe()?;
 
     // Prepare C strings before fork (allocation not async-signal-safe after fork).
-    let c_args: Vec<CString> = args
-        .iter()
-        .map(|a| CString::new(a.as_str()).unwrap())
-        .collect();
+    let c_args = cstring_vec(args, "process.args")?;
 
-    let env_vars: Vec<CString> = process
+    let env_vars = process
         .env()
         .as_ref()
-        .map(|vars| {
-            vars.iter()
-                .map(|e| CString::new(e.as_str()).unwrap())
-                .collect::<Vec<CString>>()
-        })
+        .map(|vars| cstring_vec(vars, "process.env"))
+        .transpose()?
         .unwrap_or_default();
 
     let cwd = process.cwd().to_string_lossy().to_string();
@@ -84,12 +78,12 @@ pub fn fork_and_exec(
     let hostname = spec.hostname().clone();
 
     // Pre-allocate log file paths as CStrings for signal-safe use after fork.
-    let stdout_log = std::ffi::CString::new(
-        log_dir.join("stdout.log").to_string_lossy().as_bytes(),
-    ).unwrap_or_default();
-    let stderr_log = std::ffi::CString::new(
-        log_dir.join("stderr.log").to_string_lossy().as_bytes(),
-    ).unwrap_or_default();
+    let stdout_log =
+        std::ffi::CString::new(log_dir.join("stdout.log").to_string_lossy().as_bytes())
+            .unwrap_or_default();
+    let stderr_log =
+        std::ffi::CString::new(log_dir.join("stderr.log").to_string_lossy().as_bytes())
+            .unwrap_or_default();
 
     // Convert OwnedFd to raw fds for use across fork.
     // We manage lifetime manually after fork (child/parent each close their end).
@@ -183,9 +177,7 @@ pub fn fork_and_exec(
             let child_pid = child.as_raw() as u32;
 
             // Enroll child in zone cgroup.
-            let cgroup_path = format!(
-                "/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs"
-            );
+            let cgroup_path = format!("/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs");
             if let Err(e) = std::fs::write(&cgroup_path, child_pid.to_string()) {
                 tracing::warn!(%e, cgroup = cgroup_path, "failed to enroll child in cgroup");
             }
@@ -198,6 +190,31 @@ pub fn fork_and_exec(
             tracing::info!(pid = child_pid, container = container_id, "child forked");
             Ok(child_pid)
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cstring_vec(values: &[String], field: &str) -> anyhow::Result<Vec<std::ffi::CString>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            std::ffi::CString::new(value.as_str())
+                .map_err(|_| anyhow::anyhow!("{field}[{idx}] contains an interior NUL byte"))
+        })
+        .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::cstring_vec;
+
+    #[test]
+    fn rejects_interior_nul_in_process_args() {
+        let err = cstring_vec(&["/bin/sh\0bad".to_string()], "process.args")
+            .expect_err("interior NUL must be rejected");
+
+        assert!(err.to_string().contains("process.args[0]"));
     }
 }
 

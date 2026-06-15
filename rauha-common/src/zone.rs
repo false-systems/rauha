@@ -237,6 +237,7 @@ pub struct IsolationCheck {
 
 /// TOML policy file format — deserialized from user-provided files.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFile {
     pub zone: PolicyFileZone,
     pub capabilities: Option<PolicyFileCapabilities>,
@@ -248,6 +249,7 @@ pub struct PolicyFile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFileZone {
     pub name: String,
     #[serde(rename = "type", default = "default_zone_type_str")]
@@ -259,11 +261,13 @@ fn default_zone_type_str() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFileCapabilities {
     pub allowed: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFileResources {
     pub cpu_shares: Option<u64>,
     pub memory_limit: Option<String>,
@@ -272,6 +276,7 @@ pub struct PolicyFileResources {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFileNetwork {
     pub mode: Option<String>,
     pub allowed_zones: Option<Vec<String>>,
@@ -280,6 +285,7 @@ pub struct PolicyFileNetwork {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFileFilesystem {
     pub root: Option<String>,
     pub shared_layers: Option<bool>,
@@ -287,13 +293,88 @@ pub struct PolicyFileFilesystem {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFileDevices {
     pub allowed: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFileSyscalls {
     pub deny: Vec<String>,
+}
+
+const LINUX_CAPABILITIES: &[&str] = &[
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_DAC_READ_SEARCH",
+    "CAP_FOWNER",
+    "CAP_FSETID",
+    "CAP_KILL",
+    "CAP_SETGID",
+    "CAP_SETUID",
+    "CAP_SETPCAP",
+    "CAP_LINUX_IMMUTABLE",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_NET_BROADCAST",
+    "CAP_NET_ADMIN",
+    "CAP_NET_RAW",
+    "CAP_IPC_LOCK",
+    "CAP_IPC_OWNER",
+    "CAP_SYS_MODULE",
+    "CAP_SYS_RAWIO",
+    "CAP_SYS_CHROOT",
+    "CAP_SYS_PTRACE",
+    "CAP_SYS_PACCT",
+    "CAP_SYS_ADMIN",
+    "CAP_SYS_BOOT",
+    "CAP_SYS_NICE",
+    "CAP_SYS_RESOURCE",
+    "CAP_SYS_TIME",
+    "CAP_SYS_TTY_CONFIG",
+    "CAP_MKNOD",
+    "CAP_LEASE",
+    "CAP_AUDIT_WRITE",
+    "CAP_AUDIT_CONTROL",
+    "CAP_SETFCAP",
+    "CAP_MAC_OVERRIDE",
+    "CAP_MAC_ADMIN",
+    "CAP_SYSLOG",
+    "CAP_WAKE_ALARM",
+    "CAP_BLOCK_SUSPEND",
+    "CAP_AUDIT_READ",
+    "CAP_PERFMON",
+    "CAP_BPF",
+    "CAP_CHECKPOINT_RESTORE",
+];
+
+fn canonical_capability_name(capability: &str) -> String {
+    let upper = capability.to_uppercase();
+    if upper.starts_with("CAP_") {
+        upper
+    } else {
+        format!("CAP_{upper}")
+    }
+}
+
+pub fn linux_capability_bit(capability: &str) -> Option<u8> {
+    let name = canonical_capability_name(capability);
+    LINUX_CAPABILITIES
+        .iter()
+        .position(|&known| known == name)
+        .map(|idx| idx as u8)
+}
+
+pub fn capabilities_to_mask(caps: &[impl AsRef<str>]) -> crate::error::Result<u64> {
+    let mut mask = 0u64;
+    for cap in caps {
+        let cap = cap.as_ref();
+        let bit = linux_capability_bit(cap).ok_or_else(|| {
+            crate::error::RauhaError::InvalidPolicy(format!("unknown capability: {cap}"))
+        })?;
+        mask |= 1u64 << bit;
+    }
+    Ok(mask)
 }
 
 impl PolicyFile {
@@ -315,9 +396,13 @@ impl PolicyFile {
         let capabilities = self
             .capabilities
             .as_ref()
-            .map(|c| CapabilityPolicy {
-                allowed: c.allowed.clone(),
+            .map(|c| {
+                capabilities_to_mask(&c.allowed)?;
+                Ok::<CapabilityPolicy, crate::error::RauhaError>(CapabilityPolicy {
+                    allowed: c.allowed.clone(),
+                })
             })
+            .transpose()?
             .unwrap_or_default();
 
         let resources = match &self.resources {
@@ -455,5 +540,16 @@ mod tests {
         assert!(policy.capabilities.allowed.is_empty());
         assert_eq!(policy.resources.cpu_shares, 1024);
         assert_eq!(policy.network.mode, NetworkMode::Isolated);
+    }
+
+    #[test]
+    fn capability_mask_accepts_short_form_and_case_insensitive_names() {
+        let mask = capabilities_to_mask(&["net_admin", "CAP_SYS_PTRACE"]).unwrap();
+        assert_eq!(mask, (1 << 12) | (1 << 19));
+    }
+
+    #[test]
+    fn capability_mask_rejects_unknown_names() {
+        assert!(capabilities_to_mask(&["CAP_NOT_REAL"]).is_err());
     }
 }

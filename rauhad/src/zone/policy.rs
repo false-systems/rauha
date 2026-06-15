@@ -184,4 +184,75 @@ deny = ["mount", "umount2"]
         assert_eq!(policy.network.allowed_zones, vec!["frontend"]);
         assert_eq!(policy.syscalls.deny, vec!["mount", "umount2"]);
     }
+
+    #[test]
+    fn missing_capabilities_section_means_unrestricted() {
+        // An omitted [capabilities] section parses to an empty allow list, which
+        // compiles to caps_mask == 0. The capable() LSM hook treats caps_mask == 0
+        // as "no capability restriction" (allow), NOT "deny every capability" —
+        // see rauha-ebpf/src/capable_guard.rs. Restriction is opt-in.
+        let toml = r#"
+[zone]
+name = "minimal"
+type = "non-global"
+"#;
+
+        let (_zone_type, policy) = parse_policy(toml, "/var/lib/rauha").unwrap();
+        assert!(policy.capabilities.allowed.is_empty());
+    }
+
+    #[test]
+    fn unknown_top_level_policy_key_is_rejected() {
+        let toml = r#"
+[zone]
+name = "strict"
+type = "non-global"
+
+[surprise]
+enabled = true
+"#;
+
+        assert!(parse_policy(toml, "/var/lib/rauha").is_err());
+    }
+
+    #[test]
+    fn unknown_nested_policy_key_is_rejected() {
+        let toml = r#"
+[zone]
+name = "strict"
+type = "non-global"
+extra = "nope"
+"#;
+
+        assert!(parse_policy(toml, "/var/lib/rauha").is_err());
+    }
+
+    #[test]
+    fn unknown_capability_is_rejected() {
+        let toml = r#"
+[zone]
+name = "strict"
+type = "non-global"
+
+[capabilities]
+allowed = ["CAP_NET_BIND_SERVICE", "CAP_NOT_REAL"]
+"#;
+
+        assert!(parse_policy(toml, "/var/lib/rauha").is_err());
+    }
+
+    #[test]
+    fn capability_short_form_is_accepted() {
+        let toml = r#"
+[zone]
+name = "strict"
+type = "non-global"
+
+[capabilities]
+allowed = ["net_bind_service"]
+"#;
+
+        let (_zone_type, policy) = parse_policy(toml, "/var/lib/rauha").unwrap();
+        assert_eq!(policy.capabilities.allowed, vec!["net_bind_service"]);
+    }
 }

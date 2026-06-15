@@ -188,8 +188,10 @@ mod cap_convert {
         "CAP_CHECKPOINT_RESTORE", // 40
     ];
 
-    /// Convert a list of capability name strings to a bitmask.
-    /// Unknown capabilities are silently ignored.
+    /// Convert prevalidated capability name strings to a bitmask.
+    ///
+    /// Policy input must be validated before this low-level fixed-layout
+    /// helper is called. Unknown names have no bit in the kernel mask.
     pub fn caps_to_mask(caps: &[impl AsRef<str>]) -> u64 {
         let mut mask = 0u64;
         for cap in caps {

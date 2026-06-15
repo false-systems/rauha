@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "rauha-common",
     "rauha-ebpf-common",
+    "rauha-evidence",
     "rauhad",
     "rauha-cli",
     "rauha-shim",
@@ -19,9 +20,16 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/rauha-runtime/rauha"
 
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", default-features = false, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 # gRPC
 tonic = "0.12"
@@ -41,7 +49,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 
 # OCI
 oci-spec = "0.7"

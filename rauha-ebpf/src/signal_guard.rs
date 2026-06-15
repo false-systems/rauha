@@ -19,7 +19,7 @@ pub fn task_kill(ctx: &LsmContext) -> i32 {
         Ok(ret) => (ret, false),
         Err(_) => {
             crate::emit_error_event(HOOK_TASK_KILL);
-            (0, true)
+            (-1, true)
         }
     };
     count_decision(PROG_TASK_KILL, ret == 0, is_error);

@@ -279,7 +279,7 @@ unsafe fn maybe_run_self_test() {
 ///
 /// `prog_idx`: program index constant (PROG_FILE_OPEN, etc.)
 /// `allow`: true if the decision was to allow (return 0)
-/// `is_error`: true if the hook hit an error path and fell through
+/// `is_error`: true if the hook hit an error path.
 #[inline(always)]
 fn count_decision(prog_idx: u32, allow: bool, is_error: bool) {
     if let Some(counters) = unsafe { ENFORCEMENT_COUNTERS.get_ptr_mut(prog_idx) } {

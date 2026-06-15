@@ -9,7 +9,7 @@ pub mod macos;
 
 /// Enforcement event broadcast sender type (Linux only).
 #[cfg(target_os = "linux")]
-pub type EventSender = tokio::sync::broadcast::Sender<linux::events::DecodedEvent>;
+pub type EventSender = tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>;
 
 /// Create the platform-appropriate isolation backend.
 #[cfg(target_os = "linux")]

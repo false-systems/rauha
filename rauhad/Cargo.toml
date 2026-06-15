@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 rauha-common = { path = "../rauha-common" }
+rauha-evidence = { path = "../rauha-evidence" }
 rauha-oci = { path = "../rauha-oci" }
 
 tokio = { workspace = true }

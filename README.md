@@ -1,62 +1,102 @@
 # Rauha
 
-Agent sandbox runtime for controlled, observable execution.
+**Your agents run code you didn't write. Rauha runs it inside a zone you can bound, observe, audit, and enforce.**
 
-Rauha is a sandbox runtime for AI agents, built on controlled execution zones.
-It runs agent tasks where they can be bounded, observed, audited, and later
-enforced by the platform underneath them.
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
+[![release](https://img.shields.io/badge/release-v0.1.0-2ea44f.svg)](Cargo.toml)
+[![platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS-informational.svg)](#requirements)
+[![enforcement](https://img.shields.io/badge/enforcement-Syv%C3%A4%20(Linux%20BPF--LSM)-8a2be2.svg)](#rauha-and-syvä)
 
-## Why Rauha Exists
+Rauha is an agent sandbox runtime built on controlled execution **zones**. A
+zone is the task boundary: it ties together filesystem view, processes,
+networking, resources, policy, logs, audit events, and optional kernel
+enforcement into one unit. You give an agent a task; Rauha runs it in a zone and
+hands back a structured result — stdout, stderr, exit code, and the events the
+task produced.
 
-Agents do not just answer questions anymore.
+No bespoke per-agent sandbox. No "run it on the CI box and hope." Run `rauhad`,
+point the CLI at it, give each task a zone.
 
-They run commands, inspect repositories, modify files, generate patches, call
-APIs, open sockets, spawn processes, and execute tools.
+> *Rauha* (Finnish) — *peace*. What you get when untrusted execution stays inside its boundary.
 
-Most of that execution still happens in environments designed for human
-operators:
+On Linux, the zone is built from cgroups, namespaces, networking, and rootfs
+handling; **Syvä** makes the kernel enforce the boundary with BPF-LSM. On macOS,
+the zone *is* a lightweight VM. Same model, two backends.
 
-- local shells
-- CI runners
-- Docker containers
-- Kubernetes jobs
-- ad-hoc sandboxes
+---
 
-Those environments provide structure, but not a clear task-level execution
-contract. Rauha gives each agent task a zone: an isolated, policy-bound runtime
-boundary with structured execution results and auditability.
+## Contents
 
-## The Short Version
+- [Why Rauha is different](#why-rauha-is-different)
+- [Quickstart](#quickstart)
+- [Agent sandboxing](#agent-sandboxing)
+- [Architecture](#architecture)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Control surface](#control-surface)
+- [How zones work](#how-zones-work)
+- [Rauha and Syvä](#rauha-and-syvä)
+- [Limitations (honest)](#limitations-honest)
+- [Build, test, and verify](#build-test-and-verify)
+- [Roadmap](#roadmap)
+- [License](#license)
 
-Rauha runs each task inside a zone.
+## Why Rauha is different
 
-A zone is the boundary around execution:
+- **The task is the unit, not the container.** A zone wraps one agent task —
+  filesystem, processes, network, policy, and audit — and returns a single
+  structured result. You reason about *what the task did*, not about a pile of
+  container IDs.
+- **One boundary, honestly two backends.** Linux uses cgroups + namespaces +
+  networking with optional in-kernel enforcement; macOS gives each zone its own
+  VM. The daemon is platform-agnostic behind one `IsolationBackend` trait — it
+  never knows which OS it is on.
+- **Observability is part of the boundary.** Every zone exposes logs, audit
+  events, and (on Linux) kernel enforcement events through one watch API.
+  Isolation you cannot observe is isolation you cannot trust.
+- **Enforcement belongs to Syvä.** Rauha creates and runs the zones; the Linux
+  kernel-level deny decisions live behind the Syvä enforcement boundary. Rauha
+  does not pretend the sandbox is a hardware boundary.
 
-- filesystem
-- processes
-- networking
-- resources
-- policy
-- logs
-- audit events
-- enforcement events
+## Quickstart
 
-For an agent, a zone is the sandbox around a task. For a container, a zone is
-the runtime boundary around a workload. For Kubernetes, a zone can back a pod
-or workload. On Linux, Syva can enforce those boundaries inside the kernel.
+Run the daemon (development listens on `[::1]:9876`):
 
-Rauha is an agent sandbox runtime built on a zone-based container runtime, with
-Kubernetes integration as one deployment path.
+```sh
+RUST_LOG=rauhad=debug cargo run --bin rauhad
+```
 
-## Agent Sandboxing
+Create a policy-bound zone, pull an image, and run a container in it:
 
-The intended task-level user experience is:
+```sh
+rauha zone create --name frontend --policy policies/standard.toml
+rauha image pull alpine:latest
+rauha run --zone frontend alpine:latest /bin/echo hello
+rauha ps --zone frontend
+```
 
-```bash
+Watch the zone explain itself — logs, live events, and per-zone resource use:
+
+```sh
+rauha logs <container-id>          # stream container stdout/stderr
+rauha events                       # live zone + enforcement events
+rauha top                          # per-zone resource usage
+```
+
+On macOS, install VM assets and re-sign the daemon first (see
+[Requirements](#requirements)); `rauha setup` provisions the kernel and
+initramfs. Add `--json` to any non-streaming command for machine-readable
+output.
+
+## Agent sandboxing
+
+The task-level shape Rauha is built around:
+
+```sh
 rauha sandbox --image python:3.12 --repo-path . -- pytest tests/
 ```
 
-Structured output should look like:
+returning one structured result:
 
 ```json
 {
@@ -73,284 +113,213 @@ Structured output should look like:
 }
 ```
 
-Status: API contract landed, runtime execution planned. The `rauha sandbox`
-CLI command, the `rauha.sandbox.v1.SandboxService` gRPC service, and the
-`SandboxExecResult` types in `rauha-common` are wired through the daemon and
-CLI. Calling the command today returns:
+**Status — contract landed, runtime planned.** The `rauha sandbox` CLI command,
+the `rauha.sandbox.v1.SandboxService` gRPC service (`proto/sandbox.proto`), and
+the result types in `rauha-common` are wired end to end through the daemon and
+CLI. The daemon currently returns `Unimplemented` for `RunSandbox`:
 
-```
+```text
 Error: sandbox execution is not implemented yet; use zone/run/exec commands or see docs/sandbox-runtime.md
 ```
 
-The runtime path — allocating a task zone, starting a container, waiting,
-capturing stdout/stderr/exit code, collecting enforcement events, and cleaning
-up — is the next PR. Once that lands, the JSON result shape above will be
-populated from real execution without changing the user-facing contract.
-
-The current `rauha run` command starts a container in a zone and returns the
-container ID; it is asynchronous container lifecycle, not task-level execution.
-
-## What Is a Zone?
-
-A zone is not only a namespace.
-A zone is not only a cgroup.
-
-A zone is Rauha's unit of execution, policy, isolation, observability, and
-enforcement.
-
-A zone ties together:
-
-- cgroups
-- namespaces
-- rootfs/filesystem view
-- network namespace, bridge, and rules
-- runtime metadata
-- policy
-- audit stream
-- optional kernel enforcement
-
-On macOS, the zone boundary is a lightweight VM. On Linux, the zone boundary is
-constructed from cgroups, namespaces, networking, rootfs handling, and optional
-kernel enforcement.
-
-## What Rauha Gives You
-
-- controlled agent execution
-- isolated task zones
-- structured stdout/stderr/exit-code result contracts
-- filesystem and process boundaries
-- network policy
-- resource limits
-- logs and audit events
-- future or optional Syva-backed kernel enforcement
-- Kubernetes/containerd integration as a deployment path
-
-## Current CLI
-
-The implemented CLI works at the zone and container level:
-
-```bash
-rauha zone create --name frontend --policy policies/standard.toml
-rauha image pull alpine:latest
-rauha run --zone frontend alpine:latest /bin/echo hello
-rauha ps --zone frontend
-rauha logs <container-id>
-rauha exec <container-id> -- /bin/sh
-rauha stop <container-id>
-rauha delete <container-id>
-rauha zone delete --name frontend --force
-```
-
-Use `--json` on non-streaming commands for machine-readable output.
-
-## Beyond Agents: Zone-Based Containers
-
-Rauha's agent sandbox model is built on a general zone runtime.
-
-The runtime can create zones, place containers inside those zones, apply policy,
-record metadata, expose logs, and report isolation state. This is the technical
-foundation beneath the future task-level sandbox command.
-
-Important crates:
-
-| Crate | Purpose |
-| --- | --- |
-| `rauha-common` | Shared types, `IsolationBackend`, zone/container models, sandbox result types, errors, shim IPC |
-| `rauhad` | Daemon, gRPC server, zone registry, metadata, networking, Linux/macOS backends |
-| `rauha-cli` | CLI binary that talks to `rauhad` |
-| `rauha-shim` | Per-zone Linux shim that forks and runs container processes |
-| `rauha-guest-agent` | Guest-side daemon inside macOS VMs |
-| `rauha-oci` | OCI image pull, content store, rootfs preparation |
-| `containerd-shim-rauha-v2` | containerd shim v2 for Kubernetes/containerd integration |
-| `rauha-enforce` | Transitional workload discovery and zone-mapping agent for existing clusters |
-| `rauha-ebpf` | Current in-repo Linux eBPF LSM programs |
-| `rauha-ebpf-common` | Shared fixed-layout kernel/userspace types |
-| `xtask` | Build helper for eBPF and guest-agent artifacts |
-
-## Kubernetes Integration
-
-Kubernetes is a deployment path, not Rauha's primary identity.
-
-The current repository includes `containerd-shim-rauha-v2`, which bridges
-containerd's Task API to `rauhad`:
-
-```text
-kubelet -> containerd -> containerd-shim-rauha-v2 -> rauhad -> Rauha zone
-```
-
-The shim maps a pod sandbox to a Rauha zone and places app containers in that
-zone. This supports the same zone model under Kubernetes through RuntimeClass
-configuration once installed and wired into containerd.
-
-Existing clusters can also be mapped to zones through `rauha-enforce`, which
-watches workload metadata and programs the current enforcement boundary. That
-role is discovery and zone mapping, not Rauha's product identity.
-
-## Syva-Backed Enforcement
-
-Rauha creates the zones. Syva makes the Linux kernel respect them.
-
-Rauha owns:
-
-- runtime lifecycle
-- zone creation and deletion
-- sandbox/container execution
-- policy loading and validation
-- image/rootfs handling
-- networking
-- metadata
-- logs, audit, and user-facing event surfaces
-- Kubernetes/containerd integration
-
-Syva owns:
-
-- Linux kernel enforcement
-- eBPF LSM programs
-- BPF maps
-- ring buffer events
-- file/open enforcement
-- exec enforcement
-- ptrace enforcement
-- signal enforcement
-- cgroup attach enforcement
-- enforcement counters
-- kernel capability verification
-- privileged kernel self-tests
-
-Current Linux enforcement code may still live inside this repository, but
-architecturally it belongs behind the Syva enforcement boundary.
+The runtime path — allocate a task zone, start the container, wait, capture
+stdout/stderr/exit code, collect enforcement events, clean up (or keep the zone
+with `--keep-zone`) — is the next step. When it lands, the JSON above is
+populated from real execution with no change to the user-facing contract. Today,
+`rauha run` is the working asynchronous container path: it starts a container in
+a zone and returns the container ID.
 
 ## Architecture
 
-Rauha is split around the `IsolationBackend` trait in
-`rauha-common/src/backend.rs`. The daemon is platform-agnostic and delegates
-zone/container work to the active backend.
+Policy and tasks come in through the CLI or containerd; the daemon delegates all
+zone/container work to the active platform backend; logs, audit, and enforcement
+events flow back out through one watch API.
 
-Linux backend:
+| Crate | Role |
+| --- | --- |
+| `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux/macOS backends |
+| `rauha-cli` (`rauha`) | Operator CLI over the daemon's gRPC API |
+| `rauha-common` | Shared types, the `IsolationBackend` trait, policy parsing, sandbox result types, shim IPC protocol |
+| `rauha-shim` | Per-*zone* sync process (Linux) — forks and runs container processes |
+| `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
+| `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
+| `rauha-evidence` | Evidence-grade observability schema, projections, and sinks (does not enforce) |
+| `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd's Task API to `rauhad` for Kubernetes |
+| `rauha-enforce` | Legacy in-repo enforcement seed — superseded by Syvä; do not extend |
+| `rauha-ebpf` / `rauha-ebpf-common` | In-repo Linux eBPF LSM programs and shared `repr(C)` types (separate build) |
+| `xtask` | Build helper for eBPF and guest-agent artifacts |
 
-- cgroups v2 for membership and resource grouping
-- namespaces and rootfs setup through the per-zone shim
-- network namespaces, veth pairs, bridge, and nftables
-- current in-repo eBPF LSM integration for syscall-level enforcement
-- enforcement events streamed through a BPF ring buffer and gRPC watch API
+**One shim per zone, not per container.** Zones are the isolation boundary, so
+`rauhad` spawns one `rauha-shim` per zone; the shim forks additional container
+processes on request. This diverges deliberately from containerd's
+one-shim-per-container model.
 
-macOS backend:
+## Features
 
-- one lightweight Linux VM per zone through Virtualization.framework
-- virtio-vsock to the guest agent
-- virtio-fs/APFS clonefile-backed rootfs handling
-- pf anchors for network policy where available
+- **Zone-scoped execution** — filesystem view, processes, network, resources,
+  policy, and audit bound to one task or workload.
+- **Structured task results** — stdout / stderr / exit code / duration /
+  enforcement events captured into one contract (`SandboxService`, runtime
+  landing).
+- **Two isolation backends** — Linux (cgroups v2, namespaces, veth/bridge +
+  nftables NAT, rootfs via the per-zone shim) and macOS (one
+  Virtualization.framework VM per zone, virtio-fs + APFS `clonefile`, pf
+  anchors).
+- **Zone networking** — each zone gets a unique IP from `10.89.0.0/16` via the
+  `rauha0` bridge with nftables NAT masquerade; per-zone forward chains default
+  to drop.
+- **Observability built in** — `rauha logs`, `rauha events`, `rauha trace`, and
+  `rauha top`; on Linux, kernel deny events stream from a BPF ring buffer through
+  the `WatchEvents` gRPC API and `rauha-evidence` normalizes them.
+- **TOML policy** — zone type, filesystem rules, network mode and egress,
+  resource limits, capabilities, and allowed cross-zone communication
+  (`policies/standard.toml`).
+- **Kubernetes deployment path** — `containerd-shim-rauha-v2` maps a pod sandbox
+  to a Rauha zone via `runtimeClassName: rauha`.
 
-The two backends are intentionally different. Linux uses OS-level isolation
-plus optional kernel enforcement. macOS uses a VM boundary per zone.
+## Requirements
 
-## Policy Model
+Rauha runs on Linux and macOS; full kernel enforcement is Linux-only.
 
-Policies are TOML. See `policies/standard.toml`.
+- **Linux (eBPF enforcement)** — Linux 6.1+ with `CONFIG_BPF_LSM=y`,
+  `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`; boot parameter
+  `lsm=lockdown,capability,bpf`; BTF at `/sys/kernel/btf/vmlinux`. The Linux
+  daemon **fails closed**: it requires root and a working BPF-LSM kernel, and
+  refuses to start without kernel enforcement. There is no degraded Linux mode:
+  running zones without Syvä/BPF-LSM enforcement would weaken the isolation
+  contract. For rootless local iteration, use the macOS backend.
+- **macOS (Virtualization.framework)** — macOS 15+ on Apple Silicon or Intel
+  with VT-x. `rauhad` must be signed after every build:
+  `codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad`.
+  VM assets (vmlinux + initramfs) install to `/var/lib/rauha/vm/` via
+  `rauha setup`.
 
-Policy can describe:
+Root directory: `/var/lib/rauha` on Linux, `/tmp/rauha` on macOS (override with
+`RAUHA_ROOT`).
 
-- zone type
-- filesystem rules
-- network mode and egress
-- resource limits
-- capabilities
-- syscall policy
-- devices
-- allowed zone communication
+## Control surface
 
-Rauha owns user-facing policy. Linux kernel-facing enforcement policy should
-eventually be translated into Syva's policy and map model behind an explicit
-boundary.
+The CLI is a thin client of the daemon's gRPC API (`RAUHA_ADDR`, default
+`http://[::1]:9876`).
 
-## Current Status
+```sh
+rauha zone create --name frontend --policy policies/standard.toml
+rauha zone list
+rauha image pull alpine:latest
+rauha run --zone frontend alpine:latest /bin/echo hello
+rauha ps --zone frontend
+rauha exec <container-id> -- /bin/sh    # exec in a running container
+rauha attach <container-id>             # attach to a running container
+rauha logs <container-id>               # stream stdout/stderr
+rauha events                            # live zone + enforcement events
+rauha trace --zone frontend             # per-zone syscall trace
+rauha top                               # per-zone resource usage
+rauha policy show --zone frontend
+rauha stop <container-id> && rauha delete <container-id>
+rauha zone delete --name frontend --force
+rauha sandbox --image python:3.12 -- pytest   # task-level (runtime landing)
+```
 
-Implemented today:
+`trace`, `top`, `events`, `logs`, `exec`, `attach`, and `setup` are streaming or
+interactive and do not take `--json`.
 
-- zone create/list/show/delete
-- policy parse/apply/show
-- container create/start/stop/delete/list
-- image pull/list/inspect/remove
-- logs, exec, attach, trace/events surfaces
-- `IsolationBackend` abstraction
-- Linux backend with cgroups, namespaces, networking, shim orchestration, and
-  current in-repo eBPF LSM support
-- macOS VM-per-zone backend path
-- containerd shim v2 code path
-- `rauha-enforce` transitional workload discovery/zone mapping agent
-- structured sandbox result types in `rauha-common`
-- gRPC oracle suite under `eval/oracle`
+## How zones work
 
-Planned:
+A zone is not just a namespace and not just a cgroup. It is Rauha's unit of
+execution, policy, isolation, observability, and enforcement, tying together:
+cgroups, namespaces, rootfs/filesystem view, network namespace + bridge + rules,
+runtime metadata, policy, the audit stream, and optional kernel enforcement.
 
-- `rauha sandbox` task-level CLI
-- synchronous sandbox execution API
-- structured task result emission from the daemon
-- cleanup/keep-zone behavior for task zones
-- sandbox enforcement event collection in task results
-- explicit Syva enforcer boundary
-- external Syva integration
-- Kubernetes installation docs and RuntimeClass examples
+User-visible zone IDs are UUIDs (persisted in redb, the source of truth on crash
+recovery); kernel-side they compact to `u32` BPF map keys. On startup `rauhad`
+reconciles from redb — re-establishing cgroups, networking, and (on Linux) BPF
+map state — then cleans up orphaned kernel state. On macOS the zone boundary is
+the VM itself, so no cgroups or namespaces are needed.
 
-Future:
+## Rauha and Syvä
 
-- move or wrap in-repo eBPF code behind Syva
-- privileged Syva/Rauha kernel enforcement test suite
-- richer agent orchestration/SDK surfaces
-- deeper workload discovery for existing clusters
+**Rauha creates the zones. Syvä makes the Linux kernel respect them.**
 
-## Building and Testing
+| Rauha owns | Syvä owns |
+| --- | --- |
+| Runtime lifecycle, zone create/delete | Linux kernel enforcement (BPF-LSM) |
+| Sandbox/container execution | eBPF programs, BPF maps, ring-buffer events |
+| Policy loading and validation | file / exec / ptrace / signal / socket deny decisions |
+| Image, rootfs, networking, metadata | per-hook counters and privileged self-tests |
+| Logs, audit, user-facing event surfaces | the in-kernel deny-before-it-happens decision |
+| Kubernetes / containerd integration | |
 
-```bash
-cargo build
-cargo test
-cargo build --bin rauhad
-cargo build --bin rauha
-cargo build --bin rauha-shim
-cargo build --bin rauha-guest-agent
-cargo build --bin rauha-enforce
+Syvä is a separate product ([`github.com/false-systems/syva`](https://github.com/false-systems/syva)).
+Current Linux eBPF code may still live in this repository, but architecturally it
+belongs behind the Syvä enforcement boundary; the `rauha-enforce` crate is a
+legacy seed and is not extended. See
+[`docs/rauha-syva-boundary.md`](docs/rauha-syva-boundary.md).
+
+## Limitations (honest)
+
+- **`rauha sandbox` is a contract, not yet a runtime** — the daemon returns
+  `Unimplemented` for `RunSandbox` today. Use `zone` / `run` / `exec` meanwhile.
+- **A sandbox, not a hardware boundary** — BPF-LSM is OS-level isolation and is
+  additive-only: it can deny, but cannot override SELinux/AppArmor MAC denials.
+  Covert channels through shared kernel resources are out of scope.
+- **The two backends are different isolation models** — Linux cgroups/namespaces
+  vs. a per-zone VM on macOS; they are not byte-for-byte equivalent.
+- **Linux enforcement needs kernel support** — BPF-LSM, BTF, and compatible
+  struct offsets; offsets are validated at startup and the daemon **refuses to
+  start** rather than run with no enforcement or with wrong offsets.
+- **Kubernetes integration requires containerd + RuntimeClass wiring**;
+  installation docs and examples are still being written.
+
+## Build, test, and verify
+
+```sh
+cargo build                          # all workspace crates
+cargo test                           # all unit tests
 cargo build -p containerd-shim-rauha-v2
+cargo xtask build-ebpf --release     # eBPF object (nightly Rust; separate build)
 ```
 
-Run the daemon:
+Run the daemon and drive it with the CLI:
 
-```bash
+```sh
 RUST_LOG=rauhad=debug cargo run --bin rauhad
-```
-
-Use the CLI:
-
-```bash
 cargo run --bin rauha -- zone create --name test
-cargo run --bin rauha -- image pull alpine:latest
 cargo run --bin rauha -- run --zone test alpine:latest /bin/echo hello
 ```
 
-Build eBPF programs:
+The **oracle** is a ground-truth gRPC suite (55 numbered cases) that validates
+`rauhad` through its public API only — it never reads source or mocks. It needs a
+running daemon:
 
-```bash
-cargo xtask build-ebpf
-```
-
-Oracle tests live in `eval/oracle` and require a running daemon:
-
-```bash
+```sh
 cd eval/oracle
-RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test
+RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test            # all cases
+RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test -- case_001 # one case
 ```
 
-Linux integration tests under `tests/integration` require root and a running
-daemon. eBPF enforcement tests require a kernel with BPF LSM support.
+Linux integration tests under `tests/integration/` require root and a running
+daemon (eBPF gates need a BPF-LSM kernel):
 
-## Trade-Offs
+```sh
+bash tests/integration/test-zone-isolation.sh
+bash tests/integration/test-zone-networking.sh
+bash tests/integration/test-cgroup-lock.sh     # eBPF enforcement required
+```
 
-- eBPF LSM is OS-level isolation, not a hardware boundary.
-- macOS VM-per-zone isolation is a different model from Linux cgroups and
-  namespaces.
-- LSM is additive-only: BPF LSM can deny access but cannot override SELinux,
-  AppArmor, or other MAC denials.
-- Current Linux enforcement depends on kernel support for BPF LSM, BTF, and
-  compatible struct offsets.
-- Covert channels through shared kernel resources are out of scope.
-- Kubernetes integration requires containerd and RuntimeClass configuration.
-- The task-level `rauha sandbox` command is planned, not implemented.
+## Roadmap
+
+- Synchronous `rauha sandbox` runtime: task-zone allocation, execution, result
+  emission, and `--keep-zone` / cleanup behavior.
+- An explicit Syvä enforcer boundary, then external Syvä integration; move or
+  wrap the in-repo eBPF code behind it.
+- A privileged Syvä/Rauha kernel-enforcement test suite.
+- Kubernetes installation docs and `RuntimeClass` examples; deeper workload
+  discovery for existing clusters.
+- Richer agent orchestration / SDK surfaces.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Unless you explicitly
+state otherwise, any contribution intentionally submitted for inclusion in this
+work as defined in the Apache-2.0 license shall be licensed as above, without any
+additional terms or conditions.

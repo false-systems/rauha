@@ -79,10 +79,10 @@ protocol as the Linux shim.
 status or interprets enforcement events **must** check this field.
 A report from Linux and macOS cannot be compared directly.
 
-Agent sandbox results should treat enforcement events as an optional stream:
-Linux/Syva-backed zones can populate them, macOS VM-backed zones may expose
-different audit information, and unsupported/degraded Linux hosts may have no
-kernel enforcement events at all.
+Agent sandbox results should treat enforcement events as backend-specific:
+Linux/Syva-backed zones require eBPF enforcement events to be available before
+the daemon starts, while macOS VM-backed zones may expose different audit
+information through the guest boundary.
 
 ## Known Limitations
 

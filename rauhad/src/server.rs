@@ -4,6 +4,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use rauha_common::error::RauhaError;
+#[cfg(target_os = "linux")]
+use rauha_evidence::{
+    event_name, FalseEventBuilder, FieldValue, ResourceAttrs, Severity, BACKEND_LINUX_EBPF,
+};
 
 use crate::zone::registry::ZoneRegistry;
 
@@ -61,7 +65,7 @@ pub struct ZoneServiceImpl {
     root: String,
     /// Enforcement event broadcast sender (Linux only, None on macOS).
     #[cfg(target_os = "linux")]
-    event_tx: Option<tokio::sync::broadcast::Sender<crate::backend::linux::events::DecodedEvent>>,
+    event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
 }
 
 impl ZoneServiceImpl {
@@ -69,7 +73,7 @@ impl ZoneServiceImpl {
         registry: Arc<ZoneRegistry>,
         root: String,
         #[cfg(target_os = "linux")]
-        event_tx: Option<tokio::sync::broadcast::Sender<crate::backend::linux::events::DecodedEvent>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
     ) -> Self {
         Self {
             registry,
@@ -300,8 +304,15 @@ impl ZoneService for ZoneServiceImpl {
         &self,
         request: Request<pb::zone::WatchEventsRequest>,
     ) -> Result<Response<Self::WatchEventsStream>, Status> {
+        #[cfg(target_os = "linux")]
         let zone_filter = request.into_inner().zone_name;
+        #[cfg(not(target_os = "linux"))]
+        let _ = request.into_inner();
+
+        #[cfg(target_os = "linux")]
         let (tx, rx) = mpsc::channel(128);
+        #[cfg(not(target_os = "linux"))]
+        let (_tx, rx) = mpsc::channel(128);
 
         #[cfg(target_os = "linux")]
         if let Some(event_tx) = &self.event_tx {
@@ -312,20 +323,28 @@ impl ZoneService for ZoneServiceImpl {
                         Ok(event) => {
                             // Filter by zone if requested.
                             if !zone_filter.is_empty() {
-                                // Zone filter matches on caller_zone as string.
-                                // For now, filter on zone_id as string (callers can
-                                // filter by name once we add zone name resolution).
+                                let matches_zone = event.zone.name.as_deref()
+                                    == Some(zone_filter.as_str())
+                                    || event.zone.id == zone_filter;
+                                if !matches_zone {
+                                    continue;
+                                }
                             }
 
                             let grpc_event = pb::zone::ZoneEvent {
-                                zone_name: format!("zone-{}", event.caller_zone),
-                                event_type: "enforcement_deny".to_string(),
-                                message: format!(
-                                    "DENY {} pid={} caller_zone={} target_zone={} context={}",
-                                    event.hook, event.pid, event.caller_zone,
-                                    event.target_zone, event.context
-                                ),
-                                timestamp: event.timestamp_ns.to_string(),
+                                zone_name: event
+                                    .zone
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| event.zone.id.clone()),
+                                event_type: event.event.clone(),
+                                message: event.machine_json().unwrap_or_else(|e| {
+                                    format!(
+                                        r#"{{"event":"{}","serialization_error":"{}"}}"#,
+                                        event.event, e
+                                    )
+                                }),
+                                timestamp: event.ts.clone(),
                             };
 
                             if tx.send(Ok(grpc_event)).await.is_err() {
@@ -334,7 +353,40 @@ impl ZoneService for ZoneServiceImpl {
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(n, "event subscriber lagged, dropped events");
+                            let shed = FalseEventBuilder::new(event_name::PIPELINE_SHED)
+                                .level(Severity::Warn)
+                                .zone(
+                                    if zone_filter.is_empty() {
+                                        "zone-unknown".to_string()
+                                    } else {
+                                        zone_filter.clone()
+                                    },
+                                    None,
+                                )
+                                .resource_attributes(ResourceAttrs::new(BACKEND_LINUX_EBPF))
+                                .field("shed_events", FieldValue::U64(n))
+                                .field(
+                                    "reason",
+                                    FieldValue::String("watch_subscriber_lagged".into()),
+                                )
+                                .build();
+                            if let Ok(shed) = shed {
+                                shed.emit_tracing();
+                                let grpc_event = pb::zone::ZoneEvent {
+                                    zone_name: shed.zone.id.clone(),
+                                    event_type: shed.event.clone(),
+                                    message: shed.machine_json().unwrap_or_else(|e| {
+                                        format!(
+                                            r#"{{"event":"{}","serialization_error":"{}"}}"#,
+                                            shed.event, e
+                                        )
+                                    }),
+                                    timestamp: shed.ts.clone(),
+                                };
+                                if tx.send(Ok(grpc_event)).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }

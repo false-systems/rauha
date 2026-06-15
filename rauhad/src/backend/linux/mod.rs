@@ -28,7 +28,6 @@ pub fn cleanup_network() {
 }
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
@@ -60,19 +59,14 @@ impl ShimConnection {
 
     /// Send a request to the shim and receive a response.
     fn send_request(&self, request: &ShimRequest) -> Result<ShimResponse> {
-        let mut stream = UnixStream::connect(&self.socket_path).map_err(|e| {
-            RauhaError::ShimError {
+        let mut stream =
+            UnixStream::connect(&self.socket_path).map_err(|e| RauhaError::ShimError {
                 zone: self.socket_path.display().to_string(),
                 message: format!("failed to connect to shim: {e}"),
-            }
-        })?;
+            })?;
 
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .ok();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .ok();
+        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
         shim::encode_to(&mut stream, request).map_err(|e| RauhaError::ShimError {
             zone: self.socket_path.display().to_string(),
@@ -86,15 +80,11 @@ impl ShimConnection {
     }
 }
 
-/// Lock a mutex, aborting the process if poisoned.
-///
-/// Mutex poisoning means a thread panicked while holding the lock — the
-/// protected data is in an undefined state. Process abort (not just task
-/// panic) ensures the process actually terminates so systemd can restart it.
-fn lock_or_abort<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|_| {
-        tracing::error!("mutex poisoned — daemon state corrupt, aborting for restart");
-        std::process::abort();
+/// Lock backend state, failing closed if the protected data may be corrupt.
+fn lock_backend<'a, T>(mutex: &'a Mutex<T>, name: &str) -> Result<MutexGuard<'a, T>> {
+    mutex.lock().map_err(|_| {
+        tracing::error!(state = name, "mutex poisoned — refusing backend operation");
+        RauhaError::BackendError(format!("linux backend state poisoned: {name}"))
     })
 }
 
@@ -119,7 +109,7 @@ pub struct LinuxBackend {
     /// Cancellation token for the enforcement event reader task.
     event_reader_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Broadcast sender for enforcement events (gRPC WatchEvents subscribes here).
-    event_tx: Option<tokio::sync::broadcast::Sender<events::DecodedEvent>>,
+    event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
     /// IP address allocator for zone networking.
     ip_allocator: Mutex<IpAllocator>,
 }
@@ -129,32 +119,17 @@ impl LinuxBackend {
         let cgroup = CgroupManager::new()?;
         let ip_allocator = IpAllocator::default_subnet();
 
-        // Try to load eBPF programs. If it fails, log a warning and continue
-        // in degraded mode (no kernel enforcement).
-        let (ebpf, event_reader_cancel, event_tx) = match Self::try_load_ebpf(root) {
-            Ok(mut mgr) => {
-                tracing::info!("eBPF programs loaded — kernel enforcement active");
+        let mut ebpf = Self::try_load_ebpf(root)?;
+        tracing::info!("eBPF programs loaded — kernel enforcement active");
 
-                // Start the enforcement event reader (ring buffer → tracing logs).
-                let (cancel, event_tx) = match mgr.take_event_ring_buf() {
-                    Ok(ring_buf) => {
-                        let token = tokio_util::sync::CancellationToken::new();
-                        let tx = events::spawn_event_reader(ring_buf, token.clone());
-                        (Some(token), Some(tx))
-                    }
-                    Err(e) => {
-                        tracing::warn!(%e, "enforcement event ring buffer not available");
-                        (None, None)
-                    }
-                };
-
-                (Some(mgr), cancel, event_tx)
-            }
-            Err(e) => {
-                tracing::warn!(%e, "eBPF programs not loaded — running without kernel enforcement");
-                (None, None, None)
-            }
-        };
+        let ring_buf = ebpf
+            .take_event_ring_buf()
+            .map_err(|e| RauhaError::EbpfError {
+                message: format!("enforcement event ring buffer not available: {e}"),
+                hint: "check the ENFORCEMENT_EVENTS ring buffer map was created".into(),
+            })?;
+        let event_reader_cancel = tokio_util::sync::CancellationToken::new();
+        let event_tx = events::spawn_event_reader(ring_buf, event_reader_cancel.clone());
 
         // Ensure the network bridge exists with a gateway IP.
         if let Err(e) = network::ensure_bridge(ip_allocator.gateway(), ip_allocator.prefix_len()) {
@@ -164,7 +139,14 @@ impl LinuxBackend {
         // Set up NAT masquerade for zone traffic.
         let subnet_cidr = {
             let s = ip_allocator.subnet();
-            format!("{}.{}.{}.{}/{}", s[0], s[1], s[2], s[3], ip_allocator.prefix_len())
+            format!(
+                "{}.{}.{}.{}/{}",
+                s[0],
+                s[1],
+                s[2],
+                s[3],
+                ip_allocator.prefix_len()
+            )
         };
         if let Err(e) = nftables::ensure_nat(&subnet_cidr) {
             tracing::warn!(%e, "failed to set up NAT — zones won't have internet access");
@@ -172,15 +154,15 @@ impl LinuxBackend {
 
         Ok(Self {
             root: root.into(),
-            ebpf: Mutex::new(ebpf),
+            ebpf: Mutex::new(Some(ebpf)),
             cgroup,
             next_zone_id: AtomicU32::new(1), // 0 is reserved for "no zone".
             zone_id_map: Mutex::new(HashMap::new()),
             zone_name_map: Mutex::new(HashMap::new()),
             shim_connections: Mutex::new(HashMap::new()),
             registered_inodes: Mutex::new(HashMap::new()),
-            event_reader_cancel,
-            event_tx,
+            event_reader_cancel: Some(event_reader_cancel),
+            event_tx: Some(event_tx),
             ip_allocator: Mutex::new(ip_allocator),
         })
     }
@@ -214,25 +196,29 @@ impl LinuxBackend {
     }
 
     /// Get a clone of the enforcement event broadcast sender, if available.
-    pub fn event_sender(&self) -> Option<tokio::sync::broadcast::Sender<events::DecodedEvent>> {
+    pub fn event_sender(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>> {
         self.event_tx.clone()
     }
 
     /// Allocate a new compact zone_id for BPF maps.
-    fn allocate_zone_id(&self, uuid: Uuid) -> u32 {
+    fn allocate_zone_id(&self, uuid: Uuid) -> Result<u32> {
         let id = self.next_zone_id.fetch_add(1, Ordering::Relaxed);
-        self.zone_id_map.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() }).insert(uuid, id);
-        id
+        lock_backend(&self.zone_id_map, "zone_id_map")?.insert(uuid, id);
+        Ok(id)
     }
 
     /// Look up the compact zone_id for a Uuid.
-    fn get_zone_id(&self, uuid: &Uuid) -> Option<u32> {
-        self.zone_id_map.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() }).get(uuid).copied()
+    fn get_zone_id(&self, uuid: &Uuid) -> Result<Option<u32>> {
+        Ok(lock_backend(&self.zone_id_map, "zone_id_map")?
+            .get(uuid)
+            .copied())
     }
 
     /// Remove zone_id mapping.
-    fn remove_zone_id(&self, uuid: &Uuid) -> Option<u32> {
-        self.zone_id_map.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() }).remove(uuid)
+    fn remove_zone_id(&self, uuid: &Uuid) -> Result<Option<u32>> {
+        Ok(lock_backend(&self.zone_id_map, "zone_id_map")?.remove(uuid))
     }
 
     /// Get the socket path for a zone's shim.
@@ -246,7 +232,7 @@ impl LinuxBackend {
 
         // Check if shim is already connected and responsive.
         {
-            let conns = self.shim_connections.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() });
+            let conns = lock_backend(&self.shim_connections, "shim_connections")?;
             if let Some(conn) = conns.get(zone_name) {
                 // Try a quick health check.
                 if conn
@@ -307,9 +293,7 @@ impl LinuxBackend {
 
         // Register connection.
         let conn = ShimConnection::new(socket_path);
-        self.shim_connections
-            .lock()
-            .unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() })
+        lock_backend(&self.shim_connections, "shim_connections")?
             .insert(zone_name.to_string(), conn);
 
         tracing::info!(zone = zone_name, "shim spawned");
@@ -318,7 +302,7 @@ impl LinuxBackend {
 
     /// Send a request to a zone's shim.
     fn shim_request(&self, zone_name: &str, request: &ShimRequest) -> Result<ShimResponse> {
-        let conns = self.shim_connections.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() });
+        let conns = lock_backend(&self.shim_connections, "shim_connections")?;
         let conn = conns.get(zone_name).ok_or_else(|| RauhaError::ShimError {
             zone: zone_name.into(),
             message: "no shim connection".into(),
@@ -348,8 +332,8 @@ impl LinuxBackend {
         zone_id: u32,
         net_policy: &NetworkPolicy,
     ) -> Result<()> {
-        let zone_names = self.zone_name_map.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() });
-        let zone_ids = self.zone_id_map.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() });
+        let zone_names = lock_backend(&self.zone_name_map, "zone_name_map")?;
+        let zone_ids = lock_backend(&self.zone_id_map, "zone_id_map")?;
 
         // Collect the set of peer zone_ids that should be allowed.
         let mut allowed_peer_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -424,15 +408,17 @@ fn find_shim_binary() -> Result<PathBuf> {
 }
 
 impl IsolationBackend for LinuxBackend {
-    fn recover_zone(&self, zone: &ZoneHandle, zone_type: ZoneType, policy: &ZonePolicy) -> Result<()> {
+    fn recover_zone(
+        &self,
+        zone: &ZoneHandle,
+        zone_type: ZoneType,
+        policy: &ZonePolicy,
+    ) -> Result<()> {
         tracing::info!(zone = zone.name, "recovering zone state from metadata");
 
         // Allocate a compact zone_id (these are ephemeral, not persisted).
-        let zone_id = self.allocate_zone_id(zone.id);
-        self.zone_name_map
-            .lock()
-            .unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() })
-            .insert(zone.name.clone(), zone.id);
+        let zone_id = self.allocate_zone_id(zone.id)?;
+        lock_backend(&self.zone_name_map, "zone_name_map")?.insert(zone.name.clone(), zone.id);
 
         // Re-create cgroup if missing (idempotent).
         let cgroup_id = if self.cgroup.zone_cgroup_exists(&zone.name) {
@@ -441,14 +427,13 @@ impl IsolationBackend for LinuxBackend {
             self.cgroup.create_zone_cgroup(&zone.name)?
         };
 
-        // Re-apply resource limits.
-        if let Err(e) = self.cgroup.apply_resources(&zone.name, &policy.resources) {
-            tracing::warn!(%e, zone = zone.name, "failed to re-apply resource limits during recovery");
-        }
+        // Re-apply resource limits. Recovery must fail closed if hard limits
+        // cannot be restored.
+        self.cgroup.apply_resources(&zone.name, &policy.resources)?;
 
         // Re-register IP in allocator if zone has network state.
         if let Some(ref net_state) = zone.network_state {
-            self.ip_allocator.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() }).mark_allocated(net_state.ip());
+            lock_backend(&self.ip_allocator, "ip_allocator")?.mark_allocated(net_state.ip());
         }
 
         // Re-create netns if missing (idempotent).
@@ -462,17 +447,20 @@ impl IsolationBackend for LinuxBackend {
             }
         }
 
-        // Re-populate BPF maps.
-        if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
-            if let Some(ref mut ebpf) = **ebpf_guard {
-                let bpf = ebpf.bpf_mut();
-                if let Err(e) = MapManager::add_zone_member(bpf, cgroup_id, zone_id, zone_type) {
-                    tracing::warn!(%e, zone = zone.name, "failed to re-add zone to BPF map during recovery");
-                }
-                if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, policy) {
-                    tracing::warn!(%e, zone = zone.name, "failed to re-set zone policy during recovery");
-                }
-            }
+        // Re-populate BPF maps. A recovered zone without BPF enforcement must
+        // not be treated as recovered.
+        {
+            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
+            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
+                message: "eBPF manager not available during zone recovery".into(),
+                hint: "restart rauhad after restoring eBPF LSM support".into(),
+            })?;
+            let bpf = ebpf.bpf_mut();
+            // Policy before membership — a recovered cgroup may already hold
+            // running processes, so its ZONE_POLICY must exist before any of
+            // them can resolve as a zone member (else capable() fails closed).
+            MapManager::set_zone_policy(bpf, zone_id, policy)?;
+            MapManager::add_zone_member(bpf, cgroup_id, zone_id, zone_type)?;
         }
 
         tracing::info!(zone = zone.name, zone_id, cgroup_id, "zone recovered");
@@ -524,19 +512,16 @@ impl IsolationBackend for LinuxBackend {
         tracing::info!(zone = config.name, backend = "linux-ebpf", "creating zone");
 
         let zone_uuid = Uuid::new_v4();
-        let zone_id = self.allocate_zone_id(zone_uuid);
+        let zone_id = self.allocate_zone_id(zone_uuid)?;
 
         // Track zone name → uuid mapping.
-        self.zone_name_map
-            .lock()
-            .unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() })
-            .insert(config.name.clone(), zone_uuid);
+        lock_backend(&self.zone_name_map, "zone_name_map")?.insert(config.name.clone(), zone_uuid);
 
         // Step 1: Create cgroup.
         let cgroup_id = match self.cgroup.create_zone_cgroup(&config.name) {
             Ok(id) => id,
             Err(e) => {
-                self.remove_zone_id(&zone_uuid);
+                let _ = self.remove_zone_id(&zone_uuid);
                 return Err(e);
             }
         };
@@ -545,7 +530,7 @@ impl IsolationBackend for LinuxBackend {
         let net_state = if config.policy.network.mode != NetworkMode::Host {
             // Allocate an IP for this zone.
             let ip_state = {
-                let mut alloc = self.ip_allocator.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() });
+                let mut alloc = lock_backend(&self.ip_allocator, "ip_allocator")?;
                 let ip = alloc.allocate()?;
                 ZoneNetworkState {
                     ip: ip.octets(),
@@ -570,34 +555,79 @@ impl IsolationBackend for LinuxBackend {
             None
         };
 
-        // Step 3: Populate BPF maps.
-        if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
-            if let Some(ref mut ebpf) = **ebpf_guard {
-                let bpf = ebpf.bpf_mut();
-
-                if let Err(e) =
-                    MapManager::add_zone_member(bpf, cgroup_id, zone_id, config.zone_type)
-                {
-                    tracing::warn!(%e, "failed to add zone to BPF membership map");
+        let rollback_zone = |reason: &str| {
+            tracing::warn!(
+                zone = config.name,
+                reason,
+                "rolling back failed zone creation"
+            );
+            if let Some(ref net_state) = net_state {
+                match lock_backend(&self.ip_allocator, "ip_allocator") {
+                    Ok(mut alloc) => alloc.release(net_state.ip()),
+                    Err(e) => tracing::error!(%e, "failed to release zone IP during rollback"),
                 }
-
-                if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, &config.policy) {
-                    tracing::warn!(%e, "failed to set zone policy in BPF map");
+            }
+            let _ = network::destroy_veth_pair(&config.name);
+            let _ = namespace::destroy_netns(&config.name);
+            let _ = self.cgroup.destroy_zone_cgroup(&config.name);
+            let _ = self.remove_zone_id(&zone_uuid);
+            match lock_backend(&self.zone_name_map, "zone_name_map") {
+                Ok(mut names) => {
+                    names.remove(&config.name);
                 }
+                Err(e) => tracing::error!(%e, "failed to remove zone name during rollback"),
+            }
+        };
+
+        // Step 3: Populate BPF maps. Missing enforcement is fatal.
+        {
+            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
+            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
+                message: "eBPF manager not available during zone creation".into(),
+                hint: "restart rauhad after restoring eBPF LSM support".into(),
+            });
+            let ebpf = match ebpf {
+                Ok(ebpf) => ebpf,
+                Err(e) => {
+                    rollback_zone("ebpf-unavailable");
+                    return Err(e);
+                }
+            };
+
+            let bpf = ebpf.bpf_mut();
+            // Write the policy before membership: once a process resolves to a
+            // zone via ZONE_MEMBERSHIP, its ZONE_POLICY must already exist, or
+            // the fail-closed capable() hook would deny it in the gap.
+            if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, &config.policy) {
+                rollback_zone("bpf-policy");
+                return Err(e);
+            }
+
+            if let Err(e) = MapManager::add_zone_member(bpf, cgroup_id, zone_id, config.zone_type) {
+                let _ = MapManager::remove_zone_policy(bpf, zone_id);
+                rollback_zone("bpf-membership");
+                return Err(e);
             }
         }
 
         // Step 4: Apply cgroup resource limits.
-        if let Err(e) = self.cgroup.apply_resources(&config.name, &config.policy.resources) {
-            tracing::warn!(%e, zone = config.name, "failed to apply resource limits");
+        if let Err(e) = self
+            .cgroup
+            .apply_resources(&config.name, &config.policy.resources)
+        {
+            if let Some(zone_id) = self.get_zone_id(&zone_uuid)? {
+                let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
+                if let Some(ref mut ebpf) = *ebpf_guard {
+                    let bpf = ebpf.bpf_mut();
+                    let _ = MapManager::remove_zone_member(bpf, cgroup_id);
+                    let _ = MapManager::remove_zone_policy(bpf, zone_id);
+                }
+            }
+            rollback_zone("resource-limits");
+            return Err(e);
         }
 
-        tracing::info!(
-            zone = config.name,
-            zone_id,
-            cgroup_id,
-            "zone created"
-        );
+        tracing::info!(zone = config.name, zone_id, cgroup_id, "zone created");
 
         Ok(ZoneHandle {
             id: zone_uuid,
@@ -612,24 +642,31 @@ impl IsolationBackend for LinuxBackend {
 
         // Shut down shim if running.
         {
-            let mut conns = self.shim_connections.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() });
+            let mut conns = lock_backend(&self.shim_connections, "shim_connections")?;
             if let Some(conn) = conns.remove(&zone.name) {
                 let _ = conn.send_request(&ShimRequest::Shutdown);
             }
         }
 
         // Remove from BPF maps first.
-        let zone_id = self.remove_zone_id(&zone.id);
+        let zone_id = self.remove_zone_id(&zone.id)?;
         // Remove stored inodes from BPF map (uses stored list, no re-walk).
         let stored_inodes = self
             .registered_inodes
             .lock()
-            .unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() })
+            .map_err(|_| {
+                tracing::error!(
+                    state = "registered_inodes",
+                    "mutex poisoned — refusing backend operation"
+                );
+                RauhaError::BackendError("linux backend state poisoned: registered_inodes".into())
+            })?
             .remove(&zone.name)
             .unwrap_or_default();
 
-        if let (Some(zone_id), Ok(ref mut ebpf_guard)) = (zone_id, self.ebpf.lock()) {
-            if let Some(ref mut ebpf) = **ebpf_guard {
+        if let Some(zone_id) = zone_id {
+            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
+            if let Some(ref mut ebpf) = *ebpf_guard {
                 let bpf = ebpf.bpf_mut();
 
                 if !stored_inodes.is_empty() {
@@ -645,7 +682,7 @@ impl IsolationBackend for LinuxBackend {
 
         // Release IP back to allocator.
         if let Some(ref net_state) = zone.network_state {
-            let mut alloc = self.ip_allocator.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() });
+            let mut alloc = lock_backend(&self.ip_allocator, "ip_allocator")?;
             alloc.release(net_state.ip());
         }
 
@@ -661,7 +698,7 @@ impl IsolationBackend for LinuxBackend {
         // Destroy cgroup last (must be empty).
         self.cgroup.destroy_zone_cgroup(&zone.name)?;
 
-        self.zone_name_map.lock().unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() }).remove(&zone.name);
+        lock_backend(&self.zone_name_map, "zone_name_map")?.remove(&zone.name);
 
         // Clean up shim socket.
         let socket_path = Self::shim_socket_path(&zone.name);
@@ -675,15 +712,16 @@ impl IsolationBackend for LinuxBackend {
         tracing::info!(zone = zone.name, "enforcing policy");
 
         // Update BPF policy map.
-        if let Some(zone_id) = self.get_zone_id(&zone.id) {
-            if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
-                if let Some(ref mut ebpf) = **ebpf_guard {
-                    MapManager::set_zone_policy(ebpf.bpf_mut(), zone_id, policy)?;
+        if let Some(zone_id) = self.get_zone_id(&zone.id)? {
+            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
+            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
+                message: "eBPF manager not available during policy enforcement".into(),
+                hint: "restart rauhad after restoring eBPF LSM support".into(),
+            })?;
+            MapManager::set_zone_policy(ebpf.bpf_mut(), zone_id, policy)?;
 
-                    // Wire up ZONE_ALLOWED_COMMS BPF map for defense-in-depth.
-                    self.sync_bpf_allowed_comms(ebpf.bpf_mut(), zone_id, &policy.network)?;
-                }
-            }
+            // Wire up ZONE_ALLOWED_COMMS BPF map for defense-in-depth.
+            self.sync_bpf_allowed_comms(ebpf.bpf_mut(), zone_id, &policy.network)?;
         }
 
         // Apply nftables forward rules for this zone.
@@ -699,15 +737,16 @@ impl IsolationBackend for LinuxBackend {
         tracing::info!(zone = zone.name, "hot-reloading policy");
 
         // BPF HashMap insert is atomic — kernel sees old or new, never partial.
-        if let Some(zone_id) = self.get_zone_id(&zone.id) {
-            if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
-                if let Some(ref mut ebpf) = **ebpf_guard {
-                    MapManager::hot_reload_policy(ebpf.bpf_mut(), zone_id, policy)?;
+        if let Some(zone_id) = self.get_zone_id(&zone.id)? {
+            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
+            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
+                message: "eBPF manager not available during policy hot reload".into(),
+                hint: "restart rauhad after restoring eBPF LSM support".into(),
+            })?;
+            MapManager::hot_reload_policy(ebpf.bpf_mut(), zone_id, policy)?;
 
-                    // Re-sync allowed comms on hot reload.
-                    self.sync_bpf_allowed_comms(ebpf.bpf_mut(), zone_id, &policy.network)?;
-                }
-            }
+            // Re-sync allowed comms on hot reload.
+            self.sync_bpf_allowed_comms(ebpf.bpf_mut(), zone_id, &policy.network)?;
         }
 
         // Re-apply nftables rules.
@@ -744,11 +783,7 @@ impl IsolationBackend for LinuxBackend {
             let snapshotter = rauha_oci::snapshotter::OverlayfsSnapshotter::new(
                 &PathBuf::from(&self.root).join("zones").join(&zone.name),
             );
-            snapshotter.mount_overlay(
-                &container_id.to_string(),
-                overlay_layers,
-                &container_dir,
-            )?
+            snapshotter.mount_overlay(&container_id.to_string(), overlay_layers, &container_dir)?
         } else if let Some(ref base_rootfs) = spec.rootfs_path {
             let rootfs_dir = container_dir.join("rootfs");
             copy_dir_recursive(base_rootfs, &rootfs_dir)?;
@@ -812,7 +847,7 @@ impl IsolationBackend for LinuxBackend {
         // Register rootfs inodes in BPF map for file isolation.
         // Phase 1: Collect inodes from filesystem (no lock, may be slow for large rootfs).
         // Phase 2: Insert into BPF map (short lock hold).
-        if let Some(zone_id) = self.get_zone_id(&zone.id) {
+        if let Some(zone_id) = self.get_zone_id(&zone.id)? {
             let is_overlay = rootfs_dir.ends_with("merged");
             tracing::debug!(
                 zone = zone.name,
@@ -821,39 +856,37 @@ impl IsolationBackend for LinuxBackend {
                 "collecting rootfs inodes for BPF file isolation"
             );
 
-            let inodes = maps::collect_rootfs_inodes(
-                &rootfs_dir,
-                rauha_ebpf_common::MAX_INODES,
-            );
+            let inodes = maps::collect_rootfs_inodes(&rootfs_dir, rauha_ebpf_common::MAX_INODES);
 
             if !inodes.is_empty() {
-                if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
-                    if let Some(ref mut ebpf) = **ebpf_guard {
-                        match MapManager::insert_inodes(ebpf.bpf_mut(), &inodes, zone_id) {
-                            Ok(inserted) => {
-                                // Store only successfully inserted inodes for cleanup.
-                                // This prevents removing entries that were never in the map.
-                                lock_or_abort(&self.registered_inodes)
-                                    .entry(zone.name.clone())
-                                    .or_default()
-                                    .extend_from_slice(&inserted);
-                                tracing::info!(
-                                    zone = zone.name,
-                                    container = %container_id,
-                                    count = inserted.len(),
-                                    collected = inodes.len(),
-                                    "registered container rootfs inodes in BPF map"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    %e,
-                                    zone = zone.name,
-                                    container = %container_id,
-                                    "failed to register rootfs inodes — file isolation incomplete"
-                                );
-                            }
-                        }
+                let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
+                let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
+                    message: "eBPF manager not available during rootfs inode registration".into(),
+                    hint: "restart rauhad after restoring eBPF LSM support".into(),
+                })?;
+                match MapManager::insert_inodes(ebpf.bpf_mut(), &inodes, zone_id) {
+                    Ok(inserted) => {
+                        // Store only successfully inserted inodes for cleanup.
+                        // This prevents removing entries that were never in the map.
+                        lock_backend(&self.registered_inodes, "registered_inodes")?
+                            .entry(zone.name.clone())
+                            .or_default()
+                            .extend_from_slice(&inserted);
+                        tracing::info!(
+                            zone = zone.name,
+                            container = %container_id,
+                            count = inserted.len(),
+                            collected = inodes.len(),
+                            "registered container rootfs inodes in BPF map"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %e,
+                            zone = zone.name,
+                            container = %container_id,
+                            "failed to register rootfs inodes — file isolation incomplete"
+                        );
                     }
                 }
             }
@@ -896,10 +929,8 @@ impl IsolationBackend for LinuxBackend {
         tracing::info!(container = %container.id, "starting container");
 
         // Look up zone name for this container.
-        let zone_name = self
-            .zone_name_map
-            .lock()
-            .unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() })
+        let zone_names = lock_backend(&self.zone_name_map, "zone_name_map")?;
+        let zone_name = zone_names
             .iter()
             .find(|(_, uuid)| **uuid == container.zone_id)
             .map(|(name, _)| name.clone())
@@ -931,10 +962,8 @@ impl IsolationBackend for LinuxBackend {
     fn stop_container(&self, container: &ContainerHandle) -> Result<()> {
         tracing::info!(container = %container.id, "stopping container");
 
-        let zone_name = self
-            .zone_name_map
-            .lock()
-            .unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() })
+        let zone_names = lock_backend(&self.zone_name_map, "zone_name_map")?;
+        let zone_name = zone_names
             .iter()
             .find(|(_, uuid)| **uuid == container.zone_id)
             .map(|(name, _)| name.clone())
@@ -990,8 +1019,9 @@ impl IsolationBackend for LinuxBackend {
         });
 
         // Check 2: eBPF programs loaded.
-        let ebpf_ok = if let Ok(ref ebpf_guard) = self.ebpf.lock() {
-            if let Some(ref ebpf) = **ebpf_guard {
+        let ebpf_ok = {
+            let ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
+            if let Some(ref ebpf) = *ebpf_guard {
                 match ebpf.health_check() {
                     Ok(statuses) => {
                         let all_ok = statuses.iter().all(|s| s.loaded && s.attached);
@@ -1029,12 +1059,10 @@ impl IsolationBackend for LinuxBackend {
                 });
                 false
             }
-        } else {
-            false
         };
 
         // Check 3: zone membership in BPF map.
-        let membership_ok = self.get_zone_id(&zone.id).is_some();
+        let membership_ok = self.get_zone_id(&zone.id)?.is_some();
         checks.push(IsolationCheck {
             name: "bpf_membership".into(),
             passed: membership_ok,
@@ -1058,29 +1086,28 @@ impl IsolationBackend for LinuxBackend {
         });
 
         // Check 5: enforcement counters — detect silent enforcement failure.
-        if let Ok(ref ebpf_guard) = self.ebpf.lock() {
-            if let Some(ref ebpf) = **ebpf_guard {
-                if let Ok(counters) = ebpf.read_enforcement_counters() {
-                    for (name, c) in &counters {
-                        if c.error > 0 && c.deny == 0 {
-                            checks.push(IsolationCheck {
-                                name: format!("enforcement:{name}"),
-                                passed: false,
-                                detail: format!(
-                                    "hook has {} errors and 0 denials — enforcement may be silently failing",
-                                    c.error
-                                ),
-                            });
-                        } else if c.allow > 0 || c.deny > 0 {
-                            checks.push(IsolationCheck {
-                                name: format!("enforcement:{name}"),
-                                passed: true,
-                                detail: format!(
-                                    "allow={}, deny={}, error={}",
-                                    c.allow, c.deny, c.error
-                                ),
-                            });
-                        }
+        let ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
+        if let Some(ref ebpf) = *ebpf_guard {
+            if let Ok(counters) = ebpf.read_enforcement_counters() {
+                for (name, c) in &counters {
+                    if c.error > 0 && c.deny == 0 {
+                        checks.push(IsolationCheck {
+                            name: format!("enforcement:{name}"),
+                            passed: false,
+                            detail: format!(
+                                "hook has {} errors and 0 denials — enforcement may be silently failing",
+                                c.error
+                            ),
+                        });
+                    } else if c.allow > 0 || c.deny > 0 {
+                        checks.push(IsolationCheck {
+                            name: format!("enforcement:{name}"),
+                            passed: true,
+                            detail: format!(
+                                "allow={}, deny={}, error={}",
+                                c.allow, c.deny, c.error
+                            ),
+                        });
                     }
                 }
             }
@@ -1161,4 +1188,25 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock_backend;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn poisoned_backend_lock_returns_error() {
+        let mutex = Arc::new(Mutex::new(()));
+        let poisoned = Arc::clone(&mutex);
+
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test lock should be available");
+            panic!("poison test mutex");
+        })
+        .join();
+
+        let err = lock_backend(&mutex, "test_state").expect_err("poisoned lock must fail closed");
+        assert!(err.to_string().contains("test_state"));
+    }
 }

@@ -23,9 +23,8 @@ pub fn cgroup_attach_task(ctx: &LsmContext) -> i32 {
     let (ret, is_error) = match try_cgroup_attach(ctx) {
         Ok(ret) => (ret, false),
         Err(_) => {
-            // Fail open — blocking cgroup moves breaks shim operation.
             crate::emit_error_event(HOOK_CGROUP_ATTACH);
-            (0, true)
+            (-1, true)
         }
     };
     count_decision(PROG_CGROUP_ATTACH, ret == 0, is_error);
