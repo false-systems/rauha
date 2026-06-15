@@ -135,6 +135,61 @@ Policy and tasks come in through the CLI or containerd; the daemon delegates all
 zone/container work to the active platform backend; logs, audit, and enforcement
 events flow back out through one watch API.
 
+```mermaid
+flowchart TB
+    operator["Operator / agent runner"]
+    k8s["Kubernetes / containerd"]
+    cli["rauha CLI"]
+    shimv2["containerd-shim-rauha-v2"]
+    daemon["rauhad\nzone registry · policy · metadata · watch API"]
+    backend{"IsolationBackend"}
+
+    operator --> cli
+    k8s --> shimv2
+    cli --> daemon
+    shimv2 --> daemon
+    daemon --> backend
+
+    subgraph linux["Linux backend"]
+        cgroups["cgroups v2"]
+        ns["namespaces + netns"]
+        rootfs["OCI rootfs + rauha-shim"]
+        syva["Syvä / BPF-LSM\nfile · exec · ptrace · signal · cgroup · net"]
+        maps["BPF maps\nzone membership · policy · inode ownership"]
+        ring["BPF ring buffer\nenforcement events"]
+
+        cgroups --> syva
+        ns --> syva
+        rootfs --> maps
+        maps --> syva
+        syva --> ring
+    end
+
+    subgraph macos["macOS backend"]
+        vm["Virtualization.framework VM per zone"]
+        agent["rauha-guest-agent"]
+        vsock["virtio-vsock"]
+        apfs["APFS clonefile rootfs"]
+
+        vm --> agent
+        agent --> vsock
+        apfs --> vm
+    end
+
+    backend --> linux
+    backend --> macos
+
+    evidence["rauha-evidence\ncanonical event schema · redaction · projections"]
+    surfaces["logs · trace · events · sandbox result envelope"]
+    sinks["JSON / console / watch API / OTLP"]
+
+    ring --> evidence
+    vsock --> evidence
+    daemon --> surfaces
+    evidence --> surfaces
+    evidence --> sinks
+```
+
 | Crate | Role |
 | --- | --- |
 | `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux/macOS backends |
