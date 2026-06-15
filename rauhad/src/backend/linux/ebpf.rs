@@ -145,56 +145,57 @@ impl EbpfManager {
 
         let mut program_fds = HashMap::new();
 
-        // Attach LSM programs. Some hooks may not exist on all kernels
-        // (e.g., cgroup_attach_task is not a BPF LSM hook on some kernels).
-        // Skip unsupported hooks and continue with what loads.
+        // Attach every declared LSM program. Partial enforcement is not safe:
+        // if a kernel lacks a hook we rely on, or an individual attach fails,
+        // Rauha must refuse to start rather than run with a missing boundary.
         for &(prog_name, hook_name) in LSM_PROGRAMS {
             let prog: &mut Lsm = match bpf.program_mut(prog_name) {
                 Some(p) => match p.try_into() {
                     Ok(lsm) => lsm,
                     Err(e) => {
-                        tracing::warn!(program = prog_name, %e, "skipping — not an LSM program");
-                        continue;
+                        return Err(RauhaError::EbpfError {
+                            message: format!("eBPF program {prog_name} is not an LSM program: {e}"),
+                            hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
+                        });
                     }
                 },
                 None => {
-                    tracing::warn!(program = prog_name, "skipping — not found in eBPF object");
-                    continue;
+                    return Err(RauhaError::EbpfError {
+                        message: format!("required eBPF program {prog_name} not found in object"),
+                        hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
+                    });
                 }
             };
 
-            match prog.load(hook_name, &btf) {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        program = prog_name,
-                        hook = hook_name,
-                        %e,
-                        "skipping LSM hook — not supported by this kernel"
-                    );
-                    continue;
-                }
-            }
+            prog.load(hook_name, &btf).map_err(|e| RauhaError::EbpfError {
+                message: format!(
+                    "failed to load required LSM program {prog_name} for hook {hook_name}: {e}"
+                ),
+                hint: "check kernel has CONFIG_BPF_LSM=y, `lsm=bpf` in cmdline, and exposes every required hook".into(),
+            })?;
 
-            match prog.attach() {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(program = prog_name, %e, "skipping — attach failed");
-                    continue;
-                }
-            }
+            prog.attach().map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to attach required LSM program {prog_name}: {e}"),
+                hint: "check kernel BPF-LSM support and process privileges".into(),
+            })?;
 
-            if let Ok(prog_fd) = prog.fd() {
-                program_fds.insert(prog_name.to_string(), prog_fd.as_fd().as_raw_fd());
-            }
+            let prog_fd = prog.fd().map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to record fd for required LSM program {prog_name}: {e}"),
+                hint: "restart rauhad to reload and reattach eBPF programs".into(),
+            })?;
+            program_fds.insert(prog_name.to_string(), prog_fd.as_fd().as_raw_fd());
 
             tracing::info!(program = prog_name, hook = hook_name, "attached LSM program");
         }
 
-        if program_fds.is_empty() {
+        if program_fds.len() != LSM_PROGRAMS.len() {
             return Err(RauhaError::EbpfError {
-                message: "no LSM programs could be loaded".into(),
-                hint: "check kernel supports BPF LSM hooks".into(),
+                message: format!(
+                    "partial LSM attachment: attached {} of {} required programs",
+                    program_fds.len(),
+                    LSM_PROGRAMS.len()
+                ),
+                hint: "restart rauhad after fixing kernel BPF-LSM support".into(),
             });
         }
 

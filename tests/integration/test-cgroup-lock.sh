@@ -14,9 +14,16 @@ ZONE_A="test-cglock-a-$$"
 ZONE_B="test-cglock-b-$$"
 IMAGE="${TEST_IMAGE:-alpine:latest}"
 FIFO="/tmp/rauha-test-cglock-$$"
+RESULT_FILE="/tmp/rauha-test-cglock-result-$$"
+ERR_FILE="/tmp/rauha-test-cglock-error-$$"
+HELPER_PID=""
 
 cleanup() {
-    rm -f "$FIFO"
+    if [ -n "${HELPER_PID:-}" ]; then
+        kill "$HELPER_PID" 2>/dev/null || true
+        wait "$HELPER_PID" 2>/dev/null || true
+    fi
+    rm -f "$FIFO" "$RESULT_FILE" "$ERR_FILE"
     $RAUHA zone delete --name "$ZONE_A" --force 2>/dev/null || true
     $RAUHA zone delete --name "$ZONE_B" --force 2>/dev/null || true
 }
@@ -74,9 +81,17 @@ mkfifo "$FIFO"
     # Wait until we've been enrolled in zone A.
     cat "$FIFO" > /dev/null
 
-    # Try to move ourselves to zone B's cgroup.
-    # Use /bin/sh -c with $$ to get the shell's own PID (not the subshell's).
-    /bin/sh -c "echo \$\$ > '${CGROUP_B}/cgroup.procs' 2>/dev/null; echo \$?" 2>/dev/null
+    # Try to move this helper process to zone B's cgroup. Use BASHPID so the
+    # helper writes its own PID, not the parent script's PID.
+    set +e
+    echo "$BASHPID" > "${CGROUP_B}/cgroup.procs" 2>"$ERR_FILE"
+    rc=$?
+    printf '%s\n' "$rc" > "$RESULT_FILE"
+
+    # Stay alive long enough for the parent to observe cgroup membership if the
+    # write unexpectedly succeeds. Without this, a successful move can be hidden
+    # by process exit before cgroup.procs is checked.
+    sleep 10
 ) &
 HELPER_PID=$!
 
@@ -95,10 +110,24 @@ fi
 # Signal helper to proceed with the cross-zone move attempt.
 echo "go" > "$FIFO"
 
-# Capture the helper's output (the exit code of the echo command).
-RESULT=""
-if read -t 5 RESULT < <(wait "$HELPER_PID" 2>/dev/null; echo "$?"); then
-    : # got result
+# Capture the helper's cgroup.procs write result.
+for _ in $(seq 1 50); do
+    if [ -s "$RESULT_FILE" ]; then
+        break
+    fi
+    sleep 0.1
+done
+
+if [ ! -s "$RESULT_FILE" ]; then
+    echo "  FAIL: helper did not report cross-zone cgroup move result"
+    exit 1
+fi
+
+RESULT=$(cat "$RESULT_FILE")
+if [ "$RESULT" -eq 0 ]; then
+    echo "  FAIL: cross-zone cgroup move write succeeded"
+    echo "  This means cgroup_lock eBPF enforcement is not active."
+    exit 1
 fi
 
 # Also check: is the helper still in zone A's cgroup (not zone B's)?

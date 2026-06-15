@@ -185,8 +185,9 @@ Rauha runs on Linux and macOS; full kernel enforcement is Linux-only.
   `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`; boot parameter
   `lsm=lockdown,capability,bpf`; BTF at `/sys/kernel/btf/vmlinux`. The Linux
   daemon **fails closed**: it requires root and a working BPF-LSM kernel, and
-  refuses to start without kernel enforcement. For rootless local iteration, use
-  the macOS backend.
+  refuses to start without kernel enforcement. There is no degraded Linux mode:
+  running zones without Syvä/BPF-LSM enforcement would weaken the isolation
+  contract. For rootless local iteration, use the macOS backend.
 - **macOS (Virtualization.framework)** — macOS 15+ on Apple Silicon or Intel
   with VT-x. `rauhad` must be signed after every build:
   `codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad`.
