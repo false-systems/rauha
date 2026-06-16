@@ -2451,6 +2451,7 @@ name = "rauha-ebpf-common"
 version = "0.1.0"
 dependencies = [
  "aya",
+ "sha2",
 ]
 
 [[package]]
@@ -4292,6 +4293,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rauha-ebpf-common",
 ]
 
 [[package]]

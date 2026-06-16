@@ -3,7 +3,7 @@
 //! Uses Aya to load the compiled rauha-ebpf object, attach LSM hooks,
 //! and pin maps to /sys/fs/bpf/rauha/ for persistence.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 use aya::programs::Lsm;
 use aya::{Bpf, BpfLoader, Btf};
 use rauha_common::error::{RauhaError, Result};
+use rauha_ebpf_common::offsets::{
+    object_sha256, offsets_sidecar_path, parse_offsets_sidecar, resolve_kernel_offsets_map,
+    OFFSET_DEFS,
+};
 
 const BPF_PIN_PATH: &str = "/sys/fs/bpf/rauha";
 
@@ -35,22 +39,6 @@ const MAP_NAMES: &[&str] = &[
     "SELF_TEST",
     "ENFORCEMENT_COUNTERS",
     "ENFORCEMENT_EVENTS",
-];
-
-/// Struct field offsets and their corresponding eBPF global variable names.
-/// (struct_name, field_name, ebpf_global_name, default_offset)
-///
-/// At load time, userspace reads real offsets from BTF via pahole and injects
-/// them into the eBPF programs via `BpfLoader::set_global()`. If pahole is
-/// not available, the default offsets (correct for Linux 6.1+) are used.
-const OFFSET_DEFS: &[(&str, &str, &str, u64)] = &[
-    ("task_struct", "cgroups", "TASK_CGROUPS_OFFSET", 3920),
-    ("css_set", "dfl_cgrp", "CSS_SET_DFL_CGRP_OFFSET", 136),
-    ("cgroup", "kn", "CGROUP_KN_OFFSET", 256),
-    ("kernfs_node", "id", "KERNFS_NODE_ID_OFFSET", 96),
-    ("file", "f_inode", "FILE_F_INODE_OFFSET", 32),
-    ("inode", "i_ino", "INODE_I_INO_OFFSET", 64),
-    ("linux_binprm", "executable", "BPRM_FILE_OFFSET", 48),
 ];
 
 pub struct EbpfManager {
@@ -109,22 +97,42 @@ impl EbpfManager {
             hint: "kernel must have CONFIG_DEBUG_INFO_BTF=y".into(),
         })?;
 
-        // Validate compiled struct offsets against the running kernel's BTF.
-        // If pahole finds a mismatch, log an error and fail loading — the eBPF
-        // programs would read wrong kernel fields and enforcement would be broken.
-        let resolved_offsets = resolve_kernel_offsets();
-        for &(type_name, field_name, _global_name, compiled_default) in OFFSET_DEFS {
-            if let Some(&resolved) = resolved_offsets.get(_global_name) {
-                if resolved != compiled_default {
-                    return Err(RauhaError::EbpfError {
+        // Validate the offsets compiled into the object against this kernel's
+        // BTF before loading. Wrong offsets make enforcement unsound.
+        let resolved_offsets = resolve_kernel_offsets_map().map_err(|e| RauhaError::EbpfError {
+            message: format!("failed to resolve kernel offsets: {e}"),
+            hint: "install dwarves/pahole and ensure /sys/kernel/btf/vmlinux is present".into(),
+        })?;
+        let compiled_offsets = read_compiled_offsets(ebpf_obj_path)?;
+        for def in OFFSET_DEFS {
+            let resolved =
+                resolved_offsets
+                    .get(def.manifest_key)
+                    .ok_or_else(|| RauhaError::EbpfError {
+                        message: format!("resolved offset {} is missing", def.manifest_key),
+                        hint: "install dwarves/pahole and rebuild eBPF programs".into(),
+                    })?;
+            let compiled =
+                compiled_offsets
+                    .get(def.manifest_key)
+                    .ok_or_else(|| RauhaError::EbpfError {
                         message: format!(
-                            "kernel struct offset mismatch: {type_name}.{field_name} is {resolved} \
-                             on this kernel but eBPF programs were compiled with {compiled_default}"
+                            "compiled offset {} is missing from sidecar",
+                            def.manifest_key
                         ),
-                        hint: "update offsets in rauha-ebpf/src/main.rs and rebuild with \
-                               `cargo xtask build-ebpf`".into(),
-                    });
-                }
+                        hint:
+                            "run `cargo xtask build-ebpf` to regenerate the eBPF object and sidecar"
+                                .into(),
+                    })?;
+            if resolved != compiled {
+                return Err(RauhaError::EbpfError {
+                    message: format!(
+                        "kernel struct offset mismatch for {}: running kernel has {resolved} \
+                         but eBPF object was compiled with {compiled}",
+                        def.manifest_key
+                    ),
+                    hint: "rebuild eBPF on this kernel with `cargo xtask build-ebpf`".into(),
+                });
             }
         }
 
@@ -136,12 +144,10 @@ impl EbpfManager {
         let mut loader = BpfLoader::new();
         loader.btf(Some(&btf)).map_pin_path(&pin_path);
 
-        let mut bpf = loader
-            .load(&obj_data)
-            .map_err(|e| RauhaError::EbpfError {
-                message: format!("failed to load eBPF programs: {e}"),
-                hint: "check kernel has CONFIG_BPF_LSM=y and `lsm=bpf` in cmdline".into(),
-            })?;
+        let mut bpf = loader.load(&obj_data).map_err(|e| RauhaError::EbpfError {
+            message: format!("failed to load eBPF programs: {e}"),
+            hint: "check kernel has CONFIG_BPF_LSM=y and `lsm=bpf` in cmdline".into(),
+        })?;
 
         let mut program_fds = HashMap::new();
 
@@ -185,7 +191,11 @@ impl EbpfManager {
             })?;
             program_fds.insert(prog_name.to_string(), prog_fd.as_fd().as_raw_fd());
 
-            tracing::info!(program = prog_name, hook = hook_name, "attached LSM program");
+            tracing::info!(
+                program = prog_name,
+                hook = hook_name,
+                "attached LSM program"
+            );
         }
 
         if program_fds.len() != LSM_PROGRAMS.len() {
@@ -206,7 +216,11 @@ impl EbpfManager {
             "eBPF programs loaded"
         );
 
-        let mut mgr = Self { bpf, pin_path, program_fds };
+        let mut mgr = Self {
+            bpf,
+            pin_path,
+            program_fds,
+        };
 
         // Run the offset self-test: trigger file_open to populate SELF_TEST map,
         // then verify the two cgroup_id derivation paths match.
@@ -220,12 +234,13 @@ impl EbpfManager {
     /// Transfers the map out of the Bpf object so it can be moved into a
     /// background task without lifetime issues. Can only be called once.
     pub fn take_event_ring_buf(&mut self) -> Result<aya::maps::RingBuf<aya::maps::MapData>> {
-        let map = self.bpf.take_map("ENFORCEMENT_EVENTS").ok_or_else(|| {
-            RauhaError::EbpfError {
+        let map = self
+            .bpf
+            .take_map("ENFORCEMENT_EVENTS")
+            .ok_or_else(|| RauhaError::EbpfError {
                 message: "ENFORCEMENT_EVENTS map not found or already taken".into(),
                 hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
-            }
-        })?;
+            })?;
         aya::maps::RingBuf::try_from(map).map_err(|e| RauhaError::EbpfError {
             message: format!("failed to create RingBuf from ENFORCEMENT_EVENTS: {e}"),
             hint: "check eBPF object was built correctly".into(),
@@ -293,7 +308,7 @@ impl EbpfManager {
         Ok(statuses)
     }
 
-    /// Verify that the hardcoded kernel struct offsets produce correct results.
+    /// Verify that the compiled kernel struct offsets produce correct results.
     ///
     /// Triggers a file_open event (by opening /proc/self/status) which causes
     /// the eBPF program to write both `bpf_get_current_cgroup_id()` and the
@@ -309,16 +324,17 @@ impl EbpfManager {
         // Brief sleep to let the BPF program execute.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        let map = Array::<_, SelfTestResult>::try_from(
-            self.bpf.map("SELF_TEST").ok_or_else(|| RauhaError::EbpfError {
-                message: "SELF_TEST map not found".into(),
-                hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
-            })?,
-        )
-        .map_err(|e| RauhaError::EbpfError {
-            message: format!("failed to open SELF_TEST map: {e}"),
-            hint: "check eBPF object was built correctly".into(),
-        })?;
+        let map =
+            Array::<_, SelfTestResult>::try_from(self.bpf.map("SELF_TEST").ok_or_else(|| {
+                RauhaError::EbpfError {
+                    message: "SELF_TEST map not found".into(),
+                    hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
+                }
+            })?)
+            .map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to open SELF_TEST map: {e}"),
+                hint: "check eBPF object was built correctly".into(),
+            })?;
 
         let result = map.get(&0, 0).map_err(|e| RauhaError::EbpfError {
             message: format!("failed to read SELF_TEST map: {e}"),
@@ -337,7 +353,7 @@ impl EbpfManager {
             return Err(RauhaError::EbpfError {
                 message: format!(
                     "offset self-test FAILED: bpf_get_current_cgroup_id()={} but \
-                     offset chain produced {}. Hardcoded struct offsets are wrong \
+                     offset chain produced {}. Compiled struct offsets are wrong \
                      for this kernel.",
                     result.helper_cgroup_id, result.offset_cgroup_id
                 ),
@@ -381,15 +397,19 @@ impl EbpfManager {
     /// Read per-hook enforcement counters, summed across all CPUs.
     ///
     /// Returns a vec of (program_name, counters) tuples.
-    pub fn read_enforcement_counters(&self) -> Result<Vec<(String, rauha_ebpf_common::EnforcementCounters)>> {
+    pub fn read_enforcement_counters(
+        &self,
+    ) -> Result<Vec<(String, rauha_ebpf_common::EnforcementCounters)>> {
         use aya::maps::PerCpuArray;
         use rauha_ebpf_common::EnforcementCounters;
 
         let map = PerCpuArray::<_, EnforcementCounters>::try_from(
-            self.bpf.map("ENFORCEMENT_COUNTERS").ok_or_else(|| RauhaError::EbpfError {
-                message: "ENFORCEMENT_COUNTERS map not found".into(),
-                hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
-            })?,
+            self.bpf
+                .map("ENFORCEMENT_COUNTERS")
+                .ok_or_else(|| RauhaError::EbpfError {
+                    message: "ENFORCEMENT_COUNTERS map not found".into(),
+                    hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
+                })?,
         )
         .map_err(|e| RauhaError::EbpfError {
             message: format!("failed to open ENFORCEMENT_COUNTERS map: {e}"),
@@ -398,13 +418,19 @@ impl EbpfManager {
 
         let mut results = Vec::new();
         for (idx, &(prog_name, _)) in LSM_PROGRAMS.iter().enumerate() {
-            let per_cpu = map.get(&(idx as u32), 0).map_err(|e| RauhaError::EbpfError {
-                message: format!("failed to read counters for {prog_name}: {e}"),
-                hint: "".into(),
-            })?;
+            let per_cpu = map
+                .get(&(idx as u32), 0)
+                .map_err(|e| RauhaError::EbpfError {
+                    message: format!("failed to read counters for {prog_name}: {e}"),
+                    hint: "".into(),
+                })?;
 
             // Sum across all CPUs.
-            let mut total = EnforcementCounters { allow: 0, deny: 0, error: 0 };
+            let mut total = EnforcementCounters {
+                allow: 0,
+                deny: 0,
+                error: 0,
+            };
             for cpu_val in per_cpu.iter() {
                 total.allow += cpu_val.allow;
                 total.deny += cpu_val.deny;
@@ -438,141 +464,48 @@ pub struct ProgramStatus {
     pub attached: bool,
 }
 
-/// Resolve kernel struct offsets from BTF via pahole.
-///
-/// Returns a map of global_name → offset. If pahole is not available, returns
-/// defaults from OFFSET_DEFS. If pahole finds a different offset than the
-/// default, the resolved (real) offset is used and a log message is emitted.
-fn resolve_kernel_offsets() -> HashMap<String, u64> {
-    let mut offsets: HashMap<String, u64> = HashMap::new();
+fn read_compiled_offsets(ebpf_obj_path: &Path) -> Result<BTreeMap<String, u64>> {
+    let sidecar = offsets_sidecar_path(ebpf_obj_path);
+    let content = fs::read_to_string(&sidecar).map_err(|e| RauhaError::EbpfError {
+        message: format!(
+            "failed to read eBPF offsets sidecar {}: {e}",
+            sidecar.display()
+        ),
+        hint: "run `cargo xtask build-ebpf` to regenerate the eBPF object and sidecar".into(),
+    })?;
 
-    // Start with defaults.
-    for &(_, _, global_name, default) in OFFSET_DEFS {
-        offsets.insert(global_name.to_string(), default);
-    }
+    let manifest = parse_offsets_sidecar(&content).map_err(|e| RauhaError::EbpfError {
+        message: format!("invalid eBPF offsets sidecar {}: {e}", sidecar.display()),
+        hint: "run `cargo xtask build-ebpf` to regenerate the sidecar".into(),
+    })?;
 
-    let pahole = match which_pahole() {
-        Some(path) => path,
-        None => {
-            tracing::warn!(
-                "pahole not found — using default struct offsets. \
-                 Install dwarves package for automatic kernel offset resolution."
-            );
-            return offsets;
-        }
-    };
-
-    for &(type_name, field_name, global_name, default) in OFFSET_DEFS {
-        match pahole_field_offset(&pahole, type_name, field_name) {
-            Ok(actual) => {
-                let actual_u64 = actual as u64;
-                if actual_u64 != default {
-                    tracing::info!(
-                        r#type = type_name,
-                        field = field_name,
-                        default,
-                        resolved = actual_u64,
-                        "kernel offset differs from default — using resolved value"
-                    );
-                } else {
-                    tracing::debug!(
-                        r#type = type_name,
-                        field = field_name,
-                        offset = actual_u64,
-                        "kernel offset matches default"
-                    );
-                }
-                offsets.insert(global_name.to_string(), actual_u64);
-            }
-            Err(e) => {
-                tracing::debug!(
-                    r#type = type_name,
-                    field = field_name,
-                    %e,
-                    "could not resolve offset — using default"
-                );
-            }
-        }
-    }
-
-    offsets
-}
-
-/// Find the `pahole` binary.
-fn which_pahole() -> Option<PathBuf> {
-    for path in ["/usr/bin/pahole", "/usr/local/bin/pahole"] {
-        if Path::new(path).exists() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
-}
-
-/// Query pahole for a struct member's byte offset.
-///
-/// Runs: pahole -C <type> /sys/kernel/btf/vmlinux
-/// and parses the output for the field's offset.
-fn pahole_field_offset(
-    pahole: &Path,
-    type_name: &str,
-    field_name: &str,
-) -> std::result::Result<usize, String> {
-    let output = std::process::Command::new(pahole)
-        .args(["-C", type_name, "/sys/kernel/btf/vmlinux"])
-        .output()
-        .map_err(|e| format!("failed to run pahole: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "pahole failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    // pahole output format:
-    //   struct task_struct {
-    //       ...
-    //       struct css_set *         cgroups;              /*  2336     8 */
-    //       ...
-    // We look for lines containing the field name and parse the offset from /* offset size */
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        // Match lines containing the field name as a whole word (not substring).
-        // E.g., searching for "id" must not match "void" or "unsigned".
-        let is_word_match = trimmed.split_whitespace().any(|word| {
-            let clean = word.trim_end_matches(';');
-            clean == field_name
+    let actual_hash = object_sha256(ebpf_obj_path).map_err(|e| RauhaError::EbpfError {
+        message: format!(
+            "failed to hash eBPF object {}: {e}",
+            ebpf_obj_path.display()
+        ),
+        hint: "check eBPF object permissions and rebuild if needed".into(),
+    })?;
+    if actual_hash != manifest.object_sha256 {
+        return Err(RauhaError::EbpfError {
+            message: format!(
+                "eBPF object hash mismatch: sidecar has {} but object hashes to {}",
+                manifest.object_sha256, actual_hash
+            ),
+            hint: "run `cargo xtask build-ebpf` to regenerate the sidecar".into(),
         });
-        if !is_word_match {
-            continue;
-        }
-        // Parse offset from the /*  OFFSET  SIZE */ comment.
-        if let Some(comment_start) = trimmed.rfind("/*") {
-            let comment = &trimmed[comment_start + 2..];
-            if let Some(comment_end) = comment.find("*/") {
-                let nums = &comment[..comment_end].trim();
-                // Format: "OFFSET  SIZE" — take the first number.
-                if let Some(offset_str) = nums.split_whitespace().next() {
-                    if let Ok(offset) = offset_str.parse::<usize>() {
-                        return Ok(offset);
-                    }
-                }
-            }
-        }
     }
 
-    Err(format!("field '{field_name}' not found in pahole output for '{type_name}'"))
+    Ok(manifest.offsets)
 }
 
 /// Check that the kernel is new enough for BPF LSM (6.1+).
 fn check_kernel_version() -> Result<()> {
-    let release = fs::read_to_string("/proc/sys/kernel/osrelease").map_err(|e| {
-        RauhaError::EbpfError {
+    let release =
+        fs::read_to_string("/proc/sys/kernel/osrelease").map_err(|e| RauhaError::EbpfError {
             message: format!("cannot read kernel version: {e}"),
             hint: "is /proc mounted?".into(),
-        }
-    })?;
+        })?;
 
     let release = release.trim();
     let parts: Vec<&str> = release.split('.').collect();
@@ -623,4 +556,67 @@ fn read_proc_self_cgroup_id() -> std::result::Result<u64, String> {
     }
 
     Err("no cgroup v2 entry found in /proc/self/cgroup".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_compiled_offsets;
+    use rauha_ebpf_common::offsets::{object_sha256, offsets_sidecar_path};
+
+    #[test]
+    fn offsets_sidecar_uses_object_file_name() {
+        let path = std::path::Path::new("/tmp/rauha-ebpf");
+        assert_eq!(
+            offsets_sidecar_path(path),
+            std::path::PathBuf::from("/tmp/rauha-ebpf.offsets")
+        );
+    }
+
+    #[test]
+    fn reads_compiled_offsets_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let obj = dir.path().join("rauha-ebpf");
+        let sidecar = dir.path().join("rauha-ebpf.offsets");
+        std::fs::write(&obj, b"object").unwrap();
+        let hash = object_sha256(&obj).unwrap();
+        std::fs::write(
+            &sidecar,
+            format!(
+                "# generated\nOBJECT_SHA256={hash}\nTASK_CGROUPS_OFFSET=2608\nFILE_F_INODE_OFFSET=168\n"
+            ),
+        )
+        .unwrap();
+
+        let offsets = read_compiled_offsets(&obj).unwrap();
+        assert_eq!(offsets.get("TASK_CGROUPS_OFFSET"), Some(&2608));
+        assert_eq!(offsets.get("FILE_F_INODE_OFFSET"), Some(&168));
+    }
+
+    #[test]
+    fn rejects_sidecar_for_different_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let obj = dir.path().join("rauha-ebpf");
+        let sidecar = dir.path().join("rauha-ebpf.offsets");
+        std::fs::write(&obj, b"object-a").unwrap();
+        let stale_hash = object_sha256(&obj).unwrap();
+        std::fs::write(&obj, b"object-b").unwrap();
+        std::fs::write(
+            &sidecar,
+            format!("OBJECT_SHA256={stale_hash}\nTASK_CGROUPS_OFFSET=2608\n"),
+        )
+        .unwrap();
+
+        assert!(read_compiled_offsets(&obj).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_offsets_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let obj = dir.path().join("rauha-ebpf");
+        let sidecar = dir.path().join("rauha-ebpf.offsets");
+        std::fs::write(&obj, b"object").unwrap();
+        std::fs::write(&sidecar, b"TASK_CGROUPS_OFFSET:not-a-kv\n").unwrap();
+
+        assert!(read_compiled_offsets(&obj).is_err());
+    }
 }

@@ -104,4 +104,4 @@ version = "0.3"
 # Internal
 [workspace.dependencies.rauha-ebpf-common]
 path = "rauha-ebpf-common"
-features = ["userspace"]
+features = ["userspace", "offsets"]

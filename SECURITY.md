@@ -171,9 +171,12 @@ daemon crash — there is no way to reattach to a VM that was destroyed.
 
 ### Kernel Version Sensitivity (Linux)
 
-The current in-repo eBPF programs use hardcoded struct offsets (e.g.,
-`struct file->f_inode` at offset 32). These are correct for Linux 6.1+ but
-may break on future kernels that change struct layouts.
+The current in-repo eBPF programs compile kernel struct offsets into the BPF
+object (for example, `struct file->f_inode`). `cargo xtask build-ebpf` resolves
+those offsets from the target kernel's BTF with `pahole` and writes a sidecar
+manifest beside the object, including the object's SHA-256 hash. `rauhad`
+validates the sidecar against both the object and the running kernel before
+loading; missing or stale offset metadata is a fatal startup error.
 
 Fix: migrate to CO-RE (Compile Once, Run Everywhere) using BTF-based
 field access. Aya supports this but it adds build complexity. Longer-term,

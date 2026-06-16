@@ -319,9 +319,11 @@ legacy seed and is not extended. See
   Covert channels through shared kernel resources are out of scope.
 - **The two backends are different isolation models** — Linux cgroups/namespaces
   vs. a per-zone VM on macOS; they are not byte-for-byte equivalent.
-- **Linux enforcement needs kernel support** — BPF-LSM, BTF, and compatible
-  struct offsets; offsets are validated at startup and the daemon **refuses to
-  start** rather than run with no enforcement or with wrong offsets.
+- **Linux enforcement needs kernel support** — BPF-LSM, BTF, `pahole`, and
+  compatible struct offsets. `cargo xtask build-ebpf` generates offsets for the
+  target kernel and writes a sidecar manifest bound to the eBPF object hash; the
+  daemon validates that manifest at startup and **refuses to start** rather than
+  run with no enforcement or with wrong offsets.
 - **Kubernetes integration requires containerd + RuntimeClass wiring**;
   installation docs and examples are still being written.
 
@@ -331,7 +333,7 @@ legacy seed and is not extended. See
 cargo build                          # all workspace crates
 cargo test                           # all unit tests
 cargo build -p containerd-shim-rauha-v2
-cargo xtask build-ebpf --release     # eBPF object (nightly Rust; separate build)
+cargo xtask build-ebpf --release     # eBPF object + offsets sidecar for this kernel
 ```
 
 Run the daemon and drive it with the CLI:

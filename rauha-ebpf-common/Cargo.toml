@@ -6,10 +6,13 @@ license = "Apache-2.0"
 
 [features]
 default = []
+std = []
+offsets = ["std", "sha2"]
 # Enable userspace-only helpers (requires std).
-userspace = ["aya"]
+userspace = ["std", "aya"]
 
 [dependencies]
 # aya is optional — only needed for Pod impl on userspace side.
 # This crate must still compile for bpfel-unknown-none without it.
 aya = { version = "0.13", optional = true }
+sha2 = { version = "0.10", optional = true }
