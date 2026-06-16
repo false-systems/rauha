@@ -234,11 +234,18 @@ fn redirect_stdio(log_dir: &Path) {
 }
 
 /// Collect resource usage stats for all processes in this VM.
-pub fn collect_stats() -> (u64, u64, u32) {
+pub fn collect_stats() -> (u64, u64, u32, u64, u64) {
     let cpu_usage_ns = read_proc_stat_cpu_ns().unwrap_or(0);
     let memory_bytes = read_meminfo_used().unwrap_or(0);
     let pids = count_pids().unwrap_or(0);
-    (cpu_usage_ns, memory_bytes, pids)
+    let (network_rx_bytes, network_tx_bytes) = read_network_bytes().unwrap_or((0, 0));
+    (
+        cpu_usage_ns,
+        memory_bytes,
+        pids,
+        network_rx_bytes,
+        network_tx_bytes,
+    )
 }
 
 fn read_proc_stat_cpu_ns() -> Option<u64> {
@@ -274,17 +281,41 @@ fn parse_meminfo_kb(s: &str) -> Option<u64> {
 
 fn count_pids() -> Option<u32> {
     let mut count = 0u32;
-    for entry in std::fs::read_dir("/proc").ok()? {
-        if let Ok(entry) = entry {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .chars()
-                .all(|c| c.is_ascii_digit())
-            {
-                count += 1;
-            }
+    for entry in (std::fs::read_dir("/proc").ok()?).flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+        {
+            count += 1;
         }
     }
     Some(count)
+}
+
+fn read_network_bytes() -> Option<(u64, u64)> {
+    let data = std::fs::read_to_string("/proc/net/dev").ok()?;
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+
+    for line in data.lines().skip(2) {
+        let Some((iface, counters)) = line.split_once(':') else {
+            continue;
+        };
+        let iface = iface.trim();
+        if iface == "lo" {
+            continue;
+        }
+
+        let fields: Vec<&str> = counters.split_whitespace().collect();
+        if fields.len() < 16 {
+            continue;
+        }
+
+        rx = rx.saturating_add(fields[0].parse::<u64>().unwrap_or(0));
+        tx = tx.saturating_add(fields[8].parse::<u64>().unwrap_or(0));
+    }
+
+    Some((rx, tx))
 }

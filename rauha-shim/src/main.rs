@@ -13,7 +13,10 @@ use tracing_subscriber::EnvFilter;
 use crate::state::ShimState;
 
 #[derive(Parser)]
-#[command(name = "rauha-shim", about = "Zone shim — one per zone, runs container processes")]
+#[command(
+    name = "rauha-shim",
+    about = "Zone shim — one per zone, runs container processes"
+)]
 struct Args {
     /// Zone name.
     #[arg(long)]
@@ -30,9 +33,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("rauha_shim=info".parse()?),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive("rauha_shim=info".parse()?))
         .init();
 
     let args = Args::parse();
@@ -70,9 +71,7 @@ fn main() -> anyhow::Result<()> {
                             tracing::error!(%e, "failed to send response");
                         }
                         // Check for shutdown.
-                        if matches!(response, ShimResponse::Ok)
-                            && shim_state.should_shutdown()
-                        {
+                        if matches!(response, ShimResponse::Ok) && shim_state.should_shutdown() {
                             tracing::info!("shutting down");
                             break;
                         }
@@ -147,11 +146,32 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
             ShimResponse::Ok
         }
         ShimRequest::GetStats => {
-            let (pids, _) = state.container_summary();
+            let (pids, container_count) = state.container_summary();
             ShimResponse::Stats {
-                cpu_usage_ns: 0,    // TODO: read from cgroup
-                memory_bytes: 0,    // TODO: read from cgroup
+                cpu_usage_ns: 0, // TODO: read from cgroup
+                memory_bytes: 0, // TODO: read from cgroup
                 pids,
+                container_count,
+                network_rx_bytes: 0,
+                network_tx_bytes: 0,
+            }
+        }
+        ShimRequest::ResizePty {
+            id,
+            session_id,
+            rows,
+            cols,
+        } => {
+            let Some(session_id) = session_id else {
+                return ShimResponse::Error {
+                    message: format!("missing PTY session id for container {id}"),
+                };
+            };
+            match attach::resize_pty(&session_id, rows, cols) {
+                Ok(()) => ShimResponse::Ok,
+                Err(e) => ShimResponse::Error {
+                    message: e.to_string(),
+                },
             }
         }
         ShimRequest::Exec {
@@ -168,7 +188,7 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
             }
             let session_id = uuid::Uuid::new_v4().to_string();
             match attach::fork_and_exec_pty(
-                &state.zone_name(),
+                state.zone_name(),
                 &id,
                 &command,
                 &env,
@@ -177,6 +197,7 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
                 Ok((master_fd, _pid)) => {
                     match attach::serve_attach_session(&id, &session_id, master_fd) {
                         Ok(socket_path) => ShimResponse::ExecReady {
+                            session_id: Some(session_id),
                             socket_path: Some(socket_path),
                             vsock_port: None,
                         },
@@ -196,7 +217,8 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
             // to have been started with a PTY. For now, return not supported
             // since Phase 3 containers use log-file stdio.
             ShimResponse::Error {
-                message: "attach to non-PTY container not supported — use `exec -it` instead".into(),
+                message: "attach to non-PTY container not supported — use `exec -it` instead"
+                    .into(),
             }
         }
     }

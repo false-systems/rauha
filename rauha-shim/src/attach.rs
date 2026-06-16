@@ -9,6 +9,15 @@
 
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::sync::{LazyLock, Mutex};
+
+#[cfg(target_os = "linux")]
+static PTY_SESSIONS: LazyLock<Mutex<HashMap<String, i32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Create an attach session socket and spawn a relay thread.
 ///
 /// Returns the socket path. The caller (daemon) connects to this socket
@@ -37,6 +46,12 @@ pub fn serve_attach_session(
 
     let listener = UnixListener::bind(&socket_path)?;
     let path_str = socket_path.to_string_lossy().to_string();
+    let session_key = session_id.to_string();
+
+    PTY_SESSIONS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("PTY session registry is poisoned"))?
+        .insert(session_key.clone(), pty_master_fd);
 
     // Spawn a dedicated thread for this attach session.
     std::thread::spawn(move || {
@@ -45,6 +60,12 @@ pub fn serve_attach_session(
             Ok((stream, _)) => stream,
             Err(e) => {
                 tracing::error!(%e, "attach session accept failed");
+                if let Ok(mut sessions) = PTY_SESSIONS.lock() {
+                    sessions.remove(&session_key);
+                }
+                unsafe {
+                    libc::close(pty_master_fd);
+                }
                 return;
             }
         };
@@ -125,6 +146,10 @@ pub fn serve_attach_session(
             }
         }
 
+        if let Ok(mut sessions) = PTY_SESSIONS.lock() {
+            sessions.remove(&session_key);
+        }
+
         // Close PTY master fd now that the relay is done.
         unsafe {
             libc::close(pty_master_fd);
@@ -136,6 +161,33 @@ pub fn serve_attach_session(
     });
 
     Ok(path_str)
+}
+
+#[cfg(target_os = "linux")]
+pub fn resize_pty(session_id: &str, rows: u32, cols: u32) -> anyhow::Result<()> {
+    if rows == 0 || cols == 0 || rows > u16::MAX as u32 || cols > u16::MAX as u32 {
+        anyhow::bail!("invalid PTY size {rows}x{cols}");
+    }
+
+    let pty_master_fd = *PTY_SESSIONS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("PTY session registry is poisoned"))?
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("PTY session {session_id} not found"))?;
+
+    let winsize = libc::winsize {
+        ws_row: rows as u16,
+        ws_col: cols as u16,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    let ret = unsafe { libc::ioctl(pty_master_fd, libc::TIOCSWINSZ, &winsize) };
+    if ret < 0 {
+        anyhow::bail!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 /// Write all bytes to a raw fd.
@@ -313,6 +365,11 @@ pub fn serve_attach_session(
     _pty_master_fd: i32,
 ) -> anyhow::Result<String> {
     anyhow::bail!("attach sessions are only supported on Linux")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn resize_pty(_session_id: &str, _rows: u32, _cols: u32) -> anyhow::Result<()> {
+    anyhow::bail!("PTY resize is only supported on Linux")
 }
 
 /// Non-Linux stub.

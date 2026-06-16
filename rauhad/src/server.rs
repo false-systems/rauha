@@ -512,13 +512,18 @@ impl ContainerService for ContainerServiceImpl {
             .registry
             .get_container(&container_id)
             .map_err(to_status)?;
+        let zone_name = self
+            .registry
+            .zone_name_for_container(&container.zone_id)
+            .await
+            .ok_or_else(|| Status::internal("zone not found for container"))?;
 
         Ok(Response::new(pb::container::GetContainerResponse {
             container: Some(pb::container::ContainerInfo {
                 id: container.id.to_string(),
                 name: container.name,
                 zone_id: container.zone_id.to_string(),
-                zone_name: String::new(), // TODO: reverse lookup
+                zone_name,
                 image: container.image,
                 state: format!("{:?}", container.state),
                 pid: container.pid.unwrap_or(0),
@@ -547,20 +552,25 @@ impl ContainerService for ContainerServiceImpl {
             .list_containers(zone_filter)
             .map_err(to_status)?;
 
-        let infos = containers
-            .into_iter()
-            .map(|c| pb::container::ContainerInfo {
+        let mut infos = Vec::with_capacity(containers.len());
+        for c in containers {
+            let zone_name = self
+                .registry
+                .zone_name_for_container(&c.zone_id)
+                .await
+                .ok_or_else(|| Status::internal("zone not found for container"))?;
+            infos.push(pb::container::ContainerInfo {
                 id: c.id.to_string(),
                 name: c.name,
                 zone_id: c.zone_id.to_string(),
-                zone_name: String::new(), // TODO: reverse lookup
+                zone_name,
                 image: c.image,
                 state: format!("{:?}", c.state),
                 pid: c.pid.unwrap_or(0),
                 created_at: c.created_at.to_rfc3339(),
                 started_at: c.started_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
-            })
-            .collect();
+            });
+        }
 
         Ok(Response::new(pb::container::ListContainersResponse {
             containers: infos,
@@ -680,6 +690,7 @@ impl ContainerService for ContainerServiceImpl {
         // The transport differs by platform but the relay logic is identical.
         match response {
             rauha_common::shim::ShimResponse::ExecReady {
+                session_id,
                 socket_path: Some(path),
                 ..
             } => {
@@ -687,9 +698,21 @@ impl ContainerService for ContainerServiceImpl {
                     Status::internal(format!("failed to connect to exec socket: {e}"))
                 })?;
                 let (r, w) = stream.into_split();
-                spawn_exec_relay(r, w, tx, in_stream);
+                spawn_exec_relay(
+                    r,
+                    w,
+                    tx,
+                    in_stream,
+                    Some(PtyResizeTarget {
+                        registry: self.registry.clone(),
+                        zone_name: zone_name.clone(),
+                        container_id: container_id.to_string(),
+                        session_id,
+                    }),
+                );
             }
             rauha_common::shim::ShimResponse::ExecReady {
+                session_id,
                 vsock_port: Some(port),
                 ..
             } => {
@@ -701,17 +724,42 @@ impl ContainerService for ContainerServiceImpl {
                         Status::internal(format!("failed to connect exec vsock: {e}"))
                     })?;
                 let (r, w) = tokio::io::split(stream);
-                spawn_exec_relay(r, w, tx, in_stream);
+                spawn_exec_relay(
+                    r,
+                    w,
+                    tx,
+                    in_stream,
+                    Some(PtyResizeTarget {
+                        registry: self.registry.clone(),
+                        zone_name: zone_name.clone(),
+                        container_id: container_id.to_string(),
+                        session_id,
+                    }),
+                );
             }
             // Legacy: accept AttachReady for backward compat with older shims.
-            rauha_common::shim::ShimResponse::AttachReady { socket_path } => {
+            rauha_common::shim::ShimResponse::AttachReady {
+                socket_path,
+                session_id,
+            } => {
                 let stream = tokio::net::UnixStream::connect(&socket_path)
                     .await
                     .map_err(|e| {
                         Status::internal(format!("failed to connect to attach socket: {e}"))
                     })?;
                 let (r, w) = stream.into_split();
-                spawn_exec_relay(r, w, tx, in_stream);
+                spawn_exec_relay(
+                    r,
+                    w,
+                    tx,
+                    in_stream,
+                    Some(PtyResizeTarget {
+                        registry: self.registry.clone(),
+                        zone_name: zone_name.clone(),
+                        container_id: container_id.to_string(),
+                        session_id,
+                    }),
+                );
             }
             rauha_common::shim::ShimResponse::Error { message } => {
                 return Err(Status::internal(format!("exec failed: {message}")));
@@ -769,7 +817,10 @@ impl ContainerService for ContainerServiceImpl {
             .map_err(|e| Status::internal(format!("shim attach failed: {e}")))?;
 
         match response {
-            rauha_common::shim::ShimResponse::AttachReady { socket_path } => {
+            rauha_common::shim::ShimResponse::AttachReady {
+                socket_path,
+                session_id,
+            } => {
                 let stream = tokio::net::UnixStream::connect(&socket_path)
                     .await
                     .map_err(|e| {
@@ -778,6 +829,12 @@ impl ContainerService for ContainerServiceImpl {
 
                 let (read_half, write_half) = stream.into_split();
                 let (tx, rx) = mpsc::channel(256);
+                let resize_target = PtyResizeTarget {
+                    registry: self.registry.clone(),
+                    zone_name,
+                    container_id: container_id.to_string(),
+                    session_id,
+                };
 
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
@@ -813,8 +870,8 @@ impl ContainerService for ContainerServiceImpl {
                                     break;
                                 }
                             }
-                            Some(pb::container::attach_request::Message::Resize(_resize)) => {
-                                // TODO: send TIOCSWINSZ to PTY via shim
+                            Some(pb::container::attach_request::Message::Resize(resize)) => {
+                                resize_target.resize(resize.rows, resize.cols).await;
                             }
                             _ => {}
                         }
@@ -840,6 +897,7 @@ fn spawn_exec_relay<R, W>(
     writer: W,
     tx: mpsc::Sender<Result<pb::container::ExecStreamResponse, Status>>,
     in_stream: Streaming<pb::container::ExecStreamRequest>,
+    resize_target: Option<PtyResizeTarget>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -883,13 +941,62 @@ fn spawn_exec_relay<R, W>(
                         break;
                     }
                 }
-                Some(pb::container::exec_stream_request::Message::Resize(_resize)) => {
-                    // TODO: send TIOCSWINSZ to PTY via shim
+                Some(pb::container::exec_stream_request::Message::Resize(resize)) => {
+                    if let Some(target) = &resize_target {
+                        target.resize(resize.rows, resize.cols).await;
+                    }
                 }
                 _ => {}
             }
         }
     });
+}
+
+#[derive(Clone)]
+struct PtyResizeTarget {
+    registry: Arc<ZoneRegistry>,
+    zone_name: String,
+    container_id: String,
+    session_id: Option<String>,
+}
+
+impl PtyResizeTarget {
+    async fn resize(&self, rows: u32, cols: u32) {
+        let request = rauha_common::shim::ShimRequest::ResizePty {
+            id: self.container_id.clone(),
+            session_id: self.session_id.clone(),
+            rows,
+            cols,
+        };
+
+        match self.registry.shim_request(&self.zone_name, &request).await {
+            Ok(rauha_common::shim::ShimResponse::Ok) => {}
+            Ok(rauha_common::shim::ShimResponse::Error { message }) => {
+                tracing::warn!(
+                    zone = %self.zone_name,
+                    container = %self.container_id,
+                    error = %message,
+                    "PTY resize failed"
+                );
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    zone = %self.zone_name,
+                    container = %self.container_id,
+                    response = ?other,
+                    "unexpected PTY resize response"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    zone = %self.zone_name,
+                    container = %self.container_id,
+                    error = %e,
+                    "PTY resize request failed"
+                );
+            }
+        }
+    }
 }
 
 // --- Image Service ---

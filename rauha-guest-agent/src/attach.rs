@@ -5,12 +5,20 @@
 //! - Vsock listener instead of Unix socket listener
 //! - Chroot into virtiofs-mounted rootfs at /mnt/rauha/containers/{id}/...
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::{LazyLock, Mutex};
 
 /// Next available vsock port for exec sessions. Starts at 6000 to avoid
 /// conflict with the control port (5123).
 static NEXT_SESSION_PORT: AtomicU32 = AtomicU32::new(6000);
+
+#[cfg(target_os = "linux")]
+static PTY_SESSIONS: LazyLock<Mutex<HashMap<String, i32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Allocate a unique vsock port for an exec session.
 pub fn allocate_session_port() -> u32 {
@@ -164,7 +172,11 @@ mod tests {
 ///
 /// The thread closes the PTY master fd when the session ends.
 #[cfg(target_os = "linux")]
-pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Result<()> {
+pub fn serve_vsock_session(
+    session_id: &str,
+    pty_master_fd: i32,
+    vsock_port: u32,
+) -> anyhow::Result<()> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use std::os::fd::BorrowedFd;
 
@@ -233,6 +245,12 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
     }
 
     tracing::info!(port = vsock_port, "exec session vsock listening");
+    let session_key = session_id.to_string();
+
+    PTY_SESSIONS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("PTY session registry is poisoned"))?
+        .insert(session_key.clone(), pty_master_fd);
 
     // Spawn relay thread.
     std::thread::spawn(move || {
@@ -252,6 +270,9 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
                         port = vsock_port,
                         "exec session vsock accept timed out; closing PTY"
                     );
+                    if let Ok(mut sessions) = PTY_SESSIONS.lock() {
+                        sessions.remove(&session_key);
+                    }
                     unsafe {
                         libc::close(pty_master_fd);
                         libc::close(listen_fd);
@@ -262,6 +283,9 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(e) => {
                     tracing::error!(%e, "exec session vsock poll failed");
+                    if let Ok(mut sessions) = PTY_SESSIONS.lock() {
+                        sessions.remove(&session_key);
+                    }
                     unsafe {
                         libc::close(pty_master_fd);
                         libc::close(listen_fd);
@@ -279,6 +303,9 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
                 continue;
             }
             tracing::error!(%err, "exec session vsock accept failed");
+            if let Ok(mut sessions) = PTY_SESSIONS.lock() {
+                sessions.remove(&session_key);
+            }
             unsafe {
                 libc::close(pty_master_fd);
                 libc::close(listen_fd);
@@ -372,12 +399,42 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
             }
         }
 
+        if let Ok(mut sessions) = PTY_SESSIONS.lock() {
+            sessions.remove(&session_key);
+        }
         unsafe {
             libc::close(pty_master_fd);
             libc::close(conn_fd);
         }
         tracing::debug!(port = vsock_port, "exec session ended");
     });
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn resize_pty(session_id: &str, rows: u32, cols: u32) -> anyhow::Result<()> {
+    if rows == 0 || cols == 0 || rows > u16::MAX as u32 || cols > u16::MAX as u32 {
+        anyhow::bail!("invalid PTY size {rows}x{cols}");
+    }
+
+    let pty_master_fd = *PTY_SESSIONS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("PTY session registry is poisoned"))?
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("PTY session {session_id} not found"))?;
+
+    let winsize = libc::winsize {
+        ws_row: rows as u16,
+        ws_col: cols as u16,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    let ret = unsafe { libc::ioctl(pty_master_fd, libc::TIOCSWINSZ, &winsize) };
+    if ret < 0 {
+        anyhow::bail!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error());
+    }
 
     Ok(())
 }
@@ -407,6 +464,15 @@ pub fn fork_and_exec_pty(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn serve_vsock_session(_pty_master_fd: i32, _vsock_port: u32) -> anyhow::Result<()> {
+pub fn serve_vsock_session(
+    _session_id: &str,
+    _pty_master_fd: i32,
+    _vsock_port: u32,
+) -> anyhow::Result<()> {
     anyhow::bail!("vsock sessions are only supported inside Linux VMs")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn resize_pty(_session_id: &str, _rows: u32, _cols: u32) -> anyhow::Result<()> {
+    anyhow::bail!("PTY resize is only supported inside Linux VMs")
 }
