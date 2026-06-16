@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     macros::{lsm, map},
-    maps::{Array, HashMap, PerCpuArray, ring_buf::RingBuf},
+    maps::{ring_buf::RingBuf, Array, HashMap, PerCpuArray},
     programs::LsmContext,
 };
 use rauha_ebpf_common::{
@@ -12,12 +12,12 @@ use rauha_ebpf_common::{
     MAX_INODES, MAX_ZONES,
 };
 
-mod file_guard;
+mod capable_guard;
+mod cgroup_lock;
 mod exec_guard;
+mod file_guard;
 mod ptrace_guard;
 mod signal_guard;
-mod cgroup_lock;
-mod capable_guard;
 mod socket_connect_guard;
 
 /// Maps cgroup_id → ZoneInfoKernel. Tells us which zone a process belongs to.
@@ -75,26 +75,20 @@ unsafe fn read_kernel_u64(base: u64, offset: usize) -> Result<u64, i64> {
     aya_ebpf::helpers::bpf_probe_read_kernel(addr).map_err(|e| e as i64)
 }
 
-/// Kernel struct field offsets for cgroup ID resolution.
+/// Kernel struct field offsets used by BPF programs.
 ///
-/// Defaults for Linux 6.1+. Userspace validates ALL offsets against the
-/// running kernel's BTF via pahole at startup — any mismatch blocks loading.
-/// The cgroup chain (TASK_CGROUPS → KERNFS_NODE_ID) is additionally verified
-/// by the runtime self-test. File/inode/binprm offsets are pahole-only.
-///
-/// Previous approach used #[no_mangle] static + set_global() for runtime
-/// patching, but the Rust nightly BPF compiler emits panic_misaligned_pointer
-/// functions that the BPF verifier rejects ("last insn is not an exit or jmp").
+/// `cargo xtask build-ebpf` resolves these from the target kernel's BTF and
+/// compiles them into the object. The daemon validates the generated sidecar
+/// before loading. Plain crate builds use defaults only so the source remains
+/// checkable; those objects are not production artifacts.
+#[cfg(feature = "generated-offsets")]
 mod offsets {
-    // Verified via pahole on Linux 6.19.9 (Fedora 43).
-    pub const TASK_CGROUPS: usize = 3920;
-    pub const CSS_SET_DFL_CGRP: usize = 136;
-    pub const CGROUP_KN: usize = 256;
-    pub const KERNFS_NODE_ID: usize = 96;
-    pub const FILE_F_INODE: usize = 32;
-    pub const INODE_I_INO: usize = 64;
-    // linux_binprm renamed 'file' to 'executable' in recent kernels.
-    pub const BPRM_FILE: usize = 48;
+    include!(env!("RAUHA_EBPF_OFFSETS"));
+}
+
+#[cfg(not(feature = "generated-offsets"))]
+mod offsets {
+    include!("offsets_default.rs");
 }
 
 /// Read a target task's cgroup_id by walking the task_struct pointer chain.
@@ -158,10 +152,7 @@ fn is_cross_zone_allowed(src_zone: u32, dst_zone: u32) -> bool {
     if src_zone == dst_zone {
         return true;
     }
-    let key = ZoneCommKey {
-        src_zone,
-        dst_zone,
-    };
+    let key = ZoneCommKey { src_zone, dst_zone };
     unsafe { ZONE_ALLOWED_COMMS.get(&key).is_some() }
 }
 
@@ -250,7 +241,7 @@ fn check_cross_zone_task_access(ctx: &LsmContext, hook: u8) -> Result<i32, i64> 
 /// Run the one-shot self-test: write both cgroup_id derivation paths to SELF_TEST map.
 ///
 /// Called from file_open on first invocation. Skips if already populated (nonzero).
-/// The two values should be identical if the hardcoded offsets are correct.
+/// The two values should be identical if the compiled offsets are correct.
 #[inline(always)]
 unsafe fn maybe_run_self_test() {
     // One-shot guard: skip if already written.
