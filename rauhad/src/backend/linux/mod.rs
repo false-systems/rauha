@@ -1130,6 +1130,13 @@ impl IsolationBackend for LinuxBackend {
     fn name(&self) -> &str {
         "linux-ebpf"
     }
+
+    fn kernel_zone_id(&self, zone: &ZoneHandle) -> Option<u32> {
+        // The compact id is the same value stamped on enforcement events as
+        // `caller_zone`. A poisoned lock or unmapped zone yields None — callers
+        // treat that as "can't attribute events", not an error.
+        self.get_zone_id(&zone.id).ok().flatten()
+    }
 }
 
 /// Recursively copy a directory tree, preserving symlinks and file permissions.

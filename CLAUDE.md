@@ -46,6 +46,17 @@ cargo run --bin rauha -- zone list
 cargo run --bin rauha -- image pull alpine:latest
 cargo run --bin rauha -- run --zone test alpine:latest /bin/echo hello
 
+# Agent sandbox task (primary product shape — API contract, runtime still landing)
+cargo run --bin rauha -- sandbox --image alpine:latest -- /bin/echo hello
+
+# Observability / evidence surface
+cargo run --bin rauha -- trace --zone test          # syscall trace for a zone
+cargo run --bin rauha -- top                         # per-zone resource usage
+cargo run --bin rauha -- events                      # stream zone enforcement events
+cargo run --bin rauha -- logs <container>            # stream container stdout/stderr
+cargo run --bin rauha -- exec <container> /bin/sh    # exec in a running container
+cargo run --bin rauha -- attach <container>          # attach to a running container
+
 # Integration tests (Linux only, require root + running rauhad)
 bash tests/integration/test-image-pull.sh
 bash tests/integration/test-container-lifecycle.sh
@@ -53,6 +64,7 @@ bash tests/integration/test-zone-isolation.sh
 bash tests/integration/test-zone-networking.sh
 bash tests/integration/test-exec.sh
 bash tests/integration/test-logs.sh
+bash tests/integration/test-sandbox.sh         # agent sandbox task end-to-end
 bash tests/integration/test-cgroup-lock.sh          # eBPF enforcement required
 
 # Oracle tests (require running rauhad, any platform)
@@ -61,7 +73,9 @@ RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test           # all cases
 RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test -- case_001  # one case
 ```
 
-Proto files are in `proto/` (zone.proto, container.proto, image.proto). They compile automatically via `build.rs` in rauhad and rauha-cli.
+Proto files are in `proto/` (zone.proto, container.proto, image.proto, sandbox.proto). They compile automatically via `build.rs` in rauhad and rauha-cli. `sandbox.proto` defines `SandboxService.RunSandbox` (package `rauha.sandbox.v1`) — the agent-sandbox task contract that runs a command in its own zone and captures stdout/stderr/exit-code plus enforcement events into one result. `SandboxServiceImpl` (`rauhad/src/server.rs`) implements it on top of the zone/container primitives: resolve-or-allocate a zone, create+start one container, poll to exit (or timeout), read shim log files for output, and drain the enforcement-event broadcast scoped to the task's zone. Temporary zones (empty `name`) are torn down after the run unless `keep_zone` is set; a runtime failure that prevents producing a result comes back as a `runtime_error` result, not a gRPC error. The `rauha sandbox` CLI mirrors the task's exit code.
+
+Most read-only/list commands accept `--json`; streaming/interactive commands (`trace`, `top`, `events`, `logs`, `exec`, `attach`, `setup`) do not.
 
 ## Core Principles
 
@@ -131,7 +145,18 @@ On macOS, VMs get NAT from Virtualization.framework. pf handles per-zone firewal
 
 ### Enforcement Event Streaming (`rauhad/src/backend/linux/events.rs`)
 
-Every deny decision from the 7 LSM hooks is emitted to a BPF ring buffer (`ENFORCEMENT_EVENTS`, 256 pages / ~1MB). A background task drains the ring buffer every 100ms, decodes `EnforcementEvent` structs (48 bytes, `read_unaligned` — ring buffer data is unaligned), and broadcasts them via `tokio::sync::broadcast`. The `WatchEvents` gRPC stream relays these to clients. Only deny events hit the ring buffer; allows are tracked in per-CPU counters (`ENFORCEMENT_COUNTERS`).
+Every deny decision from the 7 LSM hooks is emitted to a BPF ring buffer (`ENFORCEMENT_EVENTS`, `RingBuf::with_byte_size(1024 * 4096, 0)` = 4MB / 1024 pages). A background task drains the ring buffer every 100ms, decodes `EnforcementEvent` structs (48 bytes, `read_unaligned` — ring buffer data is unaligned), and broadcasts them via `tokio::sync::broadcast`. The `WatchEvents` gRPC stream relays these to clients. Only deny events hit the ring buffer; allows are tracked in per-CPU counters (`ENFORCEMENT_COUNTERS`).
+
+### Evidence & Observability Surface (`rauha-evidence`, `rauhad/src/logs.rs`)
+
+Ownership reading: **Syva enforces; Rauha observes.** The `rauha-evidence` crate is the normalization layer — it consumes raw enforcement records (from the eBPF backend / Syva) plus Rauha lifecycle events and projects them into one stable schema. It does **not** enforce policy. Event names are stable string constants in `rauha_evidence::event_name` (e.g. `zone.file.denied`, `zone.exec.denied`, `zone.escape.cgroup_attach`, `zone.created`, `container.exited`, `image.pulled`, `policy.loaded`, plus pipeline-health events `ringbuf.drop` / `pipeline.shed`). Output goes through pluggable sinks (file / JSON).
+
+User-facing side (CLI in `rauha-cli/src/commands/trace.rs` + formatting in `output.rs`):
+- `rauha trace` — per-zone syscall trace
+- `rauha top` — per-zone resource usage snapshot
+- `rauha events` — live stream of enforcement/lifecycle events (rides the `WatchEvents` gRPC stream)
+
+`rauhad/src/logs.rs` is separate from the evidence schema: it tails shim-written container log files (`/run/rauha/containers/{id}/stdout.log` and `stderr.log`) in one-shot or follow mode, backing the `rauha logs` command.
 
 ### Zone ID Compaction
 
@@ -172,7 +197,7 @@ On startup, rauhad runs `reconcile()`: loads all zones from redb, calls `recover
 
 ### eBPF Programs (`rauha-ebpf/src/`)
 
-Seven LSM hooks enforce zone boundaries at the kernel level: `file_open`, `bprm_check_security`, `ptrace_access_check`, `task_kill`, `cgroup_attach_task`, `capable`, `socket_connect`. All kernel memory reads use `bpf_probe_read_kernel` (not raw pointer dereference). Kernel struct offsets are hardcoded in `rauha-ebpf/src/main.rs::offsets` module and validated at startup via pahole + a runtime self-test. Unsupported hooks are skipped gracefully — the daemon continues with whatever subset the kernel supports. Shared kernel/userspace types live in `rauha-ebpf-common`.
+Seven LSM hooks enforce zone boundaries at the kernel level: `file_open`, `bprm_check_security`, `ptrace_access_check`, `task_kill`, `cgroup_attach_task`, `capable`, `socket_connect`. All kernel memory reads use `bpf_probe_read_kernel` (not raw pointer dereference). Kernel struct offsets are hardcoded in `rauha-ebpf/src/main.rs::offsets` module and validated at startup via pahole + a runtime self-test. Unsupported hooks are skipped gracefully at load time — the daemon continues with whatever subset the kernel supports. At **runtime**, hook logic that errors (e.g. a failed `bpf_probe_read_kernel`) **fails closed**: the hook returns `-EPERM` (deny) and emits an error event rather than allowing the operation. Shared kernel/userspace types live in `rauha-ebpf-common`.
 
 Seven BPF maps: `ZONE_MEMBERSHIP` (cgroup→zone), `ZONE_POLICY` (zone→policy flags), `INODE_ZONE_MAP` (inode→zone for file isolation), `ZONE_ALLOWED_COMMS` (cross-zone permission pairs), `SELF_TEST` (startup offset validation), `ENFORCEMENT_COUNTERS` (per-hook allow/deny/error counts, PerCpuArray), `ENFORCEMENT_EVENTS` (ring buffer, deny events to userspace).
 
@@ -200,6 +225,7 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 | `rauha-shim` | Per-zone sync process — fork/run containers (Linux only) |
 | `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
+| `rauha-evidence` | Evidence-grade observability schema, projections, and sinks. Normalizes Syva/backend enforcement records + Rauha lifecycle events into one schema. Does not enforce. Consumed only by `rauhad`. |
 | `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd Task ttrpc API to rauhad gRPC for Kubernetes |
 | `rauha-enforce` | **Legacy** — superseded by Syvä (separate repo at `github.com/false-systems/syva`). Do not extend. |
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, not in workspace, separate build) |

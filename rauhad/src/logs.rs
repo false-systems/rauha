@@ -126,6 +126,17 @@ fn log_path(container_id: &str, stream: &str) -> PathBuf {
         .join(format!("{stream}.log"))
 }
 
+/// Read the full stdout and stderr logs for a container.
+///
+/// Returns `(stdout, stderr)`. A missing log file yields an empty string —
+/// a container that produced no output is not an error. Synchronous file I/O,
+/// so callers in async contexts should wrap this in `spawn_blocking`.
+pub fn read_all(container_id: &str) -> (String, String) {
+    let stdout = std::fs::read_to_string(log_path(container_id, "stdout")).unwrap_or_default();
+    let stderr = std::fs::read_to_string(log_path(container_id, "stderr")).unwrap_or_default();
+    (stdout, stderr)
+}
+
 /// Read the last N lines from a file (or all lines if tail == 0).
 ///
 /// When tail > 0, uses a bounded ring buffer to avoid loading the entire

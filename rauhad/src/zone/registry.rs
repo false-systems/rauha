@@ -80,6 +80,17 @@ impl ZoneRegistry {
         self.root.clone()
     }
 
+    /// Resolve the compact, kernel-side id the backend assigns to a zone.
+    ///
+    /// Used to correlate kernel enforcement events (which carry the compact id)
+    /// back to a zone by name. Returns `None` for an unknown zone or a backend
+    /// that assigns no kernel id (macOS, or eBPF not loaded).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub async fn kernel_zone_id(&self, zone_name: &str) -> Option<u32> {
+        let handle = self.handles.read().await.get(zone_name).cloned()?;
+        self.backend.kernel_zone_id(&handle)
+    }
+
     /// Reconcile persisted metadata with kernel state on startup.
     ///
     /// redb is the source of truth. For each persisted zone, re-establish

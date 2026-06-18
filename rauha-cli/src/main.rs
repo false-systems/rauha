@@ -21,7 +21,7 @@ enum Commands {
         #[command(subcommand)]
         action: commands::zone::ZoneAction,
     },
-    /// Run an agent task in a sandbox zone (API contract; runtime planned)
+    /// Run an agent task in a sandbox zone, capturing output and events
     Sandbox(commands::sandbox::SandboxArgs),
     /// Run a container in a zone
     Run(commands::run::RunArgs),
