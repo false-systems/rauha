@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  linux-build:
+    name: Linux build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+
+      - name: Check Linux daemon and CLI
+        run: cargo check -p rauhad -p rauha-cli -p rauha-common -p rauha-enforcer-api

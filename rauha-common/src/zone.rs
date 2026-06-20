@@ -377,6 +377,37 @@ pub fn capabilities_to_mask(caps: &[impl AsRef<str>]) -> crate::error::Result<u6
     Ok(mask)
 }
 
+impl ZonePolicy {
+    /// Translate this user-facing policy into the enforcement seam's neutral
+    /// vocabulary (`rauha-enforcer-api::ZoneEnforcement`).
+    ///
+    /// This is the single source of truth for how Rauha policy maps onto
+    /// zone-wide enforcement flags. Backends consume `ZoneEnforcement` and
+    /// translate it into their own kernel/control-plane state, so this keeps
+    /// Rauha policy semantics from leaking across the boundary. Errors only
+    /// arise from unknown capability names.
+    pub fn to_enforcement(
+        &self,
+    ) -> crate::error::Result<rauha_enforcer_api::ZoneEnforcement> {
+        let caps_mask = capabilities_to_mask(&self.capabilities.allowed)?;
+
+        // ptrace is gated on the SYS_PTRACE capability being granted, accepting
+        // both the canonical and short capability spellings.
+        let allow_ptrace = self.capabilities.allowed.iter().any(|c| {
+            let upper = c.to_uppercase();
+            upper == "CAP_SYS_PTRACE" || upper == "SYS_PTRACE"
+        });
+
+        let allow_host_net = self.network.mode == NetworkMode::Host;
+
+        Ok(rauha_enforcer_api::ZoneEnforcement {
+            caps_mask,
+            allow_ptrace,
+            allow_host_net,
+        })
+    }
+}
+
 impl PolicyFile {
     /// Parse a TOML policy file into a ZonePolicy.
     pub fn to_zone_policy(&self, base_root: &str) -> crate::error::Result<ZonePolicy> {
@@ -540,6 +571,59 @@ mod tests {
         assert!(policy.capabilities.allowed.is_empty());
         assert_eq!(policy.resources.cpu_shares, 1024);
         assert_eq!(policy.network.mode, NetworkMode::Isolated);
+    }
+
+    fn policy_with_caps(caps: &[&str]) -> ZonePolicy {
+        let mut p = ZonePolicy::default();
+        p.capabilities.allowed = caps.iter().map(|c| c.to_string()).collect();
+        p
+    }
+
+    #[test]
+    fn to_enforcement_default_is_restrictive() {
+        let e = ZonePolicy::default().to_enforcement().unwrap();
+        assert_eq!(e.caps_mask, 0);
+        assert!(!e.allow_ptrace);
+        assert!(!e.allow_host_net);
+    }
+
+    #[test]
+    fn to_enforcement_sets_caps_mask_bits() {
+        // CAP_NET_ADMIN = bit 12, CAP_SYS_ADMIN = bit 21.
+        let e = policy_with_caps(&["CAP_NET_ADMIN", "CAP_SYS_ADMIN"])
+            .to_enforcement()
+            .unwrap();
+        assert_eq!(e.caps_mask, (1 << 12) | (1 << 21));
+    }
+
+    #[test]
+    fn to_enforcement_ptrace_flag_from_capability() {
+        assert!(policy_with_caps(&["CAP_SYS_PTRACE"])
+            .to_enforcement()
+            .unwrap()
+            .allow_ptrace);
+        // Short spelling, case-insensitive.
+        assert!(policy_with_caps(&["sys_ptrace"])
+            .to_enforcement()
+            .unwrap()
+            .allow_ptrace);
+    }
+
+    #[test]
+    fn to_enforcement_host_network_flag() {
+        let mut p = ZonePolicy::default();
+        p.network.mode = NetworkMode::Host;
+        assert!(p.to_enforcement().unwrap().allow_host_net);
+
+        p.network.mode = NetworkMode::Isolated;
+        assert!(!p.to_enforcement().unwrap().allow_host_net);
+    }
+
+    #[test]
+    fn to_enforcement_rejects_unknown_capability() {
+        assert!(policy_with_caps(&["CAP_NONEXISTENT"])
+            .to_enforcement()
+            .is_err());
     }
 
     #[test]

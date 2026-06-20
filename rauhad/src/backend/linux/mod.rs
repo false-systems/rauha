@@ -10,6 +10,7 @@
 
 mod cgroup;
 mod ebpf;
+mod enforcer;
 pub mod events;
 mod maps;
 mod namespace;
@@ -43,8 +44,7 @@ use rauha_common::zone::*;
 use uuid::Uuid;
 
 use self::cgroup::CgroupManager;
-use self::ebpf::EbpfManager;
-use self::maps::MapManager;
+use self::enforcer::LinuxEnforcer;
 use crate::network::allocator::IpAllocator;
 
 /// Connection to a zone's shim process via Unix socket.
@@ -91,8 +91,8 @@ fn lock_backend<'a, T>(mutex: &'a Mutex<T>, name: &str) -> Result<MutexGuard<'a,
 /// Linux isolation backend using eBPF LSM + namespaces + cgroups.
 pub struct LinuxBackend {
     root: String,
-    /// eBPF program manager (None if eBPF is not available / not loaded yet).
-    ebpf: Mutex<Option<EbpfManager>>,
+    /// Linux kernel enforcement adapter.
+    enforcer: LinuxEnforcer,
     /// cgroup v2 manager.
     cgroup: CgroupManager,
     /// Monotonic zone ID counter for compact BPF map keys.
@@ -106,10 +106,6 @@ pub struct LinuxBackend {
     /// Registered inodes per zone, for correct cleanup without re-walking.
     /// Key is zone name, value is the inode list registered in INODE_ZONE_MAP.
     registered_inodes: Mutex<HashMap<String, Vec<u64>>>,
-    /// Cancellation token for the enforcement event reader task.
-    event_reader_cancel: Option<tokio_util::sync::CancellationToken>,
-    /// Broadcast sender for enforcement events (gRPC WatchEvents subscribes here).
-    event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
     /// IP address allocator for zone networking.
     ip_allocator: Mutex<IpAllocator>,
 }
@@ -119,17 +115,7 @@ impl LinuxBackend {
         let cgroup = CgroupManager::new()?;
         let ip_allocator = IpAllocator::default_subnet();
 
-        let mut ebpf = Self::try_load_ebpf(root)?;
-        tracing::info!("eBPF programs loaded — kernel enforcement active");
-
-        let ring_buf = ebpf
-            .take_event_ring_buf()
-            .map_err(|e| RauhaError::EbpfError {
-                message: format!("enforcement event ring buffer not available: {e}"),
-                hint: "check the ENFORCEMENT_EVENTS ring buffer map was created".into(),
-            })?;
-        let event_reader_cancel = tokio_util::sync::CancellationToken::new();
-        let event_tx = events::spawn_event_reader(ring_buf, event_reader_cancel.clone());
+        let enforcer = LinuxEnforcer::new(root)?;
 
         // Ensure the network bridge exists with a gateway IP.
         if let Err(e) = network::ensure_bridge(ip_allocator.gateway(), ip_allocator.prefix_len()) {
@@ -154,44 +140,14 @@ impl LinuxBackend {
 
         Ok(Self {
             root: root.into(),
-            ebpf: Mutex::new(Some(ebpf)),
+            enforcer,
             cgroup,
             next_zone_id: AtomicU32::new(1), // 0 is reserved for "no zone".
             zone_id_map: Mutex::new(HashMap::new()),
             zone_name_map: Mutex::new(HashMap::new()),
             shim_connections: Mutex::new(HashMap::new()),
             registered_inodes: Mutex::new(HashMap::new()),
-            event_reader_cancel: Some(event_reader_cancel),
-            event_tx: Some(event_tx),
             ip_allocator: Mutex::new(ip_allocator),
-        })
-    }
-
-    fn try_load_ebpf(root: &str) -> Result<EbpfManager> {
-        // Look for the eBPF object in well-known locations.
-        let candidates = [
-            PathBuf::from(root).join("rauha-ebpf"),
-            PathBuf::from("/usr/lib/rauha/rauha-ebpf"),
-            // Development build path.
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("rauha-ebpf/target/bpfel-unknown-none/debug/rauha-ebpf"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("rauha-ebpf/target/bpfel-unknown-none/release/rauha-ebpf"),
-        ];
-
-        for path in &candidates {
-            if path.exists() {
-                return EbpfManager::load(path);
-            }
-        }
-
-        Err(RauhaError::EbpfError {
-            message: "eBPF object not found in any known location".into(),
-            hint: "run `cargo xtask build-ebpf` to compile eBPF programs".into(),
         })
     }
 
@@ -199,7 +155,7 @@ impl LinuxBackend {
     pub fn event_sender(
         &self,
     ) -> Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>> {
-        self.event_tx.clone()
+        self.enforcer.event_sender()
     }
 
     /// Allocate a new compact zone_id for BPF maps.
@@ -326,12 +282,7 @@ impl LinuxBackend {
     /// in the policy, then adds the current allowed set. This ensures
     /// hot-reload actually revokes permissions when zones are removed from
     /// `allowed_zones`.
-    fn sync_bpf_allowed_comms(
-        &self,
-        bpf: &mut aya::Bpf,
-        zone_id: u32,
-        net_policy: &NetworkPolicy,
-    ) -> Result<()> {
+    fn sync_bpf_allowed_comms(&self, zone_id: u32, net_policy: &NetworkPolicy) -> Result<()> {
         let zone_names = lock_backend(&self.zone_name_map, "zone_name_map")?;
         let zone_ids = lock_backend(&self.zone_id_map, "zone_id_map")?;
 
@@ -352,10 +303,10 @@ impl LinuxBackend {
                 continue;
             }
             if !allowed_peer_ids.contains(&peer_zone_id) {
-                if let Err(e) = MapManager::deny_zone_comm(bpf, zone_id, peer_zone_id) {
+                if let Err(e) = self.enforcer.deny_zone_comm(zone_id, peer_zone_id) {
                     tracing::warn!(%e, zone_id, peer_zone_id, "failed to revoke zone comm");
                 }
-                if let Err(e) = MapManager::deny_zone_comm(bpf, peer_zone_id, zone_id) {
+                if let Err(e) = self.enforcer.deny_zone_comm(peer_zone_id, zone_id) {
                     tracing::warn!(%e, zone_id, peer_zone_id, "failed to revoke reverse zone comm");
                 }
             }
@@ -363,10 +314,10 @@ impl LinuxBackend {
 
         // Add the currently allowed comms.
         for &peer_zone_id in &allowed_peer_ids {
-            if let Err(e) = MapManager::allow_zone_comm(bpf, zone_id, peer_zone_id) {
+            if let Err(e) = self.enforcer.allow_zone_comm(zone_id, peer_zone_id) {
                 tracing::warn!(%e, zone_id, peer_zone_id, "failed to allow zone comm in BPF map");
             }
-            if let Err(e) = MapManager::allow_zone_comm(bpf, peer_zone_id, zone_id) {
+            if let Err(e) = self.enforcer.allow_zone_comm(peer_zone_id, zone_id) {
                 tracing::warn!(%e, zone_id, peer_zone_id, "failed to allow reverse zone comm in BPF map");
             }
         }
@@ -449,19 +400,12 @@ impl IsolationBackend for LinuxBackend {
 
         // Re-populate BPF maps. A recovered zone without BPF enforcement must
         // not be treated as recovered.
-        {
-            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
-            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
-                message: "eBPF manager not available during zone recovery".into(),
-                hint: "restart rauhad after restoring eBPF LSM support".into(),
-            })?;
-            let bpf = ebpf.bpf_mut();
-            // Policy before membership — a recovered cgroup may already hold
-            // running processes, so its ZONE_POLICY must exist before any of
-            // them can resolve as a zone member (else capable() fails closed).
-            MapManager::set_zone_policy(bpf, zone_id, policy)?;
-            MapManager::add_zone_member(bpf, cgroup_id, zone_id, zone_type)?;
-        }
+        // Policy before membership — a recovered cgroup may already hold
+        // running processes, so its ZONE_POLICY must exist before any of them
+        // can resolve as a zone member (else capable() fails closed).
+        self.enforcer.set_zone_policy(zone_id, policy)?;
+        self.enforcer
+            .add_zone_member(cgroup_id, zone_id, zone_type)?;
 
         tracing::info!(zone = zone.name, zone_id, cgroup_id, "zone recovered");
         Ok(())
@@ -580,34 +524,21 @@ impl IsolationBackend for LinuxBackend {
         };
 
         // Step 3: Populate BPF maps. Missing enforcement is fatal.
+        // Write the policy before membership: once a process resolves to a
+        // zone via ZONE_MEMBERSHIP, its ZONE_POLICY must already exist, or
+        // the fail-closed capable() hook would deny it in the gap.
+        if let Err(e) = self.enforcer.set_zone_policy(zone_id, &config.policy) {
+            rollback_zone("bpf-policy");
+            return Err(e);
+        }
+
+        if let Err(e) = self
+            .enforcer
+            .add_zone_member(cgroup_id, zone_id, config.zone_type)
         {
-            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
-            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
-                message: "eBPF manager not available during zone creation".into(),
-                hint: "restart rauhad after restoring eBPF LSM support".into(),
-            });
-            let ebpf = match ebpf {
-                Ok(ebpf) => ebpf,
-                Err(e) => {
-                    rollback_zone("ebpf-unavailable");
-                    return Err(e);
-                }
-            };
-
-            let bpf = ebpf.bpf_mut();
-            // Write the policy before membership: once a process resolves to a
-            // zone via ZONE_MEMBERSHIP, its ZONE_POLICY must already exist, or
-            // the fail-closed capable() hook would deny it in the gap.
-            if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, &config.policy) {
-                rollback_zone("bpf-policy");
-                return Err(e);
-            }
-
-            if let Err(e) = MapManager::add_zone_member(bpf, cgroup_id, zone_id, config.zone_type) {
-                let _ = MapManager::remove_zone_policy(bpf, zone_id);
-                rollback_zone("bpf-membership");
-                return Err(e);
-            }
+            let _ = self.enforcer.remove_zone_policy(zone_id);
+            rollback_zone("bpf-membership");
+            return Err(e);
         }
 
         // Step 4: Apply cgroup resource limits.
@@ -616,12 +547,8 @@ impl IsolationBackend for LinuxBackend {
             .apply_resources(&config.name, &config.policy.resources)
         {
             if let Some(zone_id) = self.get_zone_id(&zone_uuid)? {
-                let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
-                if let Some(ref mut ebpf) = *ebpf_guard {
-                    let bpf = ebpf.bpf_mut();
-                    let _ = MapManager::remove_zone_member(bpf, cgroup_id);
-                    let _ = MapManager::remove_zone_policy(bpf, zone_id);
-                }
+                let _ = self.enforcer.remove_zone_member(cgroup_id);
+                let _ = self.enforcer.remove_zone_policy(zone_id);
             }
             rollback_zone("resource-limits");
             return Err(e);
@@ -665,19 +592,14 @@ impl IsolationBackend for LinuxBackend {
             .unwrap_or_default();
 
         if let Some(zone_id) = zone_id {
-            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
-            if let Some(ref mut ebpf) = *ebpf_guard {
-                let bpf = ebpf.bpf_mut();
-
-                if !stored_inodes.is_empty() {
-                    if let Err(e) = MapManager::remove_inodes(bpf, &stored_inodes) {
-                        tracing::warn!(%e, zone = zone.name, "failed to unregister rootfs inodes");
-                    }
+            if !stored_inodes.is_empty() {
+                if let Err(e) = self.enforcer.remove_inodes(&stored_inodes) {
+                    tracing::warn!(%e, zone = zone.name, "failed to unregister rootfs inodes");
                 }
-
-                let _ = MapManager::remove_zone_member(bpf, zone.platform_id);
-                let _ = MapManager::remove_zone_policy(bpf, zone_id);
             }
+
+            let _ = self.enforcer.remove_zone_member(zone.platform_id);
+            let _ = self.enforcer.remove_zone_policy(zone_id);
         }
 
         // Release IP back to allocator.
@@ -711,17 +633,15 @@ impl IsolationBackend for LinuxBackend {
     fn enforce_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
         tracing::info!(zone = zone.name, "enforcing policy");
 
-        // Update BPF policy map.
+        // Update BPF policy map. Route through the enforcement seam's neutral
+        // `ZoneEnforcement` vocabulary so the policy that reaches the kernel is
+        // exactly what crosses the Rauha/enforcer boundary.
         if let Some(zone_id) = self.get_zone_id(&zone.id)? {
-            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
-            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
-                message: "eBPF manager not available during policy enforcement".into(),
-                hint: "restart rauhad after restoring eBPF LSM support".into(),
-            })?;
-            MapManager::set_zone_policy(ebpf.bpf_mut(), zone_id, policy)?;
+            self.enforcer
+                .apply_zone_enforcement(zone_id, &policy.to_enforcement()?)?;
 
             // Wire up ZONE_ALLOWED_COMMS BPF map for defense-in-depth.
-            self.sync_bpf_allowed_comms(ebpf.bpf_mut(), zone_id, &policy.network)?;
+            self.sync_bpf_allowed_comms(zone_id, &policy.network)?;
         }
 
         // Apply nftables forward rules for this zone.
@@ -738,15 +658,10 @@ impl IsolationBackend for LinuxBackend {
 
         // BPF HashMap insert is atomic — kernel sees old or new, never partial.
         if let Some(zone_id) = self.get_zone_id(&zone.id)? {
-            let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
-            let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
-                message: "eBPF manager not available during policy hot reload".into(),
-                hint: "restart rauhad after restoring eBPF LSM support".into(),
-            })?;
-            MapManager::hot_reload_policy(ebpf.bpf_mut(), zone_id, policy)?;
+            self.enforcer.hot_reload_policy(zone_id, policy)?;
 
             // Re-sync allowed comms on hot reload.
-            self.sync_bpf_allowed_comms(ebpf.bpf_mut(), zone_id, &policy.network)?;
+            self.sync_bpf_allowed_comms(zone_id, &policy.network)?;
         }
 
         // Re-apply nftables rules.
@@ -859,12 +774,7 @@ impl IsolationBackend for LinuxBackend {
             let inodes = maps::collect_rootfs_inodes(&rootfs_dir, rauha_ebpf_common::MAX_INODES);
 
             if !inodes.is_empty() {
-                let mut ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
-                let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
-                    message: "eBPF manager not available during rootfs inode registration".into(),
-                    hint: "restart rauhad after restoring eBPF LSM support".into(),
-                })?;
-                match MapManager::insert_inodes(ebpf.bpf_mut(), &inodes, zone_id) {
+                match self.enforcer.insert_inodes(&inodes, zone_id) {
                     Ok(inserted) => {
                         // Store only successfully inserted inodes for cleanup.
                         // This prevents removing entries that were never in the map.
@@ -1019,43 +929,31 @@ impl IsolationBackend for LinuxBackend {
         });
 
         // Check 2: eBPF programs loaded.
-        let ebpf_ok = {
-            let ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
-            if let Some(ref ebpf) = *ebpf_guard {
-                match ebpf.health_check() {
-                    Ok(statuses) => {
-                        let all_ok = statuses.iter().all(|s| s.loaded && s.attached);
-                        for status in &statuses {
-                            let passed = status.loaded && status.attached;
-                            let detail = if status.loaded && status.attached {
-                                "program loaded and attached".into()
-                            } else if status.loaded {
-                                "program loaded but detached from hook — restart rauhad to re-attach".into()
-                            } else {
-                                "program not loaded — zone boundary not enforced".into()
-                            };
-                            checks.push(IsolationCheck {
-                                name: format!("ebpf:{}", status.name),
-                                passed,
-                                detail,
-                            });
-                        }
-                        all_ok
-                    }
-                    Err(e) => {
-                        checks.push(IsolationCheck {
-                            name: "ebpf:health".into(),
-                            passed: false,
-                            detail: format!("health check failed: {e}"),
-                        });
-                        false
-                    }
+        let ebpf_ok = match self.enforcer.health_check() {
+            Ok(statuses) => {
+                let all_ok = statuses.iter().all(|s| s.loaded && s.attached);
+                for status in &statuses {
+                    let passed = status.loaded && status.attached;
+                    let detail = if status.loaded && status.attached {
+                        "program loaded and attached".into()
+                    } else if status.loaded {
+                        "program loaded but detached from hook — restart rauhad to re-attach".into()
+                    } else {
+                        "program not loaded — zone boundary not enforced".into()
+                    };
+                    checks.push(IsolationCheck {
+                        name: format!("ebpf:{}", status.name),
+                        passed,
+                        detail,
+                    });
                 }
-            } else {
+                all_ok
+            }
+            Err(e) => {
                 checks.push(IsolationCheck {
-                    name: "ebpf".into(),
+                    name: "ebpf:health".into(),
                     passed: false,
-                    detail: "eBPF not loaded — no kernel enforcement".into(),
+                    detail: format!("health check failed: {e}"),
                 });
                 false
             }
@@ -1086,29 +984,23 @@ impl IsolationBackend for LinuxBackend {
         });
 
         // Check 5: enforcement counters — detect silent enforcement failure.
-        let ebpf_guard = lock_backend(&self.ebpf, "ebpf")?;
-        if let Some(ref ebpf) = *ebpf_guard {
-            if let Ok(counters) = ebpf.read_enforcement_counters() {
-                for (name, c) in &counters {
-                    if c.error > 0 && c.deny == 0 {
-                        checks.push(IsolationCheck {
-                            name: format!("enforcement:{name}"),
-                            passed: false,
-                            detail: format!(
-                                "hook has {} errors and 0 denials — enforcement may be silently failing",
-                                c.error
-                            ),
-                        });
-                    } else if c.allow > 0 || c.deny > 0 {
-                        checks.push(IsolationCheck {
-                            name: format!("enforcement:{name}"),
-                            passed: true,
-                            detail: format!(
-                                "allow={}, deny={}, error={}",
-                                c.allow, c.deny, c.error
-                            ),
-                        });
-                    }
+        if let Ok(counters) = self.enforcer.read_enforcement_counters() {
+            for (name, c) in &counters {
+                if c.error > 0 && c.deny == 0 {
+                    checks.push(IsolationCheck {
+                        name: format!("enforcement:{name}"),
+                        passed: false,
+                        detail: format!(
+                            "hook has {} errors and 0 denials — enforcement may be silently failing",
+                            c.error
+                        ),
+                    });
+                } else if c.allow > 0 || c.deny > 0 {
+                    checks.push(IsolationCheck {
+                        name: format!("enforcement:{name}"),
+                        passed: true,
+                        detail: format!("allow={}, deny={}, error={}", c.allow, c.deny, c.error),
+                    });
                 }
             }
         }

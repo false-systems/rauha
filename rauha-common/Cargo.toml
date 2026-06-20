@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rauha-enforcer-api = { path = "../rauha-enforcer-api" }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

@@ -49,24 +49,49 @@ The Rauha repository still contains Linux eBPF code:
 That code is still useful, but architecturally it should sit behind a Syva
 enforcement boundary.
 
-## Future Seam
+## Enforcement Seam
 
-A future implementation should introduce a small kernel-enforcement interface
-behind Rauha's zone lifecycle. Conceptually:
+`rauha-enforcer-api` defines the kernel-enforcement interface behind Rauha's
+zone lifecycle. It has no eBPF dependency and does not expose Rauha policy
+types. Rauha translates user-facing policy into enforcement vocabulary before
+calling the backend.
 
 ```rust
-trait KernelEnforcer {
-    fn load(&self) -> Result<()>;
-    fn create_zone(&self, spec: ZoneKernelSpec) -> Result<()>;
-    fn delete_zone(&self, zone_id: ZoneId) -> Result<()>;
-    fn apply_policy(&self, zone_id: ZoneId, policy: KernelZonePolicy) -> Result<()>;
-    fn watch_events(&self) -> EnforcementEventStream;
-    fn stats(&self) -> Result<EnforcementStats>;
-    fn verify(&self) -> Result<KernelEnforcementReport>;
+trait EnforcerBackend {
+    async fn load(&self) -> Result<(), EnforcerError>;
+    async fn shutdown(&self) -> Result<(), EnforcerError>;
+    async fn create_zone(&self, zone: ZoneId) -> Result<(), EnforcerError>;
+    async fn delete_zone(&self, zone: ZoneId) -> Result<(), EnforcerError>;
+    async fn apply_policy(
+        &self,
+        zone: ZoneId,
+        policy: &EnforcementPolicy,
+    ) -> Result<(), EnforcerError>;
+    fn watch_events(&self) -> EventStream;
+    async fn stats(&self, zone: ZoneId) -> Result<EnforcementStats, EnforcerError>;
+    async fn verify(
+        &self,
+        zone: ZoneId,
+        policy: &EnforcementPolicy,
+    ) -> Result<VerifyReport, EnforcerError>;
+    fn capabilities(&self) -> Capabilities;
 }
 ```
 
-This is a design sketch, not a committed API.
+`verify` is a drift/parity self-check: it answers whether the backend's loaded
+state for a zone matches Rauha's intended `EnforcementPolicy`. BPF verifier or
+program-load errors belong to `load`.
+
+`EnforcementPolicy` carries a `ZoneEnforcement` record — the seam's own neutral
+policy vocabulary (`{ caps_mask, allow_ptrace, allow_host_net }`), plus a
+deliberately small list of per-hook rules. Rauha translates its user-facing
+`ZonePolicy` into `ZoneEnforcement` (`ZonePolicy::to_enforcement`, the single
+source of truth for policy meaning); the Linux adapter maps `ZoneEnforcement`
+onto the kernel `ZonePolicyKernel` flag bits (`enforcement_to_kernel`, the only
+place that knows the kernel ABI). The seam never imports Rauha or eBPF policy
+types. On Linux, `apply_policy` and the daemon's synchronous `enforce_policy`
+share one sync core (`LinuxEnforcer::apply_zone_enforcement`), so both write the
+same `ZONE_POLICY` entry without either blocking a tokio runtime.
 
 The important rules are:
 
@@ -76,7 +101,9 @@ The important rules are:
 - Rauha translates Rauha policy into Syva/kernel-facing policy.
 - Rauha exposes Syva events through Rauha APIs and sandbox results.
 - macOS does not use Syva.
-- unsupported platforms should use an explicit Noop/Unsupported enforcer.
+- unsupported platforms use an explicit noop/unsupported enforcer with honest
+  capabilities. A backend without kernel enforcement must reject LSM-required
+  rules instead of silently accepting them.
 
 Do not delete the current eBPF crates until an external Syva integration exists
 and tests prove the replacement path.

@@ -2438,6 +2438,7 @@ dependencies = [
  "chrono",
  "criterion",
  "postcard",
+ "rauha-enforcer-api",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2474,6 +2475,14 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rauha-enforcer-api"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -2566,6 +2575,7 @@ dependencies = [
  "prost 0.13.5",
  "rauha-common",
  "rauha-ebpf-common",
+ "rauha-enforcer-api",
  "rauha-evidence",
  "rauha-oci",
  "redb",
