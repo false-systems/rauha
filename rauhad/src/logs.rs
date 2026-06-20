@@ -7,7 +7,7 @@
 //! - One-shot read: return existing log content
 //! - Follow mode: poll for new lines every 200ms
 
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -126,15 +126,49 @@ fn log_path(container_id: &str, stream: &str) -> PathBuf {
         .join(format!("{stream}.log"))
 }
 
-/// Read the full stdout and stderr logs for a container.
+/// Read stdout and stderr logs for a container, capped per stream.
 ///
 /// Returns `(stdout, stderr)`. A missing log file yields an empty string —
 /// a container that produced no output is not an error. Synchronous file I/O,
 /// so callers in async contexts should wrap this in `spawn_blocking`.
-pub fn read_all(container_id: &str) -> (String, String) {
-    let stdout = std::fs::read_to_string(log_path(container_id, "stdout")).unwrap_or_default();
-    let stderr = std::fs::read_to_string(log_path(container_id, "stderr")).unwrap_or_default();
+pub fn read_all_capped(container_id: &str, max_bytes_per_stream: usize) -> (String, String) {
+    let stdout = read_text_capped(
+        &log_path(container_id, "stdout"),
+        "stdout",
+        max_bytes_per_stream,
+    );
+    let stderr = read_text_capped(
+        &log_path(container_id, "stderr"),
+        "stderr",
+        max_bytes_per_stream,
+    );
     (stdout, stderr)
+}
+
+fn read_text_capped(path: &PathBuf, stream: &str, max_bytes: usize) -> String {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return String::new(),
+    };
+
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
+    let mut limited = file.take(max_bytes.saturating_add(1) as u64);
+    if limited.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+    }
+
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str(&format!(
+            "\n[rauha: {stream} truncated after {max_bytes} bytes]\n"
+        ));
+    }
+    text
 }
 
 /// Read the last N lines from a file (or all lines if tail == 0).
@@ -161,7 +195,11 @@ fn read_tail_lines(path: &PathBuf, tail: u32) -> Vec<String> {
     // Use a ring buffer of size `tail` to keep only the last N lines.
     let cap = tail as usize;
     let mut ring = std::collections::VecDeque::with_capacity(cap);
-    for line in reader.lines().filter_map(|l| l.ok()).filter(|l| !l.is_empty()) {
+    for line in reader
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter(|l| !l.is_empty())
+    {
         if ring.len() == cap {
             ring.pop_front();
         }
@@ -217,6 +255,22 @@ mod tests {
         let path = PathBuf::from("/nonexistent/test.log");
         let lines = read_tail_lines(&path, 0);
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn read_text_capped_appends_truncation_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout.log");
+        std::fs::write(&path, b"abcdef").unwrap();
+
+        let text = read_text_capped(&path, "stdout", 3);
+        assert_eq!(text, "abc\n[rauha: stdout truncated after 3 bytes]\n");
+    }
+
+    #[test]
+    fn read_text_capped_missing_file_is_empty() {
+        let path = PathBuf::from("/nonexistent/test.log");
+        assert_eq!(read_text_capped(&path, "stderr", 3), "");
     }
 
     #[test]

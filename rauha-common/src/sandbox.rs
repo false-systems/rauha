@@ -1,10 +1,9 @@
 //! Structured results for agent sandbox execution.
 //!
-//! Rauha's sandbox command is planned as a task-level wrapper around zones:
-//! create or select a zone, run one command, collect outputs and events, then
-//! clean up according to policy. The runtime path is not implemented here yet,
-//! but this module defines the stable result shape that CLI/API surfaces can
-//! use without depending on the future Linux Syva integration.
+//! Rauha's sandbox command is a task-level wrapper around zones: create or
+//! select a zone, run one command, collect outputs and events, then clean up
+//! according to policy. This module defines the stable result shape that
+//! CLI/API surfaces use without depending on Linux-specific enforcement.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -72,8 +71,8 @@ pub struct SandboxEventSummary {
 /// Kernel enforcement event summary attached to a sandbox result.
 ///
 /// This intentionally does not expose raw BPF map/ring-buffer structures.
-/// Rauha owns the user-facing runtime result; Syva can later populate these
-/// summaries from Linux kernel enforcement events.
+/// Enforcement capture is best-effort: backend absence or broadcast lag can
+/// yield an empty or partial list, so this field is not an audit-complete log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementEventSummary {
     pub timestamp: Option<DateTime<Utc>>,

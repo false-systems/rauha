@@ -1103,15 +1103,15 @@ impl ImageService for ImageServiceImpl {
 
 // --- Sandbox Service ---
 //
-// Task-level sandbox execution. The runtime path (allocate zone, start
-// container, wait, capture stdout/stderr/exit, collect events, clean up)
-// is not implemented yet — this impl exists to land the public contract.
-// The next PR replaces the Unimplemented body with a real implementation
-// built on top of existing zone/container primitives.
+// Task-level sandbox execution. This implementation builds on the existing
+// zone/container primitives: allocate or resolve a zone, start one container,
+// wait, capture output/events, and clean up according to request policy.
 
 use rauha_common::sandbox::{
     EnforcementEventSummary, SandboxEventSummary, SandboxExecResult, SandboxStatus,
 };
+
+const SANDBOX_LOG_MAX_BYTES_PER_STREAM: usize = 1024 * 1024;
 
 pub struct SandboxServiceImpl {
     registry: Arc<ZoneRegistry>,
@@ -1120,6 +1120,86 @@ pub struct SandboxServiceImpl {
     /// (macOS VMs, or Linux with eBPF not loaded), in which case sandbox
     /// results carry no enforcement events.
     event_tx: Option<tokio::sync::broadcast::Sender<FalseEvent>>,
+}
+
+struct ContainerCleanupGuard {
+    registry: Arc<ZoneRegistry>,
+    container_id: uuid::Uuid,
+    armed: bool,
+}
+
+impl ContainerCleanupGuard {
+    fn new(registry: Arc<ZoneRegistry>, container_id: uuid::Uuid) -> Self {
+        Self {
+            registry,
+            container_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainerCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let registry = self.registry.clone();
+        let container_id = self.container_id;
+        tokio::spawn(async move {
+            if let Err(e) = registry.delete_container(&container_id, true).await {
+                tracing::warn!(
+                    container = %container_id,
+                    %e,
+                    "failed to delete sandbox container during cancellation cleanup"
+                );
+            }
+        });
+    }
+}
+
+struct ZoneCleanupGuard {
+    registry: Arc<ZoneRegistry>,
+    zone_name: String,
+    armed: bool,
+}
+
+impl ZoneCleanupGuard {
+    fn new(registry: Arc<ZoneRegistry>, zone_name: String) -> Self {
+        Self {
+            registry,
+            zone_name,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ZoneCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let registry = self.registry.clone();
+        let zone_name = self.zone_name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = registry.delete_zone(&zone_name, true).await {
+                tracing::warn!(
+                    zone = zone_name,
+                    %e,
+                    "failed to delete temporary sandbox zone during cancellation cleanup"
+                );
+            }
+        });
+    }
 }
 
 impl SandboxServiceImpl {
@@ -1163,9 +1243,11 @@ impl SandboxServiceImpl {
                     req.image
                 )
             })?;
+        let mut cleanup = ContainerCleanupGuard::new(self.registry.clone(), container.id);
 
         // Everything past container creation must still clean up the container,
-        // so capture the outcome and delete unconditionally afterwards.
+        // so capture the outcome and delete unconditionally afterwards. The
+        // guard covers client cancellation while this future is still running.
         let outcome = self
             .run_started_container(task_id, zone_name, zone_id, &container.id, req)
             .await;
@@ -1173,6 +1255,7 @@ impl SandboxServiceImpl {
         if let Err(e) = self.registry.delete_container(&container.id, true).await {
             tracing::warn!(container = %container.id, %e, "failed to delete sandbox container");
         }
+        cleanup.disarm();
 
         outcome
     }
@@ -1212,11 +1295,14 @@ impl SandboxServiceImpl {
         let finished_at = chrono::Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as u64;
 
-        // Capture stdout/stderr from the shim-written log files (blocking I/O).
+        // Capture stdout/stderr from the shim-written log files (blocking I/O),
+        // bounded so a chatty task cannot exceed tonic's default message size.
         let cid = container_id.to_string();
-        let (stdout, stderr) = tokio::task::spawn_blocking(move || crate::logs::read_all(&cid))
-            .await
-            .unwrap_or_default();
+        let (stdout, stderr) = tokio::task::spawn_blocking(move || {
+            crate::logs::read_all_capped(&cid, SANDBOX_LOG_MAX_BYTES_PER_STREAM)
+        })
+        .await
+        .unwrap_or_default();
 
         let status = if timed_out {
             SandboxStatus::TimedOut
@@ -1480,6 +1566,8 @@ impl SandboxService for SandboxServiceImpl {
             let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
             (zone.name, zone.id.to_string(), false)
         };
+        let mut zone_cleanup = (temp_zone && !req.keep_zone)
+            .then(|| ZoneCleanupGuard::new(self.registry.clone(), zone_name.clone()));
 
         let outcome = self.execute_task(&task_id, &zone_name, &zone_id, &req).await;
 
@@ -1487,6 +1575,9 @@ impl SandboxService for SandboxServiceImpl {
         if temp_zone && !req.keep_zone {
             if let Err(e) = self.registry.delete_zone(&zone_name, true).await {
                 tracing::warn!(zone = zone_name, %e, "failed to delete temporary sandbox zone");
+            }
+            if let Some(cleanup) = &mut zone_cleanup {
+                cleanup.disarm();
             }
         }
 

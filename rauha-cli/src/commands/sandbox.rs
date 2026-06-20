@@ -1,11 +1,10 @@
 //! `rauha sandbox` — task-level sandbox execution.
 //!
 //! Public contract for running one agent task inside a Rauha zone and getting
-//! back a structured result. The daemon currently returns Unimplemented for
-//! RunSandbox; this command exists to land the wire-protocol contract so the
-//! runtime path can fill it in without changing the user-facing surface.
+//! back a structured result.
 
 use clap::Args;
+use std::io::Write;
 
 pub mod pb {
     pub mod sandbox {
@@ -46,7 +45,7 @@ pub struct SandboxArgs {
     /// Leave the task zone behind for debugging after the run.
     #[arg(long)]
     pub keep_zone: bool,
-    /// Soft timeout in seconds. 0 means no timeout.
+    /// Soft timeout in seconds. 0 waits indefinitely.
     #[arg(long, default_value = "0")]
     pub timeout: u32,
     /// Extra environment variable for the task, in KEY=VALUE form.
@@ -150,6 +149,8 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
     });
 
     if exit_code != 0 {
+        std::io::stdout().flush().ok();
+        std::io::stderr().flush().ok();
         std::process::exit(exit_code);
     }
     Ok(())

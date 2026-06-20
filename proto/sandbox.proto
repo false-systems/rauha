@@ -6,8 +6,7 @@ package rauha.sandbox.v1;
 //
 // Rauha's primary product shape is an agent sandbox runtime: each task runs in
 // its own zone, with stdout/stderr/exit-code captured into a single result.
-// This proto defines the public contract; the runtime implementation lands in
-// a later PR. The daemon currently returns Unimplemented for RunSandbox.
+// This proto defines the public contract and daemon runtime result shape.
 service SandboxService {
     rpc RunSandbox(RunSandboxRequest) returns (SandboxResult);
 }
@@ -25,7 +24,7 @@ message RunSandboxRequest {
     string workdir = 5;
     // If true, leave the task zone behind for debugging after the run.
     bool keep_zone = 6;
-    // Soft timeout in seconds. 0 means no timeout.
+    // Soft timeout in seconds. 0 means wait indefinitely.
     uint32 timeout_seconds = 7;
     // Extra environment variables.
     map<string, string> env = 8;
@@ -53,7 +52,9 @@ message SandboxResult {
     string finished_at = 10;
     // User-facing event summaries collected during the task.
     repeated SandboxEventSummary events = 11;
-    // Kernel enforcement events (Syvä-backed on Linux when wired up).
+    // Kernel enforcement events (Syvä-backed on Linux when available).
+    // Best-effort: daemon-wide broadcast lag or missing backend support can
+    // make this empty even when the task ran.
     repeated EnforcementEventSummary enforcement_events = 12;
 }
 

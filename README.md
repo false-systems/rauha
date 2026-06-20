@@ -113,21 +113,12 @@ returning one structured result:
 }
 ```
 
-**Status — contract landed, runtime planned.** The `rauha sandbox` CLI command,
-the `rauha.sandbox.v1.SandboxService` gRPC service (`proto/sandbox.proto`), and
-the result types in `rauha-common` are wired end to end through the daemon and
-CLI. The daemon currently returns `Unimplemented` for `RunSandbox`:
-
-```text
-Error: sandbox execution is not implemented yet; use zone/run/exec commands or see docs/sandbox-runtime.md
-```
-
-The runtime path — allocate a task zone, start the container, wait, capture
-stdout/stderr/exit code, collect enforcement events, clean up (or keep the zone
-with `--keep-zone`) — is the next step. When it lands, the JSON above is
-populated from real execution with no change to the user-facing contract. Today,
-`rauha run` is the working asynchronous container path: it starts a container in
-a zone and returns the container ID.
+**Status — runtime implemented.** The `rauha sandbox` CLI command, the
+`rauha.sandbox.v1.SandboxService` gRPC service (`proto/sandbox.proto`), and the
+result types in `rauha-common` are wired end to end through the daemon and CLI.
+The daemon allocates a task zone when needed, starts the container, waits,
+captures stdout/stderr/exit code, collects lifecycle and best-effort enforcement
+events, and cleans up temporary resources unless `--keep-zone` is set.
 
 ## Architecture
 
@@ -195,6 +186,7 @@ flowchart TB
 | `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux/macOS backends |
 | `rauha-cli` (`rauha`) | Operator CLI over the daemon's gRPC API |
 | `rauha-common` | Shared types, the `IsolationBackend` trait, policy parsing, sandbox result types, shim IPC protocol |
+| `rauha-enforcer-api` | Enforcement backend trait, kernel-facing policy/event types, capabilities, `NoopEnforcer`, and conformance harness |
 | `rauha-shim` | Per-*zone* sync process (Linux) — forks and runs container processes |
 | `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
@@ -312,8 +304,9 @@ legacy seed and is not extended. See
 
 ## Limitations (honest)
 
-- **`rauha sandbox` is a contract, not yet a runtime** — the daemon returns
-  `Unimplemented` for `RunSandbox` today. Use `zone` / `run` / `exec` meanwhile.
+- **Sandbox event capture is best-effort** — Linux enforcement events come from
+  a daemon-wide broadcast and can be absent on unsupported backends or partial
+  under broadcast lag; they are not an audit-complete log.
 - **A sandbox, not a hardware boundary** — BPF-LSM is OS-level isolation and is
   additive-only: it can deny, but cannot override SELinux/AppArmor MAC denials.
   Covert channels through shared kernel resources are out of scope.
@@ -365,10 +358,10 @@ bash tests/integration/test-cgroup-lock.sh     # eBPF enforcement required
 
 ## Roadmap
 
-- Synchronous `rauha sandbox` runtime: task-zone allocation, execution, result
-  emission, and `--keep-zone` / cleanup behavior.
-- An explicit Syvä enforcer boundary, then external Syvä integration; move or
-  wrap the in-repo eBPF code behind it.
+- Move the in-repo Linux eBPF/maps/events path behind `rauha-enforcer-api`
+  without behavior changes.
+- Add external Syvä integration as another `rauha-enforcer-api` backend and
+  prove parity with the conformance harness.
 - A privileged Syvä/Rauha kernel-enforcement test suite.
 - Kubernetes installation docs and `RuntimeClass` examples; deeper workload
   discovery for existing clusters.
