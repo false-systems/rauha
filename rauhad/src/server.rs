@@ -4,10 +4,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use rauha_common::error::RauhaError;
+use rauha_evidence::{FalseEvent, FieldValue};
 #[cfg(target_os = "linux")]
-use rauha_evidence::{
-    event_name, FalseEventBuilder, FieldValue, ResourceAttrs, Severity, BACKEND_LINUX_EBPF,
-};
+use rauha_evidence::{event_name, FalseEventBuilder, ResourceAttrs, Severity, BACKEND_LINUX_EBPF};
 
 use crate::zone::registry::ZoneRegistry;
 
@@ -512,13 +511,18 @@ impl ContainerService for ContainerServiceImpl {
             .registry
             .get_container(&container_id)
             .map_err(to_status)?;
+        let zone_name = self
+            .registry
+            .zone_name_for_container(&container.zone_id)
+            .await
+            .ok_or_else(|| Status::internal("zone not found for container"))?;
 
         Ok(Response::new(pb::container::GetContainerResponse {
             container: Some(pb::container::ContainerInfo {
                 id: container.id.to_string(),
                 name: container.name,
                 zone_id: container.zone_id.to_string(),
-                zone_name: String::new(), // TODO: reverse lookup
+                zone_name,
                 image: container.image,
                 state: format!("{:?}", container.state),
                 pid: container.pid.unwrap_or(0),
@@ -547,20 +551,25 @@ impl ContainerService for ContainerServiceImpl {
             .list_containers(zone_filter)
             .map_err(to_status)?;
 
-        let infos = containers
-            .into_iter()
-            .map(|c| pb::container::ContainerInfo {
+        let mut infos = Vec::with_capacity(containers.len());
+        for c in containers {
+            let zone_name = self
+                .registry
+                .zone_name_for_container(&c.zone_id)
+                .await
+                .ok_or_else(|| Status::internal("zone not found for container"))?;
+            infos.push(pb::container::ContainerInfo {
                 id: c.id.to_string(),
                 name: c.name,
                 zone_id: c.zone_id.to_string(),
-                zone_name: String::new(), // TODO: reverse lookup
+                zone_name,
                 image: c.image,
                 state: format!("{:?}", c.state),
                 pid: c.pid.unwrap_or(0),
                 created_at: c.created_at.to_rfc3339(),
                 started_at: c.started_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
-            })
-            .collect();
+            });
+        }
 
         Ok(Response::new(pb::container::ListContainersResponse {
             containers: infos,
@@ -680,6 +689,7 @@ impl ContainerService for ContainerServiceImpl {
         // The transport differs by platform but the relay logic is identical.
         match response {
             rauha_common::shim::ShimResponse::ExecReady {
+                session_id,
                 socket_path: Some(path),
                 ..
             } => {
@@ -687,9 +697,21 @@ impl ContainerService for ContainerServiceImpl {
                     Status::internal(format!("failed to connect to exec socket: {e}"))
                 })?;
                 let (r, w) = stream.into_split();
-                spawn_exec_relay(r, w, tx, in_stream);
+                spawn_exec_relay(
+                    r,
+                    w,
+                    tx,
+                    in_stream,
+                    Some(PtyResizeTarget {
+                        registry: self.registry.clone(),
+                        zone_name: zone_name.clone(),
+                        container_id: container_id.to_string(),
+                        session_id,
+                    }),
+                );
             }
             rauha_common::shim::ShimResponse::ExecReady {
+                session_id,
                 vsock_port: Some(port),
                 ..
             } => {
@@ -701,17 +723,42 @@ impl ContainerService for ContainerServiceImpl {
                         Status::internal(format!("failed to connect exec vsock: {e}"))
                     })?;
                 let (r, w) = tokio::io::split(stream);
-                spawn_exec_relay(r, w, tx, in_stream);
+                spawn_exec_relay(
+                    r,
+                    w,
+                    tx,
+                    in_stream,
+                    Some(PtyResizeTarget {
+                        registry: self.registry.clone(),
+                        zone_name: zone_name.clone(),
+                        container_id: container_id.to_string(),
+                        session_id,
+                    }),
+                );
             }
             // Legacy: accept AttachReady for backward compat with older shims.
-            rauha_common::shim::ShimResponse::AttachReady { socket_path } => {
+            rauha_common::shim::ShimResponse::AttachReady {
+                socket_path,
+                session_id,
+            } => {
                 let stream = tokio::net::UnixStream::connect(&socket_path)
                     .await
                     .map_err(|e| {
                         Status::internal(format!("failed to connect to attach socket: {e}"))
                     })?;
                 let (r, w) = stream.into_split();
-                spawn_exec_relay(r, w, tx, in_stream);
+                spawn_exec_relay(
+                    r,
+                    w,
+                    tx,
+                    in_stream,
+                    Some(PtyResizeTarget {
+                        registry: self.registry.clone(),
+                        zone_name: zone_name.clone(),
+                        container_id: container_id.to_string(),
+                        session_id,
+                    }),
+                );
             }
             rauha_common::shim::ShimResponse::Error { message } => {
                 return Err(Status::internal(format!("exec failed: {message}")));
@@ -769,7 +816,10 @@ impl ContainerService for ContainerServiceImpl {
             .map_err(|e| Status::internal(format!("shim attach failed: {e}")))?;
 
         match response {
-            rauha_common::shim::ShimResponse::AttachReady { socket_path } => {
+            rauha_common::shim::ShimResponse::AttachReady {
+                socket_path,
+                session_id,
+            } => {
                 let stream = tokio::net::UnixStream::connect(&socket_path)
                     .await
                     .map_err(|e| {
@@ -778,6 +828,12 @@ impl ContainerService for ContainerServiceImpl {
 
                 let (read_half, write_half) = stream.into_split();
                 let (tx, rx) = mpsc::channel(256);
+                let resize_target = PtyResizeTarget {
+                    registry: self.registry.clone(),
+                    zone_name,
+                    container_id: container_id.to_string(),
+                    session_id,
+                };
 
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
@@ -813,8 +869,8 @@ impl ContainerService for ContainerServiceImpl {
                                     break;
                                 }
                             }
-                            Some(pb::container::attach_request::Message::Resize(_resize)) => {
-                                // TODO: send TIOCSWINSZ to PTY via shim
+                            Some(pb::container::attach_request::Message::Resize(resize)) => {
+                                resize_target.resize(resize.rows, resize.cols).await;
                             }
                             _ => {}
                         }
@@ -840,6 +896,7 @@ fn spawn_exec_relay<R, W>(
     writer: W,
     tx: mpsc::Sender<Result<pb::container::ExecStreamResponse, Status>>,
     in_stream: Streaming<pb::container::ExecStreamRequest>,
+    resize_target: Option<PtyResizeTarget>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -883,13 +940,62 @@ fn spawn_exec_relay<R, W>(
                         break;
                     }
                 }
-                Some(pb::container::exec_stream_request::Message::Resize(_resize)) => {
-                    // TODO: send TIOCSWINSZ to PTY via shim
+                Some(pb::container::exec_stream_request::Message::Resize(resize)) => {
+                    if let Some(target) = &resize_target {
+                        target.resize(resize.rows, resize.cols).await;
+                    }
                 }
                 _ => {}
             }
         }
     });
+}
+
+#[derive(Clone)]
+struct PtyResizeTarget {
+    registry: Arc<ZoneRegistry>,
+    zone_name: String,
+    container_id: String,
+    session_id: Option<String>,
+}
+
+impl PtyResizeTarget {
+    async fn resize(&self, rows: u32, cols: u32) {
+        let request = rauha_common::shim::ShimRequest::ResizePty {
+            id: self.container_id.clone(),
+            session_id: self.session_id.clone(),
+            rows,
+            cols,
+        };
+
+        match self.registry.shim_request(&self.zone_name, &request).await {
+            Ok(rauha_common::shim::ShimResponse::Ok) => {}
+            Ok(rauha_common::shim::ShimResponse::Error { message }) => {
+                tracing::warn!(
+                    zone = %self.zone_name,
+                    container = %self.container_id,
+                    error = %message,
+                    "PTY resize failed"
+                );
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    zone = %self.zone_name,
+                    container = %self.container_id,
+                    response = ?other,
+                    "unexpected PTY resize response"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    zone = %self.zone_name,
+                    container = %self.container_id,
+                    error = %e,
+                    "PTY resize request failed"
+                );
+            }
+        }
+    }
 }
 
 // --- Image Service ---
@@ -997,23 +1103,436 @@ impl ImageService for ImageServiceImpl {
 
 // --- Sandbox Service ---
 //
-// Task-level sandbox execution. The runtime path (allocate zone, start
-// container, wait, capture stdout/stderr/exit, collect events, clean up)
-// is not implemented yet — this impl exists to land the public contract.
-// The next PR replaces the Unimplemented body with a real implementation
-// built on top of existing zone/container primitives.
+// Task-level sandbox execution. This implementation builds on the existing
+// zone/container primitives: allocate or resolve a zone, start one container,
+// wait, capture output/events, and clean up according to request policy.
 
-pub struct SandboxServiceImpl;
+use rauha_common::sandbox::{
+    EnforcementEventSummary, SandboxEventSummary, SandboxExecResult, SandboxStatus,
+};
 
-impl SandboxServiceImpl {
-    pub fn new() -> Self {
-        Self
+const SANDBOX_LOG_MAX_BYTES_PER_STREAM: usize = 1024 * 1024;
+
+pub struct SandboxServiceImpl {
+    registry: Arc<ZoneRegistry>,
+    /// Broadcast of normalized kernel enforcement events, shared with the
+    /// `WatchEvents` stream. `None` on backends without kernel enforcement
+    /// (macOS VMs, or Linux with eBPF not loaded), in which case sandbox
+    /// results carry no enforcement events.
+    event_tx: Option<tokio::sync::broadcast::Sender<FalseEvent>>,
+}
+
+struct ContainerCleanupGuard {
+    registry: Arc<ZoneRegistry>,
+    container_id: uuid::Uuid,
+    armed: bool,
+}
+
+impl ContainerCleanupGuard {
+    fn new(registry: Arc<ZoneRegistry>, container_id: uuid::Uuid) -> Self {
+        Self {
+            registry,
+            container_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
-impl Default for SandboxServiceImpl {
-    fn default() -> Self {
-        Self::new()
+impl Drop for ContainerCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let registry = self.registry.clone();
+        let container_id = self.container_id;
+        tokio::spawn(async move {
+            if let Err(e) = registry.delete_container(&container_id, true).await {
+                tracing::warn!(
+                    container = %container_id,
+                    %e,
+                    "failed to delete sandbox container during cancellation cleanup"
+                );
+            }
+        });
+    }
+}
+
+struct ZoneCleanupGuard {
+    registry: Arc<ZoneRegistry>,
+    zone_name: String,
+    armed: bool,
+}
+
+impl ZoneCleanupGuard {
+    fn new(registry: Arc<ZoneRegistry>, zone_name: String) -> Self {
+        Self {
+            registry,
+            zone_name,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ZoneCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let registry = self.registry.clone();
+        let zone_name = self.zone_name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = registry.delete_zone(&zone_name, true).await {
+                tracing::warn!(
+                    zone = zone_name,
+                    %e,
+                    "failed to delete temporary sandbox zone during cancellation cleanup"
+                );
+            }
+        });
+    }
+}
+
+impl SandboxServiceImpl {
+    pub fn new(
+        registry: Arc<ZoneRegistry>,
+        event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
+    ) -> Self {
+        Self { registry, event_tx }
+    }
+
+    /// Run one task to completion inside an already-resolved zone.
+    ///
+    /// Returns `Err(message)` for any failure that prevents producing a normal
+    /// result (e.g. the image isn't pulled or the container won't start); the
+    /// caller turns that into a `RuntimeError` result. The container is always
+    /// deleted before returning, success or failure.
+    async fn execute_task(
+        &self,
+        task_id: &str,
+        zone_name: &str,
+        zone_id: &str,
+        req: &pb::sandbox::RunSandboxRequest,
+    ) -> std::result::Result<SandboxExecResult, String> {
+        let spec = rauha_common::container::ContainerSpec {
+            name: format!("{task_id}-task"),
+            image: req.image.clone(),
+            command: req.command.clone(),
+            env: req.env.clone().into_iter().collect(),
+            working_dir: (!req.workdir.is_empty()).then(|| req.workdir.clone()),
+            rootfs_path: None,
+            overlay_layers: None,
+        };
+
+        let container = self
+            .registry
+            .create_container(zone_name, spec)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to create container (is the image pulled? `rauha image pull {}`): {e}",
+                    req.image
+                )
+            })?;
+        let mut cleanup = ContainerCleanupGuard::new(self.registry.clone(), container.id);
+
+        // Everything past container creation must still clean up the container,
+        // so capture the outcome and delete unconditionally afterwards. The
+        // guard covers client cancellation while this future is still running.
+        let outcome = self
+            .run_started_container(task_id, zone_name, zone_id, &container.id, req)
+            .await;
+
+        if let Err(e) = self.registry.delete_container(&container.id, true).await {
+            tracing::warn!(container = %container.id, %e, "failed to delete sandbox container");
+        }
+        cleanup.disarm();
+
+        outcome
+    }
+
+    async fn run_started_container(
+        &self,
+        task_id: &str,
+        zone_name: &str,
+        zone_id: &str,
+        container_id: &uuid::Uuid,
+        req: &pb::sandbox::RunSandboxRequest,
+    ) -> std::result::Result<SandboxExecResult, String> {
+        let mut events = vec![event("container.created", "sandbox container created")];
+
+        // Begin capturing kernel enforcement events for this task's zone before
+        // the workload starts, so nothing between start and exit is missed.
+        let capture = self.begin_enforcement_capture(zone_name).await;
+
+        let started_at = chrono::Utc::now();
+        self.registry
+            .start_container(container_id)
+            .await
+            .map_err(|e| format!("failed to start container: {e}"))?;
+        events.push(event("container.started", "sandbox container started"));
+
+        let timeout = (req.timeout_seconds > 0)
+            .then(|| std::time::Duration::from_secs(req.timeout_seconds as u64));
+        let (exit_code, timed_out) = self.wait_for_exit(container_id, timeout).await;
+
+        if timed_out {
+            let _ = self.registry.stop_container(container_id, 5).await;
+            events.push(event("container.timed_out", "sandbox task exceeded timeout"));
+        } else {
+            events.push(event("container.exited", "sandbox container exited"));
+        }
+
+        let finished_at = chrono::Utc::now();
+        let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as u64;
+
+        // Capture stdout/stderr from the shim-written log files (blocking I/O),
+        // bounded so a chatty task cannot exceed tonic's default message size.
+        let cid = container_id.to_string();
+        let (stdout, stderr) = tokio::task::spawn_blocking(move || {
+            crate::logs::read_all_capped(&cid, SANDBOX_LOG_MAX_BYTES_PER_STREAM)
+        })
+        .await
+        .unwrap_or_default();
+
+        let status = if timed_out {
+            SandboxStatus::TimedOut
+        } else if exit_code == Some(0) {
+            SandboxStatus::Succeeded
+        } else {
+            SandboxStatus::Failed
+        };
+
+        Ok(SandboxExecResult {
+            task_id: task_id.to_string(),
+            zone_id: zone_id.to_string(),
+            command: req.command.clone(),
+            status,
+            exit_code,
+            stdout,
+            stderr,
+            duration_ms,
+            started_at: Some(started_at),
+            finished_at: Some(finished_at),
+            events,
+            // Drain the events that landed on this task's zone while it ran.
+            enforcement_events: drain_enforcement_capture(capture),
+        })
+    }
+
+    /// Poll the container until it exits, returning `(exit_code, timed_out)`.
+    ///
+    /// This is the task-completion policy — poll interval, the no-timeout case,
+    /// and how a deadline maps to `timed_out`. Transient state-read errors are
+    /// tolerated (the shim may be mid-exit); only the deadline ends the wait.
+    async fn wait_for_exit(
+        &self,
+        container_id: &uuid::Uuid,
+        timeout: Option<std::time::Duration>,
+    ) -> (Option<i32>, bool) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+
+        loop {
+            match self.registry.get_container_state(container_id).await {
+                Ok((status, exit_code)) if status == "stopped" => return (exit_code, false),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(container = %container_id, %e, "transient state read while waiting");
+                }
+            }
+
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    return (None, true);
+                }
+            }
+
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// Subscribe to kernel enforcement events for `zone_name`, resolving the
+    /// compact zone id needed to scope a daemon-wide broadcast down to this
+    /// task. Called before the workload starts so no early event is missed.
+    /// Yields `None` when there is no enforcement backend to capture from
+    /// (macOS VMs, or Linux with eBPF not loaded) — the result then carries
+    /// no enforcement events.
+    async fn begin_enforcement_capture(&self, zone_name: &str) -> Option<EnforcementCapture> {
+        let tx = self.event_tx.as_ref()?;
+        Some(EnforcementCapture {
+            rx: tx.subscribe(),
+            kernel_zone_id: self.registry.kernel_zone_id(zone_name).await,
+        })
+    }
+}
+
+/// A user-facing lifecycle event stamped with the current time.
+fn event(kind: &str, message: &str) -> SandboxEventSummary {
+    SandboxEventSummary {
+        timestamp: Some(chrono::Utc::now()),
+        kind: kind.to_string(),
+        message: message.to_string(),
+    }
+}
+
+/// A live subscription to the enforcement-event broadcast, scoped to one zone.
+///
+/// The broadcast is daemon-wide (every zone's activity flows through it), so
+/// `kernel_zone_id` is what lets us keep only this task's events when draining.
+struct EnforcementCapture {
+    rx: tokio::sync::broadcast::Receiver<FalseEvent>,
+    kernel_zone_id: Option<u32>,
+}
+
+/// Drain everything buffered on the subscription since the task started and
+/// project the events belonging to this task's zone into result summaries.
+///
+/// Non-blocking: it takes what is already queued, not future events. A `Lagged`
+/// error means the broadcast outran our buffer; we keep draining what remains
+/// rather than aborting (some events are better than none, and the drop is
+/// already surfaced as a `pipeline.shed` event on the `WatchEvents` stream).
+fn drain_enforcement_capture(capture: Option<EnforcementCapture>) -> Vec<EnforcementEventSummary> {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let Some(mut capture) = capture else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    loop {
+        match capture.rx.try_recv() {
+            Ok(event) if enforcement_event_matches(&event, capture.kernel_zone_id) => {
+                out.push(project_enforcement_event(&event));
+            }
+            Ok(_) => {}
+            Err(TryRecvError::Lagged(_)) => continue,
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+        }
+    }
+    out
+}
+
+/// Decide whether a broadcast enforcement event belongs to this task.
+///
+/// This is the correlation policy. Events ride a single daemon-wide broadcast,
+/// so we scope by the compact zone id the eBPF backend stamps on each event as
+/// `caller_zone`. Without a resolved kernel id we attribute nothing — reporting
+/// no events is safer than mis-attributing another zone's enforcement activity
+/// to this task's result.
+fn enforcement_event_matches(event: &FalseEvent, kernel_zone_id: Option<u32>) -> bool {
+    let Some(zid) = kernel_zone_id else {
+        return false;
+    };
+    matches!(
+        event.fields.get("caller_zone"),
+        Some(FieldValue::U64(z)) if *z == zid as u64
+    )
+}
+
+/// Project a normalized evidence event into the sandbox result summary shape.
+///
+/// This is the user-facing boundary: raw BPF map/ring-buffer structures never
+/// reach the caller — only the stable, named fields the evidence schema already
+/// normalized are surfaced.
+fn project_enforcement_event(event: &FalseEvent) -> EnforcementEventSummary {
+    let string_field = |key: &str| match event.fields.get(key) {
+        Some(FieldValue::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let u64_field = |key: &str| match event.fields.get(key) {
+        Some(FieldValue::U64(v)) => Some(*v),
+        _ => None,
+    };
+
+    EnforcementEventSummary {
+        timestamp: chrono::DateTime::parse_from_rfc3339(&event.ts)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc)),
+        hook: string_field("hook").unwrap_or_default(),
+        // The evidence event name (e.g. `zone.file.denied`) is the action taken.
+        action: event.event.clone(),
+        decision: string_field("decision").unwrap_or_default(),
+        message: if event.what_failed.is_empty() {
+            event.event.clone()
+        } else {
+            event.what_failed.clone()
+        },
+        pid: u64_field("pid").map(|p| p as u32),
+        source_zone: Some(event.zone.id.clone()),
+        target_zone: u64_field("target_zone")
+            .filter(|z| *z != 0)
+            .map(|z| format!("zone-{z}")),
+        object: event.resource.clone(),
+    }
+}
+
+/// Validate the request before touching any zone/container state.
+fn validate_sandbox_request(req: &pb::sandbox::RunSandboxRequest) -> Result<(), Status> {
+    if req.image.trim().is_empty() {
+        return Err(Status::invalid_argument("image is required"));
+    }
+    if req.command.is_empty() {
+        return Err(Status::invalid_argument("command must not be empty"));
+    }
+    Ok(())
+}
+
+fn sandbox_status_str(status: SandboxStatus) -> String {
+    match status {
+        SandboxStatus::Succeeded => "succeeded",
+        SandboxStatus::Failed => "failed",
+        SandboxStatus::TimedOut => "timed_out",
+        SandboxStatus::RuntimeError => "runtime_error",
+    }
+    .to_string()
+}
+
+fn to_proto_result(exec: SandboxExecResult) -> pb::sandbox::SandboxResult {
+    pb::sandbox::SandboxResult {
+        task_id: exec.task_id,
+        zone_id: exec.zone_id,
+        command: exec.command,
+        status: sandbox_status_str(exec.status),
+        exit_code: exec.exit_code,
+        stdout: exec.stdout,
+        stderr: exec.stderr,
+        duration_ms: exec.duration_ms,
+        started_at: exec.started_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+        finished_at: exec.finished_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+        events: exec
+            .events
+            .into_iter()
+            .map(|e| pb::sandbox::SandboxEventSummary {
+                timestamp: e.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                kind: e.kind,
+                message: e.message,
+            })
+            .collect(),
+        enforcement_events: exec
+            .enforcement_events
+            .into_iter()
+            .map(|e| pb::sandbox::EnforcementEventSummary {
+                timestamp: e.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                hook: e.hook,
+                action: e.action,
+                decision: e.decision,
+                message: e.message,
+                pid: e.pid,
+                source_zone: e.source_zone.unwrap_or_default(),
+                target_zone: e.target_zone.unwrap_or_default(),
+                object: e.object.unwrap_or_default(),
+            })
+            .collect(),
     }
 }
 
@@ -1021,11 +1540,52 @@ impl Default for SandboxServiceImpl {
 impl SandboxService for SandboxServiceImpl {
     async fn run_sandbox(
         &self,
-        _request: Request<pb::sandbox::RunSandboxRequest>,
+        request: Request<pb::sandbox::RunSandboxRequest>,
     ) -> Result<Response<pb::sandbox::SandboxResult>, Status> {
-        Err(Status::unimplemented(
-            "sandbox execution is not implemented yet; use zone/run/exec commands or see docs/sandbox-runtime.md",
-        ))
+        let req = request.into_inner();
+        validate_sandbox_request(&req)?;
+
+        let task_id = format!("task-{}", uuid::Uuid::new_v4());
+
+        // Resolve the zone. An empty name allocates a temporary zone that we own
+        // and (by default) delete afterwards; a named zone must already exist
+        // and is left intact.
+        let (zone_name, zone_id, temp_zone) = if req.name.trim().is_empty() {
+            let name = format!("sandbox-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+            let zone = self
+                .registry
+                .create_zone(
+                    &name,
+                    rauha_common::zone::ZoneType::NonGlobal,
+                    rauha_common::zone::ZonePolicy::default(),
+                )
+                .await
+                .map_err(to_status)?;
+            (zone.name, zone.id.to_string(), true)
+        } else {
+            let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
+            (zone.name, zone.id.to_string(), false)
+        };
+        let mut zone_cleanup = (temp_zone && !req.keep_zone)
+            .then(|| ZoneCleanupGuard::new(self.registry.clone(), zone_name.clone()));
+
+        let outcome = self.execute_task(&task_id, &zone_name, &zone_id, &req).await;
+
+        // Tear down the temporary zone unless the caller asked to keep it.
+        if temp_zone && !req.keep_zone {
+            if let Err(e) = self.registry.delete_zone(&zone_name, true).await {
+                tracing::warn!(zone = zone_name, %e, "failed to delete temporary sandbox zone");
+            }
+            if let Some(cleanup) = &mut zone_cleanup {
+                cleanup.disarm();
+            }
+        }
+
+        let exec = outcome.unwrap_or_else(|message| {
+            SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
+        });
+
+        Ok(Response::new(to_proto_result(exec)))
     }
 }
 
@@ -1034,20 +1594,127 @@ mod tests {
     use super::*;
     use tonic::Code;
 
-    #[tokio::test]
-    async fn sandbox_service_returns_unimplemented_contract() {
-        let service = SandboxServiceImpl::new();
-        let request = Request::new(pb::sandbox::RunSandboxRequest::default());
+    fn req(image: &str, command: Vec<&str>) -> pb::sandbox::RunSandboxRequest {
+        pb::sandbox::RunSandboxRequest {
+            image: image.to_string(),
+            command: command.into_iter().map(String::from).collect(),
+            ..Default::default()
+        }
+    }
 
-        let status = service
-            .run_sandbox(request)
-            .await
-            .expect_err("sandbox runtime should not be implemented in this PR");
+    #[test]
+    fn empty_image_is_invalid() {
+        let status = validate_sandbox_request(&req("", vec!["echo"])).unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
 
-        assert_eq!(status.code(), Code::Unimplemented);
+    #[test]
+    fn empty_command_is_invalid() {
+        let status = validate_sandbox_request(&req("alpine", vec![])).unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn valid_request_passes_validation() {
+        assert!(validate_sandbox_request(&req("alpine", vec!["echo", "hi"])).is_ok());
+    }
+
+    #[test]
+    fn status_strings_match_contract() {
+        assert_eq!(sandbox_status_str(SandboxStatus::Succeeded), "succeeded");
+        assert_eq!(sandbox_status_str(SandboxStatus::TimedOut), "timed_out");
         assert_eq!(
-            status.message(),
-            "sandbox execution is not implemented yet; use zone/run/exec commands or see docs/sandbox-runtime.md"
+            sandbox_status_str(SandboxStatus::RuntimeError),
+            "runtime_error"
         );
+    }
+
+    #[test]
+    fn runtime_error_maps_to_proto_result() {
+        let exec =
+            SandboxExecResult::runtime_error("task-1", "zone-1", vec!["pytest".into()], "boom");
+        let proto = to_proto_result(exec);
+        assert_eq!(proto.status, "runtime_error");
+        assert_eq!(proto.stderr, "boom");
+        assert_eq!(proto.exit_code, None);
+        assert!(proto.started_at.is_empty());
+    }
+
+    // --- enforcement-event correlation & projection ---
+
+    /// Build an enforcement-shaped evidence event for the given caller zone,
+    /// mirroring what the eBPF backend's normalizer produces.
+    fn enforcement_event(caller_zone: u32) -> FalseEvent {
+        rauha_evidence::FalseEventBuilder::new("zone.file.denied")
+            .zone(format!("zone-{caller_zone}"), None)
+            .actor("pid:1234", Vec::new())
+            .resource("inode:42")
+            .field("pid", FieldValue::U64(1234))
+            .field("hook", FieldValue::String("file_open".into()))
+            .field("decision", FieldValue::String("deny".into()))
+            .field("caller_zone", FieldValue::U64(caller_zone as u64))
+            .field("target_zone", FieldValue::U64(0))
+            .build()
+            .expect("build enforcement event")
+    }
+
+    #[test]
+    fn event_matches_only_its_own_zone() {
+        let event = enforcement_event(7);
+        assert!(enforcement_event_matches(&event, Some(7)));
+        assert!(!enforcement_event_matches(&event, Some(8)));
+    }
+
+    #[test]
+    fn unresolved_kernel_id_attributes_nothing() {
+        // Without a kernel zone id we cannot safely attribute events — even a
+        // real enforcement event must not leak into an unrelated task's result.
+        let event = enforcement_event(7);
+        assert!(!enforcement_event_matches(&event, None));
+    }
+
+    #[test]
+    fn non_enforcement_event_without_caller_zone_does_not_match() {
+        let lifecycle = rauha_evidence::FalseEventBuilder::new("zone.created")
+            .zone("zone-7", None)
+            .build()
+            .expect("build lifecycle event");
+        assert!(!enforcement_event_matches(&lifecycle, Some(7)));
+    }
+
+    #[test]
+    fn projection_surfaces_stable_named_fields() {
+        let summary = project_enforcement_event(&enforcement_event(7));
+        assert_eq!(summary.hook, "file_open");
+        assert_eq!(summary.decision, "deny");
+        assert_eq!(summary.action, "zone.file.denied");
+        assert_eq!(summary.pid, Some(1234));
+        assert_eq!(summary.source_zone.as_deref(), Some("zone-7"));
+        // target_zone of 0 means "no cross-zone target" and is dropped.
+        assert_eq!(summary.target_zone, None);
+        assert_eq!(summary.object.as_deref(), Some("inode:42"));
+        assert!(summary.timestamp.is_some(), "ts should parse to a datetime");
+    }
+
+    #[test]
+    fn drain_without_capture_yields_no_events() {
+        assert!(drain_enforcement_capture(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_only_this_zones_events() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        // One event for our zone (7), one for a neighbour (9).
+        tx.send(enforcement_event(7)).unwrap();
+        tx.send(enforcement_event(9)).unwrap();
+
+        let capture = EnforcementCapture {
+            rx,
+            kernel_zone_id: Some(7),
+        };
+        let events = drain_enforcement_capture(Some(capture));
+
+        assert_eq!(events.len(), 1, "only the task's own zone is captured");
+        assert_eq!(events[0].source_zone.as_deref(), Some("zone-7"));
     }
 }

@@ -281,29 +281,23 @@ impl IsolationBackend for MacosBackend {
                 cpu_usage_ns,
                 memory_bytes,
                 pids,
+                container_count,
+                network_rx_bytes,
+                network_tx_bytes,
             }) => Ok(ZoneStats {
                 zone_id: zone.id,
-                container_count: 0, // TODO: track container count
+                container_count,
                 cpu_usage_percent: cpu_usage_ns as f64 / 1_000_000_000.0,
                 memory_usage_bytes: memory_bytes,
                 memory_limit_bytes: 0, // Set from policy
-                network_rx_bytes: 0,   // TODO: track network stats
-                network_tx_bytes: 0,
+                network_rx_bytes,
+                network_tx_bytes,
                 pids_current: pids as u64,
             }),
-            Ok(_) | Err(_) => {
-                // Fallback: return zeroed stats if guest agent isn't reachable.
-                Ok(ZoneStats {
-                    zone_id: zone.id,
-                    container_count: 0,
-                    cpu_usage_percent: 0.0,
-                    memory_usage_bytes: 0,
-                    memory_limit_bytes: 0,
-                    network_rx_bytes: 0,
-                    network_tx_bytes: 0,
-                    pids_current: 0,
-                })
-            }
+            Ok(other) => Err(RauhaError::BackendError(format!(
+                "unexpected response to GetStats: {other:?}"
+            ))),
+            Err(e) => Err(e),
         }
     }
 

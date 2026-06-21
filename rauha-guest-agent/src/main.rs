@@ -116,6 +116,10 @@ impl AgentState {
             }
         }
     }
+
+    fn container_count(&self) -> u32 {
+        self.containers.len() as u32
+    }
 }
 
 fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse {
@@ -153,11 +157,33 @@ fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse 
             ShimResponse::Ok
         }
         ShimRequest::GetStats => {
-            let (cpu_usage_ns, memory_bytes, pids) = container::collect_stats();
+            let (cpu_usage_ns, memory_bytes, pids, network_rx_bytes, network_tx_bytes) =
+                container::collect_stats();
             ShimResponse::Stats {
                 cpu_usage_ns,
                 memory_bytes,
                 pids,
+                container_count: state.container_count(),
+                network_rx_bytes,
+                network_tx_bytes,
+            }
+        }
+        ShimRequest::ResizePty {
+            id,
+            session_id,
+            rows,
+            cols,
+        } => {
+            let Some(session_id) = session_id else {
+                return ShimResponse::Error {
+                    message: format!("missing PTY session id for container {id}"),
+                };
+            };
+            match attach::resize_pty(&session_id, rows, cols) {
+                Ok(()) => ShimResponse::Ok,
+                Err(e) => ShimResponse::Error {
+                    message: e.to_string(),
+                },
             }
         }
         ShimRequest::Attach { .. } => ShimResponse::Error {
@@ -193,17 +219,21 @@ fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse 
             }
 
             let vsock_port = attach::allocate_session_port();
+            let session_id = format!("vsock-{vsock_port}");
 
             match attach::fork_and_exec_pty(&state.rootfs_root, &id, &command, &env) {
-                Ok((master_fd, _pid)) => match attach::serve_vsock_session(master_fd, vsock_port) {
-                    Ok(()) => ShimResponse::ExecReady {
-                        socket_path: None,
-                        vsock_port: Some(vsock_port),
-                    },
-                    Err(e) => ShimResponse::Error {
-                        message: format!("failed to create vsock session: {e}"),
-                    },
-                },
+                Ok((master_fd, _pid)) => {
+                    match attach::serve_vsock_session(&session_id, master_fd, vsock_port) {
+                        Ok(()) => ShimResponse::ExecReady {
+                            session_id: Some(session_id),
+                            socket_path: None,
+                            vsock_port: Some(vsock_port),
+                        },
+                        Err(e) => ShimResponse::Error {
+                            message: format!("failed to create vsock session: {e}"),
+                        },
+                    }
+                }
                 Err(e) => ShimResponse::Error {
                     message: format!("exec failed: {e}"),
                 },

@@ -10,7 +10,7 @@ rauha sandbox --image python:3.12 --repo-path . --env RUST_LOG=debug -- pytest t
 
 ## Current State
 
-API/CLI contract landed. Runtime execution still planned.
+API/CLI contract and runtime execution are implemented.
 
 What exists today:
 
@@ -18,27 +18,17 @@ What exists today:
   `RunSandbox(RunSandboxRequest) returns (SandboxResult)`.
 - `rauha-cli`'s `rauha sandbox` subcommand parses task arguments and calls
   `SandboxService.RunSandbox`.
-- `rauhad`'s `SandboxServiceImpl` returns `Status::unimplemented` with the
-  message *"sandbox execution is not implemented yet; use zone/run/exec
-  commands or see docs/sandbox-runtime.md"*.
+- `rauhad`'s `SandboxServiceImpl` allocates or resolves a zone, creates and
+  starts one container, waits for completion, captures stdout/stderr and
+  lifecycle/enforcement event summaries, then tears down temporary resources
+  unless `keep_zone` is set.
 - `rauha-common::sandbox` exposes the portable result types
   (`SandboxExecResult`, `SandboxStatus`, `SandboxEventSummary`,
   `EnforcementEventSummary`).
 
-What does **not** exist yet:
-
-- allocation of a temporary task zone
-- container creation and start inside that zone
-- waiting for command completion
-- stdout/stderr capture into a single result
-- exit code capture
-- duration tracking
-- task-scoped enforcement event collection
-- cleanup of the temporary zone by default
-
-The daemon's RunSandbox method intentionally returns `Unimplemented` so callers
-can already write code against the contract while the runtime path is being
-built.
+Temporary task containers and zones have cancellation cleanup guards. If a
+client disconnects while the request future is running, the daemon schedules
+forced deletion for resources it owns.
 
 ## Result Contract
 
@@ -62,14 +52,16 @@ sandbox execution:
 }
 ```
 
-`enforcement_events` may be empty. That is the expected portable baseline.
-When Syvä integration is added, Linux kernel events can populate that field
-without changing the user-facing result contract.
+`enforcement_events` is best-effort and may be empty. That is the expected
+portable baseline on backends without Linux kernel enforcement. On Linux, the
+daemon drains a task-scoped subscription from a daemon-wide broadcast; broadcast
+lag can still drop events, so consumers must not treat the field as an
+audit-complete log.
 
-## Minimal Implementation Plan
+`timeout_seconds == 0` means wait indefinitely. Callers that need bounded task
+execution should set an explicit timeout.
 
-The next PR replaces the `Unimplemented` body in `SandboxServiceImpl` with
-real execution. Step list:
+## Runtime Flow
 
 1. Create or select a zone for the task (temporary by default, named if
    `--name`/`name` is set).
@@ -82,7 +74,5 @@ real execution. Step list:
    enforcement events.
 6. Clean up the zone unless `keep_zone` is set.
 7. Build a `SandboxResult` and return it. CLI then renders human or JSON
-   output via the existing `OutputMode` plumbing.
-
-The first implementation should wrap existing zone/container primitives
-rather than bypassing them with an ordinary host `std::process::Command`.
+   output via the existing `OutputMode` plumbing and mirrors the task exit
+   code.

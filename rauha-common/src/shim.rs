@@ -47,32 +47,51 @@ pub enum ShimRequest {
         /// Whether to allocate a PTY for the exec process.
         pty: bool,
     },
+    /// Resize an active PTY session.
+    ResizePty {
+        id: String,
+        session_id: Option<String>,
+        rows: u32,
+        cols: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ShimResponse {
     Ok,
-    Created { pid: u32 },
+    Created {
+        pid: u32,
+    },
     State {
         pid: u32,
         status: String,
         exit_code: Option<i32>,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// Zone-level resource usage statistics.
     Stats {
         cpu_usage_ns: u64,
         memory_bytes: u64,
         pids: u32,
+        container_count: u32,
+        network_rx_bytes: u64,
+        network_tx_bytes: u64,
     },
     /// An attach/exec session is ready. Connect to the socket at `socket_path`
     /// for bidirectional I/O with the container process.
-    AttachReady { socket_path: String },
+    AttachReady {
+        socket_path: String,
+        session_id: Option<String>,
+    },
     /// An exec session is ready. Connect via the appropriate transport for
     /// bidirectional I/O with the exec process.
     ///
     /// Linux shim sets `socket_path`; macOS guest agent sets `vsock_port`.
     ExecReady {
+        /// Internal session identifier used for follow-up control messages.
+        session_id: Option<String>,
         /// Unix socket path (Linux shim).
         socket_path: Option<String>,
         /// Vsock port number (macOS guest agent).
@@ -200,6 +219,12 @@ mod tests {
                 env: vec!["TERM=xterm".into()],
                 pty: true,
             },
+            ShimRequest::ResizePty {
+                id: "c1".into(),
+                session_id: Some("session-1".into()),
+                rows: 40,
+                cols: 120,
+            },
         ];
 
         for req in cases {
@@ -230,15 +255,21 @@ mod tests {
                 cpu_usage_ns: 1_000_000,
                 memory_bytes: 64 * 1024 * 1024,
                 pids: 5,
+                container_count: 2,
+                network_rx_bytes: 1024,
+                network_tx_bytes: 2048,
             },
             ShimResponse::AttachReady {
                 socket_path: "/run/rauha/containers/abc/attach-123.sock".into(),
+                session_id: Some("attach-123".into()),
             },
             ShimResponse::ExecReady {
+                session_id: Some("exec-456".into()),
                 socket_path: Some("/run/rauha/containers/abc/exec-456.sock".into()),
                 vsock_port: None,
             },
             ShimResponse::ExecReady {
+                session_id: Some("exec-vsock".into()),
                 socket_path: None,
                 vsock_port: Some(6001),
             },

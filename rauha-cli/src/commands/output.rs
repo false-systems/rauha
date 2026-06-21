@@ -170,6 +170,42 @@ pub struct ImageInspect {
 }
 
 #[derive(Serialize)]
+pub struct SandboxEvent {
+    pub timestamp: String,
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct SandboxEnforcementEvent {
+    pub timestamp: String,
+    pub hook: String,
+    pub action: String,
+    pub decision: String,
+    pub message: String,
+    pub pid: Option<u32>,
+    pub source_zone: String,
+    pub target_zone: String,
+    pub object: String,
+}
+
+/// Result of `rauha sandbox` — the agent-facing task contract.
+/// Field names are stable; agents and scripts can rely on them.
+#[derive(Serialize)]
+pub struct SandboxRun {
+    pub ok: bool,
+    pub task_id: String,
+    pub zone_id: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+    pub events: Vec<SandboxEvent>,
+    pub enforcement_events: Vec<SandboxEnforcementEvent>,
+}
+
+#[derive(Serialize)]
 pub struct PolicyApplied {
     pub ok: bool,
     pub zone: String,

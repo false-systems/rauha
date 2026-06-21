@@ -75,12 +75,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up gRPC services.
     #[cfg(target_os = "linux")]
-    let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone(), event_tx);
+    let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone(), event_tx.clone());
     #[cfg(not(target_os = "linux"))]
     let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone());
     let container_svc = server::ContainerServiceImpl::new(registry.clone());
     let image_svc = server::ImageServiceImpl::new(image_service);
-    let sandbox_svc = server::SandboxServiceImpl::new();
+    #[cfg(target_os = "linux")]
+    let sandbox_svc = server::SandboxServiceImpl::new(registry.clone(), event_tx.clone());
+    #[cfg(not(target_os = "linux"))]
+    let sandbox_svc = server::SandboxServiceImpl::new(registry.clone(), None);
 
     let addr = "[::1]:9876".parse()?;
     tracing::info!(%addr, "listening on gRPC");

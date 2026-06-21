@@ -63,6 +63,16 @@ pub trait IsolationBackend: Send + Sync {
     /// The name of this backend (e.g., "linux-ebpf", "macos-virt").
     fn name(&self) -> &str;
 
+    /// Resolve the backend's compact, kernel-side identifier for a zone.
+    ///
+    /// Kernel enforcement events carry this compact id (not the user-facing
+    /// UUID), so callers correlating events back to a zone need it. Returns
+    /// `None` when the backend assigns no kernel-side id — e.g. macOS VMs
+    /// (the VM is the boundary) or Linux with eBPF not loaded.
+    fn kernel_zone_id(&self, _zone: &ZoneHandle) -> Option<u32> {
+        None
+    }
+
     /// Send a shim request via the backend's native transport.
     ///
     /// On macOS, this routes through vsock to the guest agent inside the VM.

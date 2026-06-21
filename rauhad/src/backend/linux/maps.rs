@@ -7,7 +7,8 @@ use aya::maps::HashMap as AyaHashMap;
 use aya::Bpf;
 
 use rauha_common::error::{RauhaError, Result};
-use rauha_common::zone::{capabilities_to_mask, ZonePolicy, ZoneType};
+use rauha_common::zone::{ZonePolicy, ZoneType};
+use rauha_enforcer_api::ZoneEnforcement;
 use rauha_ebpf_common::*;
 
 pub struct MapManager;
@@ -79,8 +80,21 @@ impl MapManager {
 
     /// Set the enforcement policy for a zone in the BPF map.
     pub fn set_zone_policy(bpf: &mut Bpf, zone_id: u32, policy: &ZonePolicy) -> Result<()> {
-        let kernel_policy = policy_to_kernel(policy)?;
+        Self::set_zone_policy_kernel(bpf, zone_id, policy_to_kernel(policy)?)
+    }
 
+    /// Write an already-translated kernel policy record into ZONE_POLICY.
+    ///
+    /// This is the kernel-facing half of policy application: it takes the
+    /// `ZonePolicyKernel` produced from the enforcement seam's vocabulary and
+    /// inserts it. The enforcer adapter calls this directly so policy that
+    /// crosses the seam (`ZoneEnforcement`) lands in the same map entry as
+    /// policy applied from a full `ZonePolicy`.
+    pub fn set_zone_policy_kernel(
+        bpf: &mut Bpf,
+        zone_id: u32,
+        kernel_policy: ZonePolicyKernel,
+    ) -> Result<()> {
         let mut map: AyaHashMap<_, u32, ZonePolicyKernel> =
             AyaHashMap::try_from(bpf.map_mut("ZONE_POLICY").ok_or_else(|| {
                 RauhaError::EbpfError {
@@ -344,27 +358,33 @@ pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> 
 /// Convert userspace ZonePolicy to kernel-side ZonePolicyKernel.
 ///
 /// Maps capability names to a bitmask and policy settings to flag bits.
-fn policy_to_kernel(policy: &ZonePolicy) -> Result<ZonePolicyKernel> {
-    let caps_mask = capabilities_to_mask(&policy.capabilities.allowed)?;
-
+/// Map the enforcement seam's neutral zone flags onto the kernel policy record.
+///
+/// This is the only place that knows the kernel's flag-bit ABI
+/// (`POLICY_FLAG_*`). Everything upstream speaks `ZoneEnforcement`.
+pub fn enforcement_to_kernel(zone: &ZoneEnforcement) -> ZonePolicyKernel {
     let mut flags = 0u32;
-    // Allow ptrace if SYS_PTRACE capability is granted.
-    if policy.capabilities.allowed.iter().any(|c| {
-        let upper = c.to_uppercase();
-        upper == "CAP_SYS_PTRACE" || upper == "SYS_PTRACE"
-    }) {
+    if zone.allow_ptrace {
         flags |= POLICY_FLAG_ALLOW_PTRACE;
     }
-
-    if policy.network.mode == rauha_common::zone::NetworkMode::Host {
+    if zone.allow_host_net {
         flags |= POLICY_FLAG_ALLOW_HOST_NET;
     }
 
-    Ok(ZonePolicyKernel {
-        caps_mask,
+    ZonePolicyKernel {
+        caps_mask: zone.caps_mask,
         flags,
         _pad: 0,
-    })
+    }
+}
+
+/// Translate a full Rauha `ZonePolicy` into a kernel policy record.
+///
+/// Goes through the enforcement seam's `ZoneEnforcement` vocabulary so there is
+/// a single source of truth for policy meaning (`ZonePolicy::to_enforcement`)
+/// and a single place that knows the kernel ABI (`enforcement_to_kernel`).
+fn policy_to_kernel(policy: &ZonePolicy) -> Result<ZonePolicyKernel> {
+    Ok(enforcement_to_kernel(&policy.to_enforcement()?))
 }
 
 #[cfg(test)]

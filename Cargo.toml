@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "rauha-common",
+    "rauha-enforcer-api",
     "rauha-ebpf-common",
     "rauha-evidence",
     "rauhad",
