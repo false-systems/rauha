@@ -31,8 +31,9 @@ pub(super) struct LinuxEnforcer {
     /// `EnforcerBackend` trait. `LinuxBackend` currently keeps its own
     /// name<->id map and drives this enforcer through the inherent (id-keyed)
     /// methods, so this registry is only exercised when `LinuxEnforcer` is used
-    /// directly as an `EnforcerBackend` (conformance, and the future migration
-    /// where `LinuxBackend` consumes the trait and this becomes the single map).
+    /// directly as an `EnforcerBackend` — the `linux_enforcer_passes_basic_conformance`
+    /// test below, and the future migration where `LinuxBackend` consumes the
+    /// trait and this becomes the single map.
     trait_zones: Mutex<HashMap<String, (u32, ZoneType)>>,
     trait_next_zone_id: AtomicU32,
 }
@@ -462,5 +463,37 @@ fn to_enforcer_error(error: RauhaError) -> EnforcerError {
         }
         RauhaError::BackendError(message) => EnforcerError::Verifier(message),
         other => EnforcerError::Verifier(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rauha_enforcer_api::conformance;
+
+    /// The Linux eBPF backend must satisfy the same `EnforcerBackend` contract
+    /// as every other backend. This runs the shared conformance suite against a
+    /// real `LinuxEnforcer`.
+    ///
+    /// It is environment-gated, like the `tests/integration/*.sh` suite: loading
+    /// eBPF needs root, a `CONFIG_BPF_LSM` kernel, and the compiled eBPF object.
+    /// Where those are absent (ordinary CI, non-root dev), `LinuxEnforcer::new`
+    /// fails and the test skips rather than reporting a false failure. On an
+    /// enforcement-capable host it exercises the full lifecycle for real.
+    #[tokio::test]
+    async fn linux_enforcer_passes_basic_conformance() {
+        let root = tempfile::tempdir().expect("temp root");
+        let enforcer = match LinuxEnforcer::new(root.path().to_str().expect("utf-8 root")) {
+            Ok(enforcer) => enforcer,
+            Err(e) => {
+                eprintln!(
+                    "skipping linux_enforcer_passes_basic_conformance: \
+                     eBPF enforcement unavailable in this environment ({e})"
+                );
+                return;
+            }
+        };
+
+        conformance::run_basic_conformance(&enforcer).await;
     }
 }
