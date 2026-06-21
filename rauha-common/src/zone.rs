@@ -404,6 +404,11 @@ impl ZonePolicy {
             caps_mask,
             allow_ptrace,
             allow_host_net,
+            // `ZonePolicy` carries no zone type — that lives on the zone and is
+            // applied via membership — so the policy translation leaves `kind`
+            // at its default. Backends that key on zone type receive it through
+            // container attachment, not policy.
+            kind: rauha_enforcer_api::ZoneKind::default(),
         })
     }
 }

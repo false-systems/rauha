@@ -54,29 +54,44 @@ enforcement boundary.
 `rauha-enforcer-api` defines the kernel-enforcement interface behind Rauha's
 zone lifecycle. It has no eBPF dependency and does not expose Rauha policy
 types. Rauha translates user-facing policy into enforcement vocabulary before
-calling the backend.
+calling the backend. The trait is the complete, name-keyed enforcement
+contract — see [rauha-product-abilities.md](rauha-product-abilities.md) for how
+it splits Rauha (the product) from the enforcer behind it.
 
 ```rust
 trait EnforcerBackend {
     async fn load(&self) -> Result<(), EnforcerError>;
     async fn shutdown(&self) -> Result<(), EnforcerError>;
-    async fn create_zone(&self, zone: ZoneId) -> Result<(), EnforcerError>;
-    async fn delete_zone(&self, zone: ZoneId) -> Result<(), EnforcerError>;
-    async fn apply_policy(
-        &self,
-        zone: ZoneId,
-        policy: &EnforcementPolicy,
-    ) -> Result<(), EnforcerError>;
+
+    async fn register_zone(&self, name: &str, policy: &EnforcementPolicy)
+        -> Result<u32, EnforcerError>;            // returns the kernel zone id
+    async fn remove_zone(&self, name: &str, drain: bool) -> Result<(), EnforcerError>;
+    async fn apply_policy(&self, zone: &ZoneRef, policy: &EnforcementPolicy)
+        -> Result<(), EnforcerError>;
+
+    async fn attach_container(&self, zone: &ZoneRef, container_id: &str, cgroup_id: u64)
+        -> Result<(), EnforcerError>;
+    async fn detach_container(&self, container_id: &str, cgroup_id: u64)
+        -> Result<(), EnforcerError>;
+    async fn register_host_path(&self, zone: &ZoneRef, path: &str, recursive: bool)
+        -> Result<u32, EnforcerError>;
+    async fn allow_comm(&self, a: &ZoneRef, b: &ZoneRef) -> Result<(), EnforcerError>;
+    async fn deny_comm(&self, a: &ZoneRef, b: &ZoneRef) -> Result<(), EnforcerError>;
+
     fn watch_events(&self) -> EventStream;
-    async fn stats(&self, zone: ZoneId) -> Result<EnforcementStats, EnforcerError>;
-    async fn verify(
-        &self,
-        zone: ZoneId,
-        policy: &EnforcementPolicy,
-    ) -> Result<VerifyReport, EnforcerError>;
+    async fn stats(&self, zone: &ZoneRef) -> Result<EnforcementStats, EnforcerError>;
+    async fn verify(&self, zone: &ZoneRef, policy: &EnforcementPolicy)
+        -> Result<VerifyReport, EnforcerError>;
     fn capabilities(&self) -> Capabilities;
 }
 ```
+
+The trait is **name-keyed** because the zone name is the stable handle both the
+in-repo eBPF backend (which also keeps a compact `u32` map key) and Syva
+(`register_zone` returns its own `u32`) share. `ZoneRef { name, kernel_id }`
+carries both so each backend uses whichever it needs. This shape mirrors
+`syva.core.v1` (`RegisterZone`/`AttachContainer`/`RegisterHostPath`/`AllowComm`/
+`WatchEvents`), so a `SyvaEnforcer` is a direct implementation.
 
 `verify` is a drift/parity self-check: it answers whether the backend's loaded
 state for a zone matches Rauha's intended `EnforcementPolicy`. BPF verifier or

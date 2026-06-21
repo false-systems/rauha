@@ -4,15 +4,17 @@
 //! BPF map helpers. It creates the enforcement seam first without moving the
 //! kernel code or changing backend behavior.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::{ZonePolicy, ZoneType};
 use rauha_enforcer_api::{
-    Capabilities, Decision, EnforcementPolicy, EnforcementStats, EnforcerBackend, EnforcerError,
-    EventStream, Hook, HookSet, VerifyDiscrepancy, VerifyDiscrepancyKind, VerifyReport,
-    ZoneEnforcement, ZoneId,
+    Capabilities, EnforcementPolicy, EnforcementStats, EnforcerBackend, EnforcerError, EventStream,
+    Hook, HookSet, VerifyDiscrepancy, VerifyDiscrepancyKind, VerifyReport, ZoneEnforcement,
+    ZoneKind, ZoneRef,
 };
 
 use super::ebpf::EbpfManager;
@@ -25,6 +27,14 @@ pub(super) struct LinuxEnforcer {
     ebpf: Mutex<Option<EbpfManager>>,
     event_reader_cancel: Option<tokio_util::sync::CancellationToken>,
     event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
+    /// Name -> (kernel zone id, zone type) registry backing the name-keyed
+    /// `EnforcerBackend` trait. `LinuxBackend` currently keeps its own
+    /// name<->id map and drives this enforcer through the inherent (id-keyed)
+    /// methods, so this registry is only exercised when `LinuxEnforcer` is used
+    /// directly as an `EnforcerBackend` (conformance, and the future migration
+    /// where `LinuxBackend` consumes the trait and this becomes the single map).
+    trait_zones: Mutex<HashMap<String, (u32, ZoneType)>>,
+    trait_next_zone_id: AtomicU32,
 }
 
 impl LinuxEnforcer {
@@ -46,6 +56,8 @@ impl LinuxEnforcer {
             ebpf: Mutex::new(Some(ebpf)),
             event_reader_cancel: Some(event_reader_cancel),
             event_tx: Some(event_tx),
+            trait_zones: Mutex::new(HashMap::new()),
+            trait_next_zone_id: AtomicU32::new(1),
         })
     }
 
@@ -206,6 +218,31 @@ impl LinuxEnforcer {
             counters: true,
         }
     }
+
+    fn lock_ebpf(
+        &self,
+    ) -> std::result::Result<std::sync::MutexGuard<'_, Option<EbpfManager>>, EnforcerError> {
+        self.ebpf
+            .lock()
+            .map_err(|_| EnforcerError::Verifier("linux enforcer mutex poisoned".into()))
+    }
+
+    fn lock_trait_zones(
+        &self,
+    ) -> std::result::Result<std::sync::MutexGuard<'_, HashMap<String, (u32, ZoneType)>>, EnforcerError>
+    {
+        self.trait_zones
+            .lock()
+            .map_err(|_| EnforcerError::Verifier("linux enforcer zone registry poisoned".into()))
+    }
+
+    /// Map the seam's neutral zone classification onto Rauha's kernel zone type.
+    fn zone_type_for(kind: ZoneKind) -> ZoneType {
+        match kind {
+            ZoneKind::Privileged => ZoneType::Privileged,
+            ZoneKind::Standard | ZoneKind::Isolated => ZoneType::NonGlobal,
+        }
+    }
 }
 
 impl Drop for LinuxEnforcer {
@@ -218,10 +255,7 @@ impl Drop for LinuxEnforcer {
 
 impl EnforcerBackend for LinuxEnforcer {
     async fn load(&self) -> std::result::Result<(), EnforcerError> {
-        let mut ebpf_guard = self
-            .ebpf
-            .lock()
-            .map_err(|_| EnforcerError::Verifier("linux enforcer mutex poisoned".into()))?;
+        let mut ebpf_guard = self.lock_ebpf()?;
         if ebpf_guard.is_some() {
             return Ok(());
         }
@@ -231,53 +265,59 @@ impl EnforcerBackend for LinuxEnforcer {
     }
 
     async fn shutdown(&self) -> std::result::Result<(), EnforcerError> {
-        let mut ebpf_guard = self
-            .ebpf
-            .lock()
-            .map_err(|_| EnforcerError::Verifier("linux enforcer mutex poisoned".into()))?;
-        if let Some(ebpf) = ebpf_guard.take() {
+        if let Some(ebpf) = self.lock_ebpf()?.take() {
             ebpf.cleanup();
+        }
+        self.lock_trait_zones()?.clear();
+        Ok(())
+    }
+
+    async fn register_zone(
+        &self,
+        name: &str,
+        policy: &EnforcementPolicy,
+    ) -> std::result::Result<u32, EnforcerError> {
+        if self.lock_ebpf()?.is_none() {
+            return Err(EnforcerError::NotLoaded);
+        }
+        let zone_type = Self::zone_type_for(policy.zone.kind);
+        let kernel_id = {
+            let mut zones = self.lock_trait_zones()?;
+            if let Some((id, kind)) = zones.get_mut(name) {
+                *kind = zone_type;
+                *id
+            } else {
+                let id = self.trait_next_zone_id.fetch_add(1, Ordering::SeqCst);
+                zones.insert(name.to_string(), (id, zone_type));
+                id
+            }
+        };
+        self.apply_zone_enforcement(kernel_id, &policy.zone)
+            .map_err(to_enforcer_error)?;
+        Ok(kernel_id)
+    }
+
+    async fn remove_zone(
+        &self,
+        name: &str,
+        _drain: bool,
+    ) -> std::result::Result<(), EnforcerError> {
+        if self.lock_ebpf()?.is_none() {
+            return Err(EnforcerError::NotLoaded);
+        }
+        let id = self.lock_trait_zones()?.remove(name).map(|(id, _)| id);
+        if let Some(id) = id {
+            self.remove_zone_policy(id).map_err(to_enforcer_error)?;
         }
         Ok(())
     }
 
-    async fn create_zone(&self, _zone: ZoneId) -> std::result::Result<(), EnforcerError> {
-        if self
-            .ebpf
-            .lock()
-            .map_err(|_| EnforcerError::Verifier("linux enforcer mutex poisoned".into()))?
-            .is_some()
-        {
-            Ok(())
-        } else {
-            Err(EnforcerError::NotLoaded)
-        }
-    }
-
-    async fn delete_zone(&self, _zone: ZoneId) -> std::result::Result<(), EnforcerError> {
-        if self
-            .ebpf
-            .lock()
-            .map_err(|_| EnforcerError::Verifier("linux enforcer mutex poisoned".into()))?
-            .is_some()
-        {
-            Ok(())
-        } else {
-            Err(EnforcerError::NotLoaded)
-        }
-    }
-
     async fn apply_policy(
         &self,
-        zone: ZoneId,
+        zone: &ZoneRef,
         policy: &EnforcementPolicy,
     ) -> std::result::Result<(), EnforcerError> {
-        if self
-            .ebpf
-            .lock()
-            .map_err(|_| EnforcerError::Verifier("linux enforcer mutex poisoned".into()))?
-            .is_none()
-        {
+        if self.lock_ebpf()?.is_none() {
             return Err(EnforcerError::NotLoaded);
         }
 
@@ -285,16 +325,71 @@ impl EnforcerBackend for LinuxEnforcer {
         for rule in &policy.rules {
             if !capabilities.supports_rule(rule) {
                 return Err(EnforcerError::PolicyUnenforceable {
-                    zone,
+                    zone: zone.name.clone(),
                     rule: rule.id,
                     reason: format!("unsupported hook {:?}", rule.hook),
                 });
             }
         }
 
-        // Zone IDs cross the seam as u64 but Rauha's kernel-side IDs are the
-        // compact u32 BPF map keys, so the caller passes `ZoneId(zone_id)`.
-        self.apply_zone_enforcement(zone.0 as u32, &policy.zone)
+        self.apply_zone_enforcement(zone.kernel_id, &policy.zone)
+            .map_err(to_enforcer_error)
+    }
+
+    async fn attach_container(
+        &self,
+        zone: &ZoneRef,
+        _container_id: &str,
+        cgroup_id: u64,
+    ) -> std::result::Result<(), EnforcerError> {
+        let zone_type = self
+            .lock_trait_zones()?
+            .get(&zone.name)
+            .map(|(_, t)| *t)
+            .unwrap_or(ZoneType::NonGlobal);
+        self.add_zone_member(cgroup_id, zone.kernel_id, zone_type)
+            .map_err(to_enforcer_error)
+    }
+
+    async fn detach_container(
+        &self,
+        _container_id: &str,
+        cgroup_id: u64,
+    ) -> std::result::Result<(), EnforcerError> {
+        self.remove_zone_member(cgroup_id)
+            .map_err(to_enforcer_error)
+    }
+
+    async fn register_host_path(
+        &self,
+        zone: &ZoneRef,
+        path: &str,
+        _recursive: bool,
+    ) -> std::result::Result<u32, EnforcerError> {
+        // The eBPF backend always claims the full tree under `path` (the rootfs
+        // case), so `recursive` is implied; a non-recursive single-inode claim
+        // is not distinguished today.
+        let inodes = super::maps::collect_rootfs_inodes(
+            std::path::Path::new(path),
+            rauha_ebpf_common::MAX_INODES,
+        );
+        let inserted = self
+            .insert_inodes(&inodes, zone.kernel_id)
+            .map_err(to_enforcer_error)?;
+        Ok(inserted.len() as u32)
+    }
+
+    async fn allow_comm(&self, a: &ZoneRef, b: &ZoneRef) -> std::result::Result<(), EnforcerError> {
+        self.allow_zone_comm(a.kernel_id, b.kernel_id)
+            .map_err(to_enforcer_error)?;
+        self.allow_zone_comm(b.kernel_id, a.kernel_id)
+            .map_err(to_enforcer_error)
+    }
+
+    async fn deny_comm(&self, a: &ZoneRef, b: &ZoneRef) -> std::result::Result<(), EnforcerError> {
+        self.deny_zone_comm(a.kernel_id, b.kernel_id)
+            .map_err(to_enforcer_error)?;
+        self.deny_zone_comm(b.kernel_id, a.kernel_id)
             .map_err(to_enforcer_error)
     }
 
@@ -306,7 +401,7 @@ impl EnforcerBackend for LinuxEnforcer {
         rx
     }
 
-    async fn stats(&self, _zone: ZoneId) -> std::result::Result<EnforcementStats, EnforcerError> {
+    async fn stats(&self, _zone: &ZoneRef) -> std::result::Result<EnforcementStats, EnforcerError> {
         let counters = self
             .read_enforcement_counters()
             .map_err(to_enforcer_error)?;
@@ -321,7 +416,7 @@ impl EnforcerBackend for LinuxEnforcer {
 
     async fn verify(
         &self,
-        _zone: ZoneId,
+        _zone: &ZoneRef,
         policy: &EnforcementPolicy,
     ) -> std::result::Result<VerifyReport, EnforcerError> {
         let mut discrepancies = Vec::new();
