@@ -145,7 +145,7 @@ flowchart TB
         cgroups["cgroups v2"]
         ns["namespaces + netns"]
         rootfs["OCI rootfs + rauha-shim"]
-        syva["Syvä / BPF-LSM\nfile · exec · ptrace · signal · cgroup · net"]
+        syva["Syvä / BPF-LSM — 6 enforcing hooks\nfile · exec · ptrace · signal · cgroup · capability\n+ socket (audit-only; nftables enforces network)"]
         maps["BPF maps\nzone membership · policy · inode ownership"]
         ring["BPF ring buffer\nenforcement events"]
 
@@ -291,15 +291,19 @@ the VM itself, so no cgroups or namespaces are needed.
 | --- | --- |
 | Runtime lifecycle, zone create/delete | Linux kernel enforcement (BPF-LSM) |
 | Sandbox/container execution | eBPF programs, BPF maps, ring-buffer events |
-| Policy loading and validation | file / exec / ptrace / signal / socket deny decisions |
+| Policy loading and validation | file / exec / ptrace / signal / cgroup / capability deny decisions (socket is audit-only; nftables enforces network) |
 | Image, rootfs, networking, metadata | per-hook counters and privileged self-tests |
 | Logs, audit, user-facing event surfaces | the in-kernel deny-before-it-happens decision |
 | Kubernetes / containerd integration | |
 
 Syvä is a separate product ([`github.com/false-systems/syva`](https://github.com/false-systems/syva)).
-Current Linux eBPF code may still live in this repository, but architecturally it
-now sits behind the `rauha-enforcer-api` boundary; the `rauha-enforce` crate is
-a legacy seed and is not extended. See
+The `rauha-enforcer-api` crate defines this boundary as a backend-neutral trait,
+with a `NoopEnforcer` and a shared conformance harness every backend must pass.
+Be precise about today's state: the in-repo Linux eBPF backend is the
+implementation the daemon actually runs, an external Syvä backend is not yet
+wired in, and routing the daemon's live enforcement entirely through the trait
+is still in progress. **The seam is real, but not yet the sole enforcement
+path.** The `rauha-enforce` crate is a legacy seed and is not extended. See
 [`docs/rauha-syva-boundary.md`](docs/rauha-syva-boundary.md).
 
 ## Limitations (honest)
