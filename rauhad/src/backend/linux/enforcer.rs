@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::{ZonePolicy, ZoneType};
@@ -20,7 +20,7 @@ use rauha_enforcer_api::{
 use super::ebpf::EbpfManager;
 use super::events;
 use super::lock_backend;
-use super::maps::{enforcement_to_kernel, MapManager};
+use super::maps::{MapManager, enforcement_to_kernel};
 
 pub(super) struct LinuxEnforcer {
     root: String,
@@ -31,8 +31,9 @@ pub(super) struct LinuxEnforcer {
     /// `EnforcerBackend` trait. `LinuxBackend` currently keeps its own
     /// name<->id map and drives this enforcer through the inherent (id-keyed)
     /// methods, so this registry is only exercised when `LinuxEnforcer` is used
-    /// directly as an `EnforcerBackend` (conformance, and the future migration
-    /// where `LinuxBackend` consumes the trait and this becomes the single map).
+    /// directly as an `EnforcerBackend` — the `linux_enforcer_passes_basic_conformance`
+    /// test below, and the future migration where `LinuxBackend` consumes the
+    /// trait and this becomes the single map.
     trait_zones: Mutex<HashMap<String, (u32, ZoneType)>>,
     trait_next_zone_id: AtomicU32,
 }
@@ -229,8 +230,10 @@ impl LinuxEnforcer {
 
     fn lock_trait_zones(
         &self,
-    ) -> std::result::Result<std::sync::MutexGuard<'_, HashMap<String, (u32, ZoneType)>>, EnforcerError>
-    {
+    ) -> std::result::Result<
+        std::sync::MutexGuard<'_, HashMap<String, (u32, ZoneType)>>,
+        EnforcerError,
+    > {
         self.trait_zones
             .lock()
             .map_err(|_| EnforcerError::Verifier("linux enforcer zone registry poisoned".into()))
@@ -462,5 +465,77 @@ fn to_enforcer_error(error: RauhaError) -> EnforcerError {
         }
         RauhaError::BackendError(message) => EnforcerError::Verifier(message),
         other => EnforcerError::Verifier(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rauha_enforcer_api::conformance;
+    use std::sync::Arc;
+
+    /// The Linux eBPF backend must satisfy the same `EnforcerBackend` contract
+    /// as every other backend. This runs the shared conformance suite against a
+    /// real `LinuxEnforcer`.
+    ///
+    /// It is explicitly opt-in because loading the in-repo eBPF backend touches
+    /// global kernel state under `/sys/fs/bpf/rauha`. This must never happen as
+    /// a side effect of ordinary `cargo test`.
+    #[tokio::test]
+    async fn linux_enforcer_passes_basic_conformance() {
+        if std::env::var("RAUHA_RUN_EBPF_CONFORMANCE").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping linux_enforcer_passes_basic_conformance: set \
+                 RAUHA_RUN_EBPF_CONFORMANCE=1 on an isolated enforcement-capable Linux host"
+            );
+            return;
+        }
+
+        if bpf_pin_dir_has_entries()
+            && std::env::var("RAUHA_EBPF_CONFORMANCE_OVERWRITE_PINS").as_deref() != Ok("1")
+        {
+            eprintln!(
+                "skipping linux_enforcer_passes_basic_conformance: /sys/fs/bpf/rauha \
+                 already contains pinned state; stop rauhad or set \
+                 RAUHA_EBPF_CONFORMANCE_OVERWRITE_PINS=1 on an isolated test host"
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("temp root");
+        let enforcer = match LinuxEnforcer::new(root.path().to_str().expect("utf-8 root")) {
+            Ok(enforcer) => enforcer,
+            Err(e) => {
+                eprintln!(
+                    "skipping linux_enforcer_passes_basic_conformance: \
+                     eBPF enforcement unavailable in this environment ({e})"
+                );
+                return;
+            }
+        };
+        let enforcer = Arc::new(enforcer);
+
+        let conformance_enforcer = Arc::clone(&enforcer);
+        let result = tokio::spawn(async move {
+            conformance::run_basic_conformance(conformance_enforcer.as_ref()).await;
+        })
+        .await;
+
+        if let Err(e) = enforcer.shutdown().await {
+            eprintln!("linux_enforcer_passes_basic_conformance cleanup failed: {e}");
+        }
+
+        match result {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => panic!("conformance task failed: {e}"),
+        }
+    }
+
+    fn bpf_pin_dir_has_entries() -> bool {
+        let path = std::path::Path::new("/sys/fs/bpf/rauha");
+        std::fs::read_dir(path)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
     }
 }
