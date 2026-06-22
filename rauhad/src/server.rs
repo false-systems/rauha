@@ -1124,24 +1124,12 @@ fn command_hash(command: &[String]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-fn safe_command_argv(command: &[String]) -> Vec<String> {
-    command
-        .iter()
-        .map(|arg| {
-            let lower = arg.to_ascii_lowercase();
-            if lower.contains("secret")
-                || lower.contains("password")
-                || lower.contains("token")
-                || lower.contains("key=")
-            {
-                "[redacted]".to_string()
-            } else {
-                arg.clone()
-            }
-        })
-        .collect()
-}
-
+// NOTE: a `safe_command_argv` keyword-denylist redactor was removed here. It
+// matched secret keywords against each argv element, which leaks the common
+// `--password <value>` / `-p <value>` / `--token <value>` patterns (the secret
+// is the *next* element, with no keyword). `command_hash` is the safe default:
+// it correlates commands without exposing argv. Any future human-readable argv
+// surface must be opt-in, value-after-flag aware, and labeled not secret-safe.
 fn sandbox_event_builder(
     registry: &ZoneRegistry,
     name: &'static str,
@@ -1423,7 +1411,6 @@ impl SandboxServiceImpl {
         )
         .container_id(container_id.to_string())
         .command_hash(command_hash(&req.command))
-        .command_argv_safe(safe_command_argv(&req.command))
         .image_ref(&req.image)
         .trust_level(TrustLevel::Complete)
         .emit();
@@ -1854,7 +1841,6 @@ impl SandboxService for SandboxServiceImpl {
         .correlation_id(&task_id)
         .image_ref(&req.image)
         .command_hash(command_hash(&req.command))
-        .command_argv_safe(safe_command_argv(&req.command))
         .repo_path_safe(&req.repo_path)
         .backend(
             self.registry.backend_name(),
@@ -2119,19 +2105,6 @@ mod tests {
         let hash = command_hash(&command);
         assert!(hash.starts_with("sha256:"));
         assert!(!hash.contains("super-secret-token"));
-    }
-
-    #[test]
-    fn safe_command_argv_redacts_secret_like_arguments() {
-        let command = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "TOKEN=abc123".to_string(),
-            "echo ok".to_string(),
-        ];
-        let safe = safe_command_argv(&command);
-        assert_eq!(safe[2], "[redacted]");
-        assert_eq!(safe[3], "echo ok");
     }
 
     #[tokio::test]
