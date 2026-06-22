@@ -186,7 +186,7 @@ flowchart TB
 | `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux/macOS backends |
 | `rauha-cli` (`rauha`) | Operator CLI over the daemon's gRPC API |
 | `rauha-common` | Shared types, the `IsolationBackend` trait, policy parsing, sandbox result types, shim IPC protocol |
-| `rauha-enforcer-api` | Enforcement backend trait, kernel-facing policy/event types, capabilities, `NoopEnforcer`, and conformance harness |
+| `rauha-enforcer-api` | Enforcement backend trait, kernel-facing policy/event types, capabilities, `NoopEnforcer`, and shared conformance harness |
 | `rauha-shim` | Per-*zone* sync process (Linux) — forks and runs container processes |
 | `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
@@ -298,8 +298,8 @@ the VM itself, so no cgroups or namespaces are needed.
 
 Syvä is a separate product ([`github.com/false-systems/syva`](https://github.com/false-systems/syva)).
 Current Linux eBPF code may still live in this repository, but architecturally it
-belongs behind the Syvä enforcement boundary; the `rauha-enforce` crate is a
-legacy seed and is not extended. See
+now sits behind the `rauha-enforcer-api` boundary; the `rauha-enforce` crate is
+a legacy seed and is not extended. See
 [`docs/rauha-syva-boundary.md`](docs/rauha-syva-boundary.md).
 
 ## Limitations (honest)
@@ -328,6 +328,19 @@ cargo test                           # all unit tests
 cargo build -p containerd-shim-rauha-v2
 cargo xtask build-ebpf --release     # eBPF object + offsets sidecar for this kernel
 ```
+
+The shared enforcer conformance suite runs against `NoopEnforcer` in ordinary
+tests. The real Linux eBPF backend test is opt-in because it loads programs and
+touches global pinned BPF state under `/sys/fs/bpf/rauha`:
+
+```sh
+RAUHA_RUN_EBPF_CONFORMANCE=1 \
+  cargo test -p rauhad linux_enforcer_passes_basic_conformance -- --nocapture
+```
+
+Run that only as root on an isolated Linux host with the required BPF-LSM
+kernel. If `/sys/fs/bpf/rauha` already contains pins from a daemon or prior run,
+the test skips unless `RAUHA_EBPF_CONFORMANCE_OVERWRITE_PINS=1` is also set.
 
 Run the daemon and drive it with the CLI:
 
@@ -358,10 +371,10 @@ bash tests/integration/test-cgroup-lock.sh     # eBPF enforcement required
 
 ## Roadmap
 
-- Move the in-repo Linux eBPF/maps/events path behind `rauha-enforcer-api`
-  without behavior changes.
+- Keep the in-repo Linux eBPF/maps/events path behind `rauha-enforcer-api` while
+  the external Syvä backend is integrated.
 - Add external Syvä integration as another `rauha-enforcer-api` backend and
-  prove parity with the conformance harness.
+  prove parity with the shared conformance harness.
 - A privileged Syvä/Rauha kernel-enforcement test suite.
 - Kubernetes installation docs and `RuntimeClass` examples; deeper workload
   discovery for existing clusters.
