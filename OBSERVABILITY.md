@@ -3,7 +3,12 @@
 Ownership reading for this PR: Syva is the eBPF LSM enforcer. `rauha-evidence`
 is Rauha's evidence/observability surface. It consumes raw Syva/backend records
 plus Rauha lifecycle events and owns schema, projections, and sinks. It does not
-enforce policy and does not add sandbox execution.
+enforce policy.
+
+For the current structured runtime event contract and audit inventory, see:
+
+- [`docs/observability-contract.md`](docs/observability-contract.md)
+- [`docs/observability-audit.md`](docs/observability-audit.md)
 
 ## Data Path
 
@@ -29,13 +34,15 @@ That adapter is intentionally not implemented in this observe-only pass.
 All event names are constants in `rauha_evidence::event_name`. The message
 position is stable; variance belongs in event fields.
 
-Reserved sandbox names are present in the schema:
+Sandbox runtime names are present in the schema and emitted by `rauhad` during
+task execution:
 
-- `task.started`
-- `task.succeeded`
-- `task.failed`
-
-They are not emitted until the separate sandbox runtime PR.
+- `rauha.sandbox.run.started`
+- `rauha.sandbox.command.started`
+- `rauha.sandbox.command.exited`
+- `rauha.sandbox.result.built`
+- `rauha.sandbox.run.succeeded`
+- `rauha.sandbox.run.failed`
 
 ## Projections
 

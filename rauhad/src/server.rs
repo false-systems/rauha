@@ -4,9 +4,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use rauha_common::error::RauhaError;
-use rauha_evidence::{FalseEvent, FieldValue};
+use rauha_evidence::{
+    event_name, EnforcementMode, EventKind, EventOutcome, FalseEvent, FieldValue,
+    RuntimeEventBuilder, Severity, TrustLevel,
+};
 #[cfg(target_os = "linux")]
-use rauha_evidence::{event_name, FalseEventBuilder, ResourceAttrs, Severity, BACKEND_LINUX_EBPF};
+use rauha_evidence::{FalseEventBuilder, ResourceAttrs, BACKEND_LINUX_EBPF};
 
 use crate::zone::registry::ZoneRegistry;
 
@@ -52,10 +55,10 @@ pub mod pb {
     }
 }
 
-use pb::zone::zone_service_server::ZoneService;
 use pb::container::container_service_server::ContainerService;
 use pb::image::image_service_server::ImageService;
 use pb::sandbox::sandbox_service_server::SandboxService;
+use pb::zone::zone_service_server::ZoneService;
 
 // --- Zone Service ---
 
@@ -71,8 +74,9 @@ impl ZoneServiceImpl {
     pub fn new(
         registry: Arc<ZoneRegistry>,
         root: String,
-        #[cfg(target_os = "linux")]
-        event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
+        #[cfg(target_os = "linux")] event_tx: Option<
+            tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>,
+        >,
     ) -> Self {
         Self {
             registry,
@@ -149,11 +153,7 @@ impl ZoneService for ZoneServiceImpl {
         request: Request<pb::zone::GetZoneRequest>,
     ) -> Result<Response<pb::zone::GetZoneResponse>, Status> {
         let req = request.into_inner();
-        let zone = self
-            .registry
-            .get_zone(&req.name)
-            .await
-            .map_err(to_status)?;
+        let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
 
         let containers = self
             .registry
@@ -176,10 +176,7 @@ impl ZoneService for ZoneServiceImpl {
         &self,
         _request: Request<pb::zone::ListZonesRequest>,
     ) -> Result<Response<pb::zone::ListZonesResponse>, Status> {
-        let zones = self
-            .registry
-            .list_zones()
-            .map_err(to_status)?;
+        let zones = self.registry.list_zones().map_err(to_status)?;
 
         let zone_infos = zones
             .into_iter()
@@ -218,9 +215,8 @@ impl ZoneService for ZoneServiceImpl {
             )));
         }
 
-        let (_zone_type, policy) =
-            crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let (_zone_type, policy) = crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         self.registry
             .apply_policy(&req.zone_name, policy)
@@ -241,8 +237,7 @@ impl ZoneService for ZoneServiceImpl {
             .await
             .map_err(to_status)?;
 
-        let toml =
-            crate::zone::policy::policy_to_toml(&zone.name, zone.zone_type, &zone.policy);
+        let toml = crate::zone::policy::policy_to_toml(&zone.name, zone.zone_type, &zone.policy);
 
         Ok(Response::new(pb::zone::GetPolicyResponse {
             policy_toml: toml,
@@ -646,7 +641,11 @@ impl ContainerService for ContainerServiceImpl {
         let start = match in_stream.next().await {
             Some(Ok(msg)) => match msg.message {
                 Some(pb::container::exec_stream_request::Message::Start(s)) => s,
-                _ => return Err(Status::invalid_argument("first message must be ExecStreamStart")),
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "first message must be ExecStreamStart",
+                    ))
+                }
             },
             _ => return Err(Status::invalid_argument("empty stream")),
         };
@@ -673,7 +672,11 @@ impl ContainerService for ContainerServiceImpl {
         let exec_req = rauha_common::shim::ShimRequest::Exec {
             id: container_id.to_string(),
             command: start.command,
-            env: start.env.into_iter().map(|(k, v)| format!("{k}={v}")).collect(),
+            env: start
+                .env
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect(),
             pty: start.tty,
         };
 
@@ -719,9 +722,7 @@ impl ContainerService for ContainerServiceImpl {
                     .registry
                     .connect_exec_vsock(&zone_name, port)
                     .await
-                    .map_err(|e| {
-                        Status::internal(format!("failed to connect exec vsock: {e}"))
-                    })?;
+                    .map_err(|e| Status::internal(format!("failed to connect exec vsock: {e}")))?;
                 let (r, w) = tokio::io::split(stream);
                 spawn_exec_relay(
                     r,
@@ -783,7 +784,11 @@ impl ContainerService for ContainerServiceImpl {
         let start = match in_stream.next().await {
             Some(Ok(msg)) => match msg.message {
                 Some(pb::container::attach_request::Message::Start(s)) => s,
-                _ => return Err(Status::invalid_argument("first message must be AttachStart")),
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "first message must be AttachStart",
+                    ))
+                }
             },
             _ => return Err(Status::invalid_argument("empty stream")),
         };
@@ -913,11 +918,9 @@ fn spawn_exec_relay<R, W>(
                 Ok(0) => break,
                 Ok(n) => {
                     let resp = pb::container::ExecStreamResponse {
-                        message: Some(
-                            pb::container::exec_stream_response::Message::StdoutData(
-                                buf[..n].to_vec(),
-                            ),
-                        ),
+                        message: Some(pb::container::exec_stream_response::Message::StdoutData(
+                            buf[..n].to_vec(),
+                        )),
                     };
                     if tx.send(Ok(resp)).await.is_err() {
                         break;
@@ -1050,10 +1053,7 @@ impl ImageService for ImageServiceImpl {
         &self,
         _request: Request<pb::image::ListImagesRequest>,
     ) -> Result<Response<pb::image::ListImagesResponse>, Status> {
-        let images = self
-            .image_service
-            .list_images()
-            .map_err(to_status)?;
+        let images = self.image_service.list_images().map_err(to_status)?;
 
         let infos = images
             .into_iter()
@@ -1112,6 +1112,55 @@ use rauha_common::sandbox::{
 };
 
 const SANDBOX_LOG_MAX_BYTES_PER_STREAM: usize = 1024 * 1024;
+
+fn command_hash(command: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for arg in command {
+        hasher.update(arg.as_bytes());
+        hasher.update([0]);
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn safe_command_argv(command: &[String]) -> Vec<String> {
+    command
+        .iter()
+        .map(|arg| {
+            let lower = arg.to_ascii_lowercase();
+            if lower.contains("secret")
+                || lower.contains("password")
+                || lower.contains("token")
+                || lower.contains("key=")
+            {
+                "[redacted]".to_string()
+            } else {
+                arg.clone()
+            }
+        })
+        .collect()
+}
+
+fn sandbox_event_builder(
+    registry: &ZoneRegistry,
+    name: &'static str,
+    outcome: EventOutcome,
+    task_id: &str,
+    zone_name: &str,
+    zone_id: &str,
+) -> RuntimeEventBuilder {
+    RuntimeEventBuilder::new(name, EventKind::Execution, outcome)
+        .task_id(task_id)
+        .correlation_id(task_id)
+        .zone_name(zone_name)
+        .zone_id(zone_id)
+        .backend(
+            registry.backend_name(),
+            registry.backend_platform(),
+            registry.enforcement_mode(),
+        )
+}
 
 pub struct SandboxServiceImpl {
     registry: Arc<ZoneRegistry>,
@@ -1223,6 +1272,19 @@ impl SandboxServiceImpl {
         zone_id: &str,
         req: &pb::sandbox::RunSandboxRequest,
     ) -> std::result::Result<SandboxExecResult, String> {
+        sandbox_event_builder(
+            &self.registry,
+            event_name::FS_ROOTFS_PREPARE_STARTED,
+            EventOutcome::Started,
+            task_id,
+            zone_name,
+            zone_id,
+        )
+        .image_ref(&req.image)
+        .command_hash(command_hash(&req.command))
+        .trust_level(TrustLevel::Complete)
+        .emit();
+
         let spec = rauha_common::container::ContainerSpec {
             name: format!("{task_id}-task"),
             image: req.image.clone(),
@@ -1238,12 +1300,37 @@ impl SandboxServiceImpl {
             .create_container(zone_name, spec)
             .await
             .map_err(|e| {
+                sandbox_event_builder(
+                    &self.registry,
+                    event_name::FS_ROOTFS_PREPARE_FAILED,
+                    EventOutcome::Failed,
+                    task_id,
+                    zone_name,
+                    zone_id,
+                )
+                .level(Severity::Error)
+                .image_ref(&req.image)
+                .error("container_create_failed", "runtime", e.to_string())
+                .emit();
                 format!(
                     "failed to create container (is the image pulled? `rauha image pull {}`): {e}",
                     req.image
                 )
             })?;
         let mut cleanup = ContainerCleanupGuard::new(self.registry.clone(), container.id);
+
+        sandbox_event_builder(
+            &self.registry,
+            event_name::FS_ROOTFS_PREPARE_SUCCEEDED,
+            EventOutcome::Succeeded,
+            task_id,
+            zone_name,
+            zone_id,
+        )
+        .container_id(container.id.to_string())
+        .image_ref(&req.image)
+        .trust_level(TrustLevel::Complete)
+        .emit();
 
         // Everything past container creation must still clean up the container,
         // so capture the outcome and delete unconditionally afterwards. The
@@ -1254,6 +1341,32 @@ impl SandboxServiceImpl {
 
         if let Err(e) = self.registry.delete_container(&container.id, true).await {
             tracing::warn!(container = %container.id, %e, "failed to delete sandbox container");
+            sandbox_event_builder(
+                &self.registry,
+                event_name::SANDBOX_CLEANUP_PARTIAL,
+                EventOutcome::Degraded,
+                task_id,
+                zone_name,
+                zone_id,
+            )
+            .level(Severity::Warn)
+            .container_id(container.id.to_string())
+            .error("container_cleanup_failed", "cleanup", e.to_string())
+            .trust_level(TrustLevel::Partial)
+            .degraded_reason("container_delete_failed")
+            .emit();
+        } else {
+            sandbox_event_builder(
+                &self.registry,
+                event_name::SANDBOX_CLEANUP_SUCCEEDED,
+                EventOutcome::Succeeded,
+                task_id,
+                zone_name,
+                zone_id,
+            )
+            .container_id(container.id.to_string())
+            .trust_level(TrustLevel::Complete)
+            .emit();
         }
         cleanup.disarm();
 
@@ -1273,6 +1386,13 @@ impl SandboxServiceImpl {
         // Begin capturing kernel enforcement events for this task's zone before
         // the workload starts, so nothing between start and exit is missed.
         let capture = self.begin_enforcement_capture(zone_name).await;
+        emit_enforcement_capture_state(
+            &self.registry,
+            task_id,
+            zone_name,
+            zone_id,
+            capture.as_ref(),
+        );
 
         let started_at = chrono::Utc::now();
         self.registry
@@ -1280,6 +1400,33 @@ impl SandboxServiceImpl {
             .await
             .map_err(|e| format!("failed to start container: {e}"))?;
         events.push(event("container.started", "sandbox container started"));
+        sandbox_event_builder(
+            &self.registry,
+            event_name::SANDBOX_CONTAINER_STARTED,
+            EventOutcome::Started,
+            task_id,
+            zone_name,
+            zone_id,
+        )
+        .container_id(container_id.to_string())
+        .command_hash(command_hash(&req.command))
+        .image_ref(&req.image)
+        .trust_level(TrustLevel::Complete)
+        .emit();
+        sandbox_event_builder(
+            &self.registry,
+            event_name::SANDBOX_COMMAND_STARTED,
+            EventOutcome::Started,
+            task_id,
+            zone_name,
+            zone_id,
+        )
+        .container_id(container_id.to_string())
+        .command_hash(command_hash(&req.command))
+        .command_argv_safe(safe_command_argv(&req.command))
+        .image_ref(&req.image)
+        .trust_level(TrustLevel::Complete)
+        .emit();
 
         let timeout = (req.timeout_seconds > 0)
             .then(|| std::time::Duration::from_secs(req.timeout_seconds as u64));
@@ -1287,13 +1434,51 @@ impl SandboxServiceImpl {
 
         if timed_out {
             let _ = self.registry.stop_container(container_id, 5).await;
-            events.push(event("container.timed_out", "sandbox task exceeded timeout"));
+            events.push(event(
+                "container.timed_out",
+                "sandbox task exceeded timeout",
+            ));
         } else {
             events.push(event("container.exited", "sandbox container exited"));
         }
 
         let finished_at = chrono::Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds().max(0) as u64;
+        sandbox_event_builder(
+            &self.registry,
+            if timed_out {
+                event_name::SANDBOX_COMMAND_TIMED_OUT
+            } else {
+                event_name::SANDBOX_COMMAND_EXITED
+            },
+            if timed_out {
+                EventOutcome::TimedOut
+            } else {
+                EventOutcome::Succeeded
+            },
+            task_id,
+            zone_name,
+            zone_id,
+        )
+        .level(if timed_out {
+            Severity::Warn
+        } else {
+            Severity::Info
+        })
+        .container_id(container_id.to_string())
+        .duration_ms(duration_ms)
+        .field(
+            "exit_code",
+            exit_code
+                .map(|code| FieldValue::I64(code as i64))
+                .unwrap_or_else(|| FieldValue::String("none".into())),
+        )
+        .trust_level(if timed_out {
+            TrustLevel::Partial
+        } else {
+            TrustLevel::Complete
+        })
+        .emit();
 
         // Capture stdout/stderr from the shim-written log files (blocking I/O),
         // bounded so a chatty task cannot exceed tonic's default message size.
@@ -1303,6 +1488,30 @@ impl SandboxServiceImpl {
         })
         .await
         .unwrap_or_default();
+        sandbox_event_builder(
+            &self.registry,
+            event_name::SANDBOX_STDOUT_CAPTURED,
+            EventOutcome::Succeeded,
+            task_id,
+            zone_name,
+            zone_id,
+        )
+        .container_id(container_id.to_string())
+        .field("bytes", FieldValue::U64(stdout.len() as u64))
+        .trust_level(TrustLevel::Complete)
+        .emit();
+        sandbox_event_builder(
+            &self.registry,
+            event_name::SANDBOX_STDERR_CAPTURED,
+            EventOutcome::Succeeded,
+            task_id,
+            zone_name,
+            zone_id,
+        )
+        .container_id(container_id.to_string())
+        .field("bytes", FieldValue::U64(stderr.len() as u64))
+        .trust_level(TrustLevel::Complete)
+        .emit();
 
         let status = if timed_out {
             SandboxStatus::TimedOut
@@ -1311,6 +1520,27 @@ impl SandboxServiceImpl {
         } else {
             SandboxStatus::Failed
         };
+
+        let enforcement_events = drain_enforcement_capture(capture);
+        sandbox_event_builder(
+            &self.registry,
+            event_name::SANDBOX_RESULT_BUILT,
+            EventOutcome::Succeeded,
+            task_id,
+            zone_name,
+            zone_id,
+        )
+        .container_id(container_id.to_string())
+        .duration_ms(duration_ms)
+        .field(
+            "enforcement_event_count",
+            FieldValue::U64(enforcement_events.len() as u64),
+        )
+        .field("stdout_bytes", FieldValue::U64(stdout.len() as u64))
+        .field("stderr_bytes", FieldValue::U64(stderr.len() as u64))
+        .trust_level(TrustLevel::BestEffort)
+        .degraded_reason("enforcement_capture_is_best_effort")
+        .emit();
 
         Ok(SandboxExecResult {
             task_id: task_id.to_string(),
@@ -1325,7 +1555,7 @@ impl SandboxServiceImpl {
             finished_at: Some(finished_at),
             events,
             // Drain the events that landed on this task's zone while it ran.
-            enforcement_events: drain_enforcement_capture(capture),
+            enforcement_events,
         })
     }
 
@@ -1373,6 +1603,77 @@ impl SandboxServiceImpl {
             rx: tx.subscribe(),
             kernel_zone_id: self.registry.kernel_zone_id(zone_name).await,
         })
+    }
+}
+
+fn emit_enforcement_capture_state(
+    registry: &ZoneRegistry,
+    task_id: &str,
+    zone_name: &str,
+    zone_id: &str,
+    capture: Option<&EnforcementCapture>,
+) {
+    match capture {
+        Some(capture) if capture.kernel_zone_id.is_some() => {
+            RuntimeEventBuilder::new(
+                event_name::ENFORCEMENT_CAPTURE_BEST_EFFORT,
+                EventKind::Enforcement,
+                EventOutcome::Degraded,
+            )
+            .level(Severity::Warn)
+            .task_id(task_id)
+            .correlation_id(task_id)
+            .zone_name(zone_name)
+            .zone_id(zone_id)
+            .backend(
+                registry.backend_name(),
+                registry.backend_platform(),
+                registry.enforcement_mode(),
+            )
+            .trust_level(TrustLevel::BestEffort)
+            .degraded_reason("daemon_wide_broadcast_scoped_by_kernel_zone_id")
+            .emit();
+        }
+        Some(_) => {
+            RuntimeEventBuilder::new(
+                event_name::ENFORCEMENT_CAPTURE_INCOMPLETE,
+                EventKind::Enforcement,
+                EventOutcome::Degraded,
+            )
+            .level(Severity::Warn)
+            .task_id(task_id)
+            .correlation_id(task_id)
+            .zone_name(zone_name)
+            .zone_id(zone_id)
+            .backend(
+                registry.backend_name(),
+                registry.backend_platform(),
+                registry.enforcement_mode(),
+            )
+            .trust_level(TrustLevel::Partial)
+            .degraded_reason("kernel_zone_id_unavailable")
+            .emit();
+        }
+        None => {
+            RuntimeEventBuilder::new(
+                event_name::ENFORCER_UNAVAILABLE,
+                EventKind::Enforcement,
+                EventOutcome::Skipped,
+            )
+            .level(Severity::Warn)
+            .task_id(task_id)
+            .correlation_id(task_id)
+            .zone_name(zone_name)
+            .zone_id(zone_id)
+            .backend(
+                registry.backend_name(),
+                registry.backend_platform(),
+                EnforcementMode::Unavailable,
+            )
+            .trust_level(TrustLevel::Unavailable)
+            .degraded_reason("enforcement_event_broadcast_unavailable")
+            .emit();
+        }
     }
 }
 
@@ -1543,15 +1844,61 @@ impl SandboxService for SandboxServiceImpl {
         request: Request<pb::sandbox::RunSandboxRequest>,
     ) -> Result<Response<pb::sandbox::SandboxResult>, Status> {
         let req = request.into_inner();
-        validate_sandbox_request(&req)?;
-
         let task_id = format!("task-{}", uuid::Uuid::new_v4());
+        RuntimeEventBuilder::new(
+            event_name::SANDBOX_RUN_STARTED,
+            EventKind::Execution,
+            EventOutcome::Started,
+        )
+        .task_id(&task_id)
+        .correlation_id(&task_id)
+        .image_ref(&req.image)
+        .command_hash(command_hash(&req.command))
+        .command_argv_safe(safe_command_argv(&req.command))
+        .repo_path_safe(&req.repo_path)
+        .backend(
+            self.registry.backend_name(),
+            self.registry.backend_platform(),
+            self.registry.enforcement_mode(),
+        )
+        .trust_level(TrustLevel::BestEffort)
+        .degraded_reason("enforcement_capture_status_reported_separately")
+        .emit();
+
+        if let Err(status) = validate_sandbox_request(&req) {
+            RuntimeEventBuilder::new(
+                event_name::SANDBOX_RUN_FAILED,
+                EventKind::Execution,
+                EventOutcome::Failed,
+            )
+            .level(Severity::Warn)
+            .task_id(&task_id)
+            .correlation_id(&task_id)
+            .image_ref(&req.image)
+            .command_hash(command_hash(&req.command))
+            .backend(
+                self.registry.backend_name(),
+                self.registry.backend_platform(),
+                self.registry.enforcement_mode(),
+            )
+            .error(
+                "sandbox_request_invalid",
+                format!("{:?}", status.code()),
+                status.message().to_string(),
+            )
+            .trust_level(TrustLevel::Complete)
+            .emit();
+            return Err(status);
+        }
 
         // Resolve the zone. An empty name allocates a temporary zone that we own
         // and (by default) delete afterwards; a named zone must already exist
         // and is left intact.
         let (zone_name, zone_id, temp_zone) = if req.name.trim().is_empty() {
-            let name = format!("sandbox-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+            let name = format!(
+                "sandbox-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            );
             let zone = self
                 .registry
                 .create_zone(
@@ -1561,6 +1908,16 @@ impl SandboxService for SandboxServiceImpl {
                 )
                 .await
                 .map_err(to_status)?;
+            sandbox_event_builder(
+                &self.registry,
+                event_name::SANDBOX_ZONE_ALLOCATED,
+                EventOutcome::Succeeded,
+                &task_id,
+                &zone.name,
+                &zone.id.to_string(),
+            )
+            .trust_level(TrustLevel::Complete)
+            .emit();
             (zone.name, zone.id.to_string(), true)
         } else {
             let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
@@ -1569,12 +1926,27 @@ impl SandboxService for SandboxServiceImpl {
         let mut zone_cleanup = (temp_zone && !req.keep_zone)
             .then(|| ZoneCleanupGuard::new(self.registry.clone(), zone_name.clone()));
 
-        let outcome = self.execute_task(&task_id, &zone_name, &zone_id, &req).await;
+        let outcome = self
+            .execute_task(&task_id, &zone_name, &zone_id, &req)
+            .await;
 
         // Tear down the temporary zone unless the caller asked to keep it.
         if temp_zone && !req.keep_zone {
             if let Err(e) = self.registry.delete_zone(&zone_name, true).await {
                 tracing::warn!(zone = zone_name, %e, "failed to delete temporary sandbox zone");
+                sandbox_event_builder(
+                    &self.registry,
+                    event_name::SANDBOX_CLEANUP_PARTIAL,
+                    EventOutcome::Degraded,
+                    &task_id,
+                    &zone_name,
+                    &zone_id,
+                )
+                .level(Severity::Warn)
+                .error("zone_cleanup_failed", "cleanup", e.to_string())
+                .trust_level(TrustLevel::Partial)
+                .degraded_reason("temporary_zone_delete_failed")
+                .emit();
             }
             if let Some(cleanup) = &mut zone_cleanup {
                 cleanup.disarm();
@@ -1584,6 +1956,46 @@ impl SandboxService for SandboxServiceImpl {
         let exec = outcome.unwrap_or_else(|message| {
             SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
         });
+        let run_event = match exec.status {
+            SandboxStatus::Succeeded => (
+                event_name::SANDBOX_RUN_SUCCEEDED,
+                EventOutcome::Succeeded,
+                Severity::Info,
+            ),
+            SandboxStatus::Failed | SandboxStatus::RuntimeError => (
+                event_name::SANDBOX_RUN_FAILED,
+                EventOutcome::Failed,
+                Severity::Warn,
+            ),
+            SandboxStatus::TimedOut => (
+                event_name::SANDBOX_RUN_FAILED,
+                EventOutcome::TimedOut,
+                Severity::Warn,
+            ),
+        };
+        sandbox_event_builder(
+            &self.registry,
+            run_event.0,
+            run_event.1,
+            &task_id,
+            &zone_name,
+            &zone_id,
+        )
+        .level(run_event.2)
+        .duration_ms(exec.duration_ms)
+        .field(
+            "status",
+            FieldValue::String(sandbox_status_str(exec.status).to_string()),
+        )
+        .field(
+            "exit_code",
+            exec.exit_code
+                .map(|code| FieldValue::I64(code as i64))
+                .unwrap_or_else(|| FieldValue::String("none".into())),
+        )
+        .trust_level(TrustLevel::BestEffort)
+        .degraded_reason("enforcement_events_are_best_effort")
+        .emit();
 
         Ok(Response::new(to_proto_result(exec)))
     }
@@ -1699,6 +2111,27 @@ mod tests {
     #[test]
     fn drain_without_capture_yields_no_events() {
         assert!(drain_enforcement_capture(None).is_empty());
+    }
+
+    #[test]
+    fn command_hash_does_not_expose_command_payload() {
+        let command = vec!["echo".to_string(), "super-secret-token".to_string()];
+        let hash = command_hash(&command);
+        assert!(hash.starts_with("sha256:"));
+        assert!(!hash.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn safe_command_argv_redacts_secret_like_arguments() {
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "TOKEN=abc123".to_string(),
+            "echo ok".to_string(),
+        ];
+        let safe = safe_command_argv(&command);
+        assert_eq!(safe[2], "[redacted]");
+        assert_eq!(safe[3], "echo ok");
     }
 
     #[tokio::test]

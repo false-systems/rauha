@@ -17,6 +17,91 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod event_name {
+    pub const DAEMON_START: &str = "rauha.daemon.start";
+    pub const DAEMON_READY: &str = "rauha.daemon.ready";
+    pub const DAEMON_SHUTDOWN: &str = "rauha.daemon.shutdown";
+    pub const BACKEND_SELECTED: &str = "rauha.backend.selected";
+    pub const BACKEND_CAPABILITY_DETECTED: &str = "rauha.backend.capability_detected";
+    pub const BACKEND_CAPABILITY_MISSING: &str = "rauha.backend.capability_missing";
+    pub const BACKEND_DEGRADED: &str = "rauha.backend.degraded";
+    pub const ENFORCER_SELECTED: &str = "rauha.enforcer.selected";
+    pub const ENFORCER_CONFORMANCE_CHECKED: &str = "rauha.enforcer.conformance.checked";
+    pub const ENFORCER_UNAVAILABLE: &str = "rauha.enforcer.unavailable";
+    pub const ENFORCER_NOOP_ENABLED: &str = "rauha.enforcer.noop.enabled";
+    pub const RAUHA_ZONE_CREATE_STARTED: &str = "rauha.zone.create.started";
+    pub const RAUHA_ZONE_CREATE_SUCCEEDED: &str = "rauha.zone.create.succeeded";
+    pub const RAUHA_ZONE_CREATE_FAILED: &str = "rauha.zone.create.failed";
+    pub const RAUHA_ZONE_RESTORE_STARTED: &str = "rauha.zone.restore.started";
+    pub const RAUHA_ZONE_RESTORE_SUCCEEDED: &str = "rauha.zone.restore.succeeded";
+    pub const RAUHA_ZONE_RESTORE_FAILED: &str = "rauha.zone.restore.failed";
+    pub const RAUHA_ZONE_DELETE_STARTED: &str = "rauha.zone.delete.started";
+    pub const RAUHA_ZONE_DELETE_SUCCEEDED: &str = "rauha.zone.delete.succeeded";
+    pub const RAUHA_ZONE_DELETE_FAILED: &str = "rauha.zone.delete.failed";
+    pub const RAUHA_ZONE_CLEANUP_STARTED: &str = "rauha.zone.cleanup.started";
+    pub const RAUHA_ZONE_CLEANUP_SUCCEEDED: &str = "rauha.zone.cleanup.succeeded";
+    pub const RAUHA_ZONE_CLEANUP_PARTIAL: &str = "rauha.zone.cleanup.partial";
+    pub const RAUHA_ZONE_CLEANUP_FAILED: &str = "rauha.zone.cleanup.failed";
+    pub const POLICY_LOAD_STARTED: &str = "rauha.policy.load.started";
+    pub const POLICY_LOAD_SUCCEEDED: &str = "rauha.policy.load.succeeded";
+    pub const POLICY_LOAD_FAILED: &str = "rauha.policy.load.failed";
+    pub const POLICY_VALIDATE_SUCCEEDED: &str = "rauha.policy.validate.succeeded";
+    pub const POLICY_VALIDATE_FAILED: &str = "rauha.policy.validate.failed";
+    pub const POLICY_APPLY_STARTED: &str = "rauha.policy.apply.started";
+    pub const POLICY_APPLY_SUCCEEDED: &str = "rauha.policy.apply.succeeded";
+    pub const POLICY_APPLY_FAILED: &str = "rauha.policy.apply.failed";
+    pub const POLICY_AMBIGUOUS_INPUT_REJECTED: &str = "rauha.policy.ambiguous_input.rejected";
+    pub const SANDBOX_RUN_STARTED: &str = "rauha.sandbox.run.started";
+    pub const SANDBOX_ZONE_ALLOCATED: &str = "rauha.sandbox.zone.allocated";
+    pub const SANDBOX_CONTAINER_STARTED: &str = "rauha.sandbox.container.started";
+    pub const SANDBOX_COMMAND_STARTED: &str = "rauha.sandbox.command.started";
+    pub const SANDBOX_COMMAND_EXITED: &str = "rauha.sandbox.command.exited";
+    pub const SANDBOX_COMMAND_TIMED_OUT: &str = "rauha.sandbox.command.timed_out";
+    pub const SANDBOX_COMMAND_CANCELLED: &str = "rauha.sandbox.command.cancelled";
+    pub const SANDBOX_STDOUT_CAPTURED: &str = "rauha.sandbox.stdout.captured";
+    pub const SANDBOX_STDERR_CAPTURED: &str = "rauha.sandbox.stderr.captured";
+    pub const SANDBOX_RESULT_BUILT: &str = "rauha.sandbox.result.built";
+    pub const SANDBOX_CLEANUP_SUCCEEDED: &str = "rauha.sandbox.cleanup.succeeded";
+    pub const SANDBOX_CLEANUP_PARTIAL: &str = "rauha.sandbox.cleanup.partial";
+    pub const SANDBOX_RUN_SUCCEEDED: &str = "rauha.sandbox.run.succeeded";
+    pub const SANDBOX_RUN_FAILED: &str = "rauha.sandbox.run.failed";
+    pub const FS_ROOTFS_PREPARE_STARTED: &str = "rauha.fs.rootfs.prepare.started";
+    pub const FS_ROOTFS_PREPARE_SUCCEEDED: &str = "rauha.fs.rootfs.prepare.succeeded";
+    pub const FS_ROOTFS_PREPARE_FAILED: &str = "rauha.fs.rootfs.prepare.failed";
+    pub const FS_MOUNT_VISIBLE: &str = "rauha.fs.mount.visible";
+    pub const FS_POLICY_APPLIED: &str = "rauha.fs.policy.applied";
+    pub const FS_ACCESS_DENIED: &str = "rauha.fs.access.denied";
+    pub const FS_ACCESS_AUDIT: &str = "rauha.fs.access.audit";
+    pub const NETWORK_NAMESPACE_CREATED: &str = "rauha.network.namespace.created";
+    pub const NETWORK_BRIDGE_CONFIGURED: &str = "rauha.network.bridge.configured";
+    pub const NETWORK_EGRESS_POLICY_APPLIED: &str = "rauha.network.egress.policy.applied";
+    pub const NETWORK_EGRESS_DENIED: &str = "rauha.network.egress.denied";
+    pub const NETWORK_EGRESS_AUDIT: &str = "rauha.network.egress.audit";
+    pub const NETWORK_MODE_AUDIT_ONLY: &str = "rauha.network.mode.audit_only";
+    pub const NETWORK_CLEANUP_SUCCEEDED: &str = "rauha.network.cleanup.succeeded";
+    pub const NETWORK_CLEANUP_FAILED: &str = "rauha.network.cleanup.failed";
+    pub const RESOURCE_CGROUP_CREATED: &str = "rauha.resource.cgroup.created";
+    pub const RESOURCE_LIMIT_APPLIED: &str = "rauha.resource.limit.applied";
+    pub const RESOURCE_LIMIT_FAILED: &str = "rauha.resource.limit.failed";
+    pub const RESOURCE_SAMPLE: &str = "rauha.resource.sample";
+    pub const RESOURCE_PRESSURE_DETECTED: &str = "rauha.resource.pressure.detected";
+    pub const RESOURCE_OOM_DETECTED: &str = "rauha.resource.oom.detected";
+    pub const ENFORCEMENT_POLICY_LOADED: &str = "rauha.enforcement.policy.loaded";
+    pub const ENFORCEMENT_MAP_UPDATED: &str = "rauha.enforcement.map.updated";
+    pub const ENFORCEMENT_EVENT_RECEIVED: &str = "rauha.enforcement.event.received";
+    pub const ENFORCEMENT_DENY: &str = "rauha.enforcement.deny";
+    pub const ENFORCEMENT_AUDIT: &str = "rauha.enforcement.audit";
+    pub const ENFORCEMENT_COUNTER_UPDATED: &str = "rauha.enforcement.counter.updated";
+    pub const ENFORCEMENT_BROADCAST_LAG_DETECTED: &str = "rauha.enforcement.broadcast.lag_detected";
+    pub const ENFORCEMENT_CAPTURE_BEST_EFFORT: &str = "rauha.enforcement.capture.best_effort";
+    pub const ENFORCEMENT_CAPTURE_INCOMPLETE: &str = "rauha.enforcement.capture.incomplete";
+    pub const CONTAINERD_TASK_CREATE_STARTED: &str = "rauha.containerd.task.create.started";
+    pub const CONTAINERD_TASK_CREATE_SUCCEEDED: &str = "rauha.containerd.task.create.succeeded";
+    pub const CONTAINERD_TASK_CREATE_FAILED: &str = "rauha.containerd.task.create.failed";
+    pub const K8S_RUNTIMECLASS_ZONE_MAPPED: &str = "rauha.k8s.runtimeclass.zone.mapped";
+    pub const K8S_POD_SANDBOX_MAPPED: &str = "rauha.k8s.pod.sandbox.mapped";
+    pub const K8S_IDENTITY_MISSING: &str = "rauha.k8s.identity.missing";
+    pub const K8S_IDENTITY_RESOLVED: &str = "rauha.k8s.identity.resolved";
+
     pub const ZONE_FILE_DENIED: &str = "zone.file.denied";
     pub const ZONE_FILE_ALLOWED: &str = "zone.file.allowed";
     pub const ZONE_EXEC_DENIED: &str = "zone.exec.denied";
@@ -49,6 +134,467 @@ pub const BACKEND_LINUX_EBPF: &str = "linux-ebpf";
 pub const BACKEND_MACOS_VM: &str = "macos-vm";
 
 const MAX_FIELD_CHARS: usize = 4096;
+pub const RUNTIME_EVENT_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    Lifecycle,
+    Policy,
+    Execution,
+    Filesystem,
+    Network,
+    Resource,
+    Enforcement,
+    Audit,
+    Cleanup,
+    Backend,
+    Error,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lifecycle => "lifecycle",
+            Self::Policy => "policy",
+            Self::Execution => "execution",
+            Self::Filesystem => "filesystem",
+            Self::Network => "network",
+            Self::Resource => "resource",
+            Self::Enforcement => "enforcement",
+            Self::Audit => "audit",
+            Self::Cleanup => "cleanup",
+            Self::Backend => "backend",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventOutcome {
+    Started,
+    Succeeded,
+    Failed,
+    Denied,
+    Allowed,
+    Skipped,
+    Degraded,
+    TimedOut,
+    Cancelled,
+}
+
+impl EventOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Denied => "denied",
+            Self::Allowed => "allowed",
+            Self::Skipped => "skipped",
+            Self::Degraded => "degraded",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevel {
+    Complete,
+    Partial,
+    BestEffort,
+    Unavailable,
+}
+
+impl TrustLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::BestEffort => "best_effort",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+    Enforcing,
+    AuditOnly,
+    Noop,
+    Unavailable,
+}
+
+impl EnforcementMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforcing => "enforcing",
+            Self::AuditOnly => "audit_only",
+            Self::Noop => "noop",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeEvent {
+    pub timestamp: String,
+    pub level: Severity,
+    #[serde(rename = "event.name")]
+    pub event_name: String,
+    #[serde(rename = "event.version")]
+    pub event_version: u32,
+    #[serde(rename = "event.kind")]
+    pub event_kind: EventKind,
+    #[serde(rename = "event.outcome")]
+    pub event_outcome: EventOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_argv_safe: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_path_safe: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_hash: Option<String>,
+    #[serde(rename = "backend.name", skip_serializing_if = "Option::is_none")]
+    pub backend_name: Option<String>,
+    #[serde(rename = "backend.platform", skip_serializing_if = "Option::is_none")]
+    pub backend_platform: Option<String>,
+    #[serde(
+        rename = "backend.enforcement_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub backend_enforcement_mode: Option<EnforcementMode>,
+    #[serde(rename = "enforcer.backend", skip_serializing_if = "Option::is_none")]
+    pub enforcer_backend: Option<String>,
+    #[serde(
+        rename = "enforcer.capabilities",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enforcer_capabilities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(rename = "error.code", skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(rename = "error.kind", skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(rename = "error.message", skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_level: Option<TrustLevel>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, FieldValue>,
+}
+
+impl RuntimeEvent {
+    pub fn machine_json(&self) -> Result<String, EvidenceError> {
+        serde_json::to_string(self).map_err(EvidenceError::Serialize)
+    }
+
+    pub fn emit_tracing(&self) {
+        match self.level {
+            Severity::Trace => self.emit_trace(),
+            Severity::Info => self.emit_info(),
+            Severity::Warn => self.emit_warn(),
+            Severity::Error => self.emit_error(),
+        }
+    }
+
+    fn emit_trace(&self) {
+        tracing::trace!(
+            event.name = %self.event_name,
+            event.version = self.event_version,
+            event.kind = %self.event_kind.as_str(),
+            event.outcome = %self.event_outcome.as_str(),
+            task_id = self.task_id.as_deref().unwrap_or(""),
+            zone_id = self.zone_id.as_deref().unwrap_or(""),
+            zone_name = self.zone_name.as_deref().unwrap_or(""),
+            container_id = self.container_id.as_deref().unwrap_or(""),
+            backend.name = self.backend_name.as_deref().unwrap_or(""),
+            backend.platform = self.backend_platform.as_deref().unwrap_or(""),
+            backend.enforcement_mode = self.backend_enforcement_mode.map(EnforcementMode::as_str).unwrap_or(""),
+            enforcer.backend = self.enforcer_backend.as_deref().unwrap_or(""),
+            correlation_id = self.correlation_id.as_deref().unwrap_or(""),
+            request_id = self.request_id.as_deref().unwrap_or(""),
+            trust_level = self.trust_level.map(TrustLevel::as_str).unwrap_or(""),
+            error.code = self.error_code.as_deref().unwrap_or(""),
+            error.kind = self.error_kind.as_deref().unwrap_or(""),
+            degraded_reason = self.degraded_reason.as_deref().unwrap_or(""),
+            "rauha.evidence"
+        );
+    }
+
+    fn emit_info(&self) {
+        tracing::info!(
+            event.name = %self.event_name,
+            event.version = self.event_version,
+            event.kind = %self.event_kind.as_str(),
+            event.outcome = %self.event_outcome.as_str(),
+            task_id = self.task_id.as_deref().unwrap_or(""),
+            zone_id = self.zone_id.as_deref().unwrap_or(""),
+            zone_name = self.zone_name.as_deref().unwrap_or(""),
+            container_id = self.container_id.as_deref().unwrap_or(""),
+            backend.name = self.backend_name.as_deref().unwrap_or(""),
+            backend.platform = self.backend_platform.as_deref().unwrap_or(""),
+            backend.enforcement_mode = self.backend_enforcement_mode.map(EnforcementMode::as_str).unwrap_or(""),
+            enforcer.backend = self.enforcer_backend.as_deref().unwrap_or(""),
+            correlation_id = self.correlation_id.as_deref().unwrap_or(""),
+            request_id = self.request_id.as_deref().unwrap_or(""),
+            trust_level = self.trust_level.map(TrustLevel::as_str).unwrap_or(""),
+            error.code = self.error_code.as_deref().unwrap_or(""),
+            error.kind = self.error_kind.as_deref().unwrap_or(""),
+            degraded_reason = self.degraded_reason.as_deref().unwrap_or(""),
+            "rauha.evidence"
+        );
+    }
+
+    fn emit_warn(&self) {
+        tracing::warn!(
+            event.name = %self.event_name,
+            event.version = self.event_version,
+            event.kind = %self.event_kind.as_str(),
+            event.outcome = %self.event_outcome.as_str(),
+            task_id = self.task_id.as_deref().unwrap_or(""),
+            zone_id = self.zone_id.as_deref().unwrap_or(""),
+            zone_name = self.zone_name.as_deref().unwrap_or(""),
+            container_id = self.container_id.as_deref().unwrap_or(""),
+            backend.name = self.backend_name.as_deref().unwrap_or(""),
+            backend.platform = self.backend_platform.as_deref().unwrap_or(""),
+            backend.enforcement_mode = self.backend_enforcement_mode.map(EnforcementMode::as_str).unwrap_or(""),
+            enforcer.backend = self.enforcer_backend.as_deref().unwrap_or(""),
+            correlation_id = self.correlation_id.as_deref().unwrap_or(""),
+            request_id = self.request_id.as_deref().unwrap_or(""),
+            trust_level = self.trust_level.map(TrustLevel::as_str).unwrap_or(""),
+            error.code = self.error_code.as_deref().unwrap_or(""),
+            error.kind = self.error_kind.as_deref().unwrap_or(""),
+            degraded_reason = self.degraded_reason.as_deref().unwrap_or(""),
+            "rauha.evidence"
+        );
+    }
+
+    fn emit_error(&self) {
+        tracing::error!(
+            event.name = %self.event_name,
+            event.version = self.event_version,
+            event.kind = %self.event_kind.as_str(),
+            event.outcome = %self.event_outcome.as_str(),
+            task_id = self.task_id.as_deref().unwrap_or(""),
+            zone_id = self.zone_id.as_deref().unwrap_or(""),
+            zone_name = self.zone_name.as_deref().unwrap_or(""),
+            container_id = self.container_id.as_deref().unwrap_or(""),
+            backend.name = self.backend_name.as_deref().unwrap_or(""),
+            backend.platform = self.backend_platform.as_deref().unwrap_or(""),
+            backend.enforcement_mode = self.backend_enforcement_mode.map(EnforcementMode::as_str).unwrap_or(""),
+            enforcer.backend = self.enforcer_backend.as_deref().unwrap_or(""),
+            correlation_id = self.correlation_id.as_deref().unwrap_or(""),
+            request_id = self.request_id.as_deref().unwrap_or(""),
+            trust_level = self.trust_level.map(TrustLevel::as_str).unwrap_or(""),
+            error.code = self.error_code.as_deref().unwrap_or(""),
+            error.kind = self.error_kind.as_deref().unwrap_or(""),
+            degraded_reason = self.degraded_reason.as_deref().unwrap_or(""),
+            "rauha.evidence"
+        );
+    }
+}
+
+pub struct RuntimeEventBuilder {
+    event: RuntimeEvent,
+}
+
+impl RuntimeEventBuilder {
+    pub fn new(name: impl Into<String>, kind: EventKind, outcome: EventOutcome) -> Self {
+        Self {
+            event: RuntimeEvent {
+                timestamp: now_rfc3339(),
+                level: Severity::Info,
+                event_name: name.into(),
+                event_version: RUNTIME_EVENT_VERSION,
+                event_kind: kind,
+                event_outcome: outcome,
+                task_id: None,
+                zone_id: None,
+                zone_name: None,
+                container_id: None,
+                sandbox_id: None,
+                command_hash: None,
+                command_argv_safe: None,
+                image_ref: None,
+                repo_path_safe: None,
+                repo_hash: None,
+                policy_name: None,
+                policy_hash: None,
+                backend_name: None,
+                backend_platform: None,
+                backend_enforcement_mode: None,
+                enforcer_backend: None,
+                enforcer_capabilities: None,
+                request_id: None,
+                trace_id: None,
+                correlation_id: None,
+                parent_span_id: None,
+                span_id: None,
+                duration_ms: None,
+                error_code: None,
+                error_kind: None,
+                error_message: None,
+                degraded_reason: None,
+                trust_level: None,
+                fields: BTreeMap::new(),
+            },
+        }
+    }
+
+    pub fn level(mut self, level: Severity) -> Self {
+        self.event.level = level;
+        self
+    }
+
+    pub fn task_id(mut self, value: impl Into<String>) -> Self {
+        self.event.task_id = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn zone_id(mut self, value: impl Into<String>) -> Self {
+        self.event.zone_id = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn zone_name(mut self, value: impl Into<String>) -> Self {
+        self.event.zone_name = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn container_id(mut self, value: impl Into<String>) -> Self {
+        self.event.container_id = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn command_hash(mut self, value: impl Into<String>) -> Self {
+        self.event.command_hash = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn command_argv_safe(mut self, value: Vec<String>) -> Self {
+        self.event.command_argv_safe = Some(value.into_iter().map(|s| bound_string(&s)).collect());
+        self
+    }
+
+    pub fn image_ref(mut self, value: impl Into<String>) -> Self {
+        self.event.image_ref = Some(redact_and_bound(&value.into()));
+        self
+    }
+
+    pub fn repo_path_safe(mut self, value: impl Into<String>) -> Self {
+        self.event.repo_path_safe = Some(redact_and_bound(&value.into()));
+        self
+    }
+
+    pub fn policy_hash(mut self, value: impl Into<String>) -> Self {
+        self.event.policy_hash = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn backend(
+        mut self,
+        name: impl Into<String>,
+        platform: impl Into<String>,
+        mode: EnforcementMode,
+    ) -> Self {
+        self.event.backend_name = Some(bound_string(&name.into()));
+        self.event.backend_platform = Some(bound_string(&platform.into()));
+        self.event.backend_enforcement_mode = Some(mode);
+        self
+    }
+
+    pub fn enforcer_backend(mut self, value: impl Into<String>) -> Self {
+        self.event.enforcer_backend = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn correlation_id(mut self, value: impl Into<String>) -> Self {
+        self.event.correlation_id = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn request_id(mut self, value: impl Into<String>) -> Self {
+        self.event.request_id = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn duration_ms(mut self, value: u64) -> Self {
+        self.event.duration_ms = Some(value);
+        self
+    }
+
+    pub fn error(
+        mut self,
+        code: impl Into<String>,
+        kind: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        self.event.error_code = Some(bound_string(&code.into()));
+        self.event.error_kind = Some(bound_string(&kind.into()));
+        self.event.error_message = Some(redact_and_bound(&message.into()));
+        self
+    }
+
+    pub fn degraded_reason(mut self, value: impl Into<String>) -> Self {
+        self.event.degraded_reason = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn trust_level(mut self, value: TrustLevel) -> Self {
+        self.event.trust_level = Some(value);
+        self
+    }
+
+    pub fn field(mut self, key: impl Into<String>, value: FieldValue) -> Self {
+        self.event.fields.insert(key.into(), value.bounded());
+        self
+    }
+
+    pub fn build(self) -> RuntimeEvent {
+        self.event
+    }
+
+    pub fn emit(self) -> RuntimeEvent {
+        let event = self.build();
+        event.emit_tracing();
+        event
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -695,5 +1241,48 @@ mod tests {
         assert!(event.machine_json().unwrap().contains("zone.file.denied"));
         assert!(event.compact_human().contains("zone.file.denied"));
         assert!(event.expanded_human().contains("delegation"));
+    }
+
+    #[test]
+    fn runtime_event_uses_stable_evidence_fields() {
+        let event = RuntimeEventBuilder::new(
+            event_name::SANDBOX_RUN_STARTED,
+            EventKind::Execution,
+            EventOutcome::Started,
+        )
+        .task_id("task-123")
+        .zone_id("zone-456")
+        .zone_name("sandbox-zone")
+        .backend("linux-ebpf", "linux", EnforcementMode::Enforcing)
+        .correlation_id("task-123")
+        .trust_level(TrustLevel::BestEffort)
+        .degraded_reason("enforcement_capture_status_reported_separately")
+        .build();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&event.machine_json().unwrap()).unwrap();
+        assert_eq!(value["event.name"], event_name::SANDBOX_RUN_STARTED);
+        assert_eq!(value["event.version"], RUNTIME_EVENT_VERSION);
+        assert_eq!(value["event.kind"], "execution");
+        assert_eq!(value["event.outcome"], "started");
+        assert_eq!(value["backend.enforcement_mode"], "enforcing");
+        assert_eq!(value["trust_level"], "best_effort");
+        assert_eq!(value["correlation_id"], "task-123");
+    }
+
+    #[test]
+    fn runtime_event_redacts_sensitive_fields() {
+        let event = RuntimeEventBuilder::new(
+            event_name::SANDBOX_RUN_STARTED,
+            EventKind::Execution,
+            EventOutcome::Started,
+        )
+        .image_ref("registry.example/app:token=secret")
+        .error("bad", "secret_error", "password=abc123")
+        .build();
+
+        let json = event.machine_json().unwrap();
+        assert!(json.contains("[redacted]"));
+        assert!(!json.contains("abc123"));
     }
 }
