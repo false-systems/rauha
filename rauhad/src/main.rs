@@ -5,16 +5,20 @@ mod network;
 mod server;
 mod zone;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rauha_evidence::{
+    event_name, EnforcementMode, EventKind, EventOutcome, RuntimeEventBuilder, Severity, TrustLevel,
+};
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
 
-use server::pb::zone::zone_service_server::ZoneServiceServer;
 use server::pb::container::container_service_server::ContainerServiceServer;
 use server::pb::image::image_service_server::ImageServiceServer;
 use server::pb::sandbox::sandbox_service_server::SandboxServiceServer;
+use server::pb::zone::zone_service_server::ZoneServiceServer;
 
 const DEFAULT_ROOT: &str = if cfg!(target_os = "macos") {
     "/tmp/rauha"
@@ -30,6 +34,22 @@ async fn main() -> anyhow::Result<()> {
 
     let root = std::env::var("RAUHA_ROOT").unwrap_or_else(|_| DEFAULT_ROOT.into());
     let root_path = PathBuf::from(&root);
+    let platform = if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        std::env::consts::OS
+    };
+    RuntimeEventBuilder::new(
+        event_name::DAEMON_START,
+        EventKind::Lifecycle,
+        EventOutcome::Started,
+    )
+    .backend("unselected", platform, EnforcementMode::Unavailable)
+    .trust_level(TrustLevel::Partial)
+    .degraded_reason("backend_not_selected_yet")
+    .emit();
 
     // Ensure directories exist.
     std::fs::create_dir_all(root_path.join("metadata"))?;
@@ -39,9 +59,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(root = %root, "starting rauhad");
 
     // Open metadata store.
-    let metadata = Arc::new(
-        metadata::db::MetadataStore::open(&root_path.join("metadata").join("rauha.redb"))?,
-    );
+    let metadata = Arc::new(metadata::db::MetadataStore::open(
+        &root_path.join("metadata").join("rauha.redb"),
+    )?);
 
     // Create platform backend.
     #[cfg(target_os = "linux")]
@@ -51,6 +71,18 @@ async fn main() -> anyhow::Result<()> {
     let backend: Arc<dyn rauha_common::backend::IsolationBackend> = Arc::from(backend_box);
 
     tracing::info!(backend = backend.name(), "isolation backend initialized");
+    let enforcement_mode = match backend.isolation_model() {
+        rauha_common::zone::IsolationModel::SyscallPolicy
+        | rauha_common::zone::IsolationModel::HardwareBoundary => EnforcementMode::Enforcing,
+    };
+    RuntimeEventBuilder::new(
+        event_name::BACKEND_SELECTED,
+        EventKind::Backend,
+        EventOutcome::Succeeded,
+    )
+    .backend(backend.name(), platform, enforcement_mode)
+    .trust_level(TrustLevel::Complete)
+    .emit();
 
     // Create image service.
     let content_store = Arc::new(
@@ -85,13 +117,28 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
     let sandbox_svc = server::SandboxServiceImpl::new(registry.clone(), None);
 
-    let addr = "[::1]:9876".parse()?;
+    let addr: SocketAddr = "[::1]:9876".parse()?;
     tracing::info!(%addr, "listening on gRPC");
+    RuntimeEventBuilder::new(
+        event_name::DAEMON_READY,
+        EventKind::Lifecycle,
+        EventOutcome::Succeeded,
+    )
+    .backend(
+        registry.backend_name(),
+        registry.backend_platform(),
+        registry.enforcement_mode(),
+    )
+    .field(
+        "grpc_addr",
+        rauha_evidence::FieldValue::String(addr.to_string()),
+    )
+    .trust_level(TrustLevel::Complete)
+    .emit();
 
     // Graceful shutdown: clean up network state on SIGTERM/SIGINT.
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    ).map_err(|e| anyhow::anyhow!("failed to register SIGTERM handler: {e}"))?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| anyhow::anyhow!("failed to register SIGTERM handler: {e}"))?;
 
     let shutdown = async move {
         tokio::select! {
@@ -116,6 +163,27 @@ async fn main() -> anyhow::Result<()> {
     cleanup_network();
 
     tracing::info!("rauhad stopped");
+    RuntimeEventBuilder::new(
+        event_name::DAEMON_SHUTDOWN,
+        EventKind::Lifecycle,
+        if serve_result.is_ok() {
+            EventOutcome::Succeeded
+        } else {
+            EventOutcome::Failed
+        },
+    )
+    .level(if serve_result.is_ok() {
+        Severity::Info
+    } else {
+        Severity::Error
+    })
+    .backend(
+        registry.backend_name(),
+        registry.backend_platform(),
+        registry.enforcement_mode(),
+    )
+    .trust_level(TrustLevel::Complete)
+    .emit();
     serve_result?;
     Ok(())
 }

@@ -3,6 +3,9 @@ use rauha_common::backend::IsolationBackend;
 use rauha_common::container::{Container, ContainerHandle, ContainerSpec, ContainerState};
 use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::*;
+use rauha_evidence::{
+    event_name, EnforcementMode, EventKind, EventOutcome, RuntimeEventBuilder, Severity, TrustLevel,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -34,9 +37,7 @@ pub struct ZoneRegistry {
 /// Validate that a zone name is safe (no path traversal, no special chars).
 fn validate_zone_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err(RauhaError::InvalidInput(
-            "zone name cannot be empty".into(),
-        ));
+        return Err(RauhaError::InvalidInput("zone name cannot be empty".into()));
     }
     if name.contains('/') || name.contains('\\') || name.contains('\0') {
         return Err(RauhaError::InvalidInput(
@@ -80,6 +81,43 @@ impl ZoneRegistry {
         self.root.clone()
     }
 
+    pub fn backend_name(&self) -> &str {
+        self.backend.name()
+    }
+
+    pub fn backend_platform(&self) -> &'static str {
+        if cfg!(target_os = "linux") {
+            "linux"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            std::env::consts::OS
+        }
+    }
+
+    pub fn enforcement_mode(&self) -> EnforcementMode {
+        match self.backend.isolation_model() {
+            IsolationModel::SyscallPolicy | IsolationModel::HardwareBoundary => {
+                EnforcementMode::Enforcing
+            }
+        }
+    }
+
+    fn event(
+        &self,
+        name: &'static str,
+        kind: EventKind,
+        outcome: EventOutcome,
+    ) -> RuntimeEventBuilder {
+        RuntimeEventBuilder::new(name, kind, outcome)
+            .backend(
+                self.backend_name(),
+                self.backend_platform(),
+                self.enforcement_mode(),
+            )
+            .trust_level(TrustLevel::Complete)
+    }
+
     /// Resolve the compact, kernel-side id the backend assigns to a zone.
     ///
     /// Used to correlate kernel enforcement events (which carry the compact id)
@@ -118,7 +156,10 @@ impl ZoneRegistry {
                 network_state: zone.network_state.clone(),
             };
 
-            match self.backend.recover_zone(&handle, zone.zone_type, &zone.policy) {
+            match self
+                .backend
+                .recover_zone(&handle, zone.zone_type, &zone.policy)
+            {
                 Ok(()) => {
                     // Update handle with live cgroup_id from the filesystem.
                     // recover_zone re-stats the cgroup directory, but the handle
@@ -141,7 +182,11 @@ impl ZoneRegistry {
             tracing::warn!(%e, "failed to clean up orphaned kernel state");
         }
 
-        tracing::info!(recovered = handles.len(), total = zones.len(), "reconciliation complete");
+        tracing::info!(
+            recovered = handles.len(),
+            total = zones.len(),
+            "reconciliation complete"
+        );
         Ok(())
     }
 
@@ -166,9 +211,33 @@ impl ZoneRegistry {
         Ok(0)
     }
 
-    pub async fn create_zone(&self, name: &str, zone_type: ZoneType, policy: ZonePolicy) -> Result<Zone> {
+    pub async fn create_zone(
+        &self,
+        name: &str,
+        zone_type: ZoneType,
+        policy: ZonePolicy,
+    ) -> Result<Zone> {
+        self.event(
+            event_name::RAUHA_ZONE_CREATE_STARTED,
+            EventKind::Lifecycle,
+            EventOutcome::Started,
+        )
+        .zone_name(name)
+        .emit();
+
         // Validate zone name: reject path traversal and unsafe characters.
-        validate_zone_name(name)?;
+        if let Err(e) = validate_zone_name(name) {
+            self.event(
+                event_name::RAUHA_ZONE_CREATE_FAILED,
+                EventKind::Lifecycle,
+                EventOutcome::Failed,
+            )
+            .level(Severity::Warn)
+            .zone_name(name)
+            .error("invalid_zone_name", "invalid_input", e.to_string())
+            .emit();
+            return Err(e);
+        }
 
         // Serialize zone mutations to prevent TOCTOU: two concurrent creates
         // with the same name could both pass the duplicate check before either
@@ -177,7 +246,17 @@ impl ZoneRegistry {
 
         // Check for duplicates (protected by zone_mutation_lock).
         if self.metadata.get_zone(name)?.is_some() {
-            return Err(RauhaError::ZoneAlreadyExists(name.into()));
+            let err = RauhaError::ZoneAlreadyExists(name.into());
+            self.event(
+                event_name::RAUHA_ZONE_CREATE_FAILED,
+                EventKind::Lifecycle,
+                EventOutcome::Failed,
+            )
+            .level(Severity::Warn)
+            .zone_name(name)
+            .error("zone_already_exists", "conflict", err.to_string())
+            .emit();
+            return Err(err);
         }
 
         let config = ZoneConfig {
@@ -187,10 +266,36 @@ impl ZoneRegistry {
         };
 
         // Create in backend first (sets up isolation primitives).
-        let handle = self.backend.create_zone(&config)?;
+        let handle = match self.backend.create_zone(&config) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.event(
+                    event_name::RAUHA_ZONE_CREATE_FAILED,
+                    EventKind::Lifecycle,
+                    EventOutcome::Failed,
+                )
+                .level(Severity::Error)
+                .zone_name(name)
+                .error("backend_create_zone_failed", "backend", e.to_string())
+                .emit();
+                return Err(e);
+            }
+        };
 
         // Apply the policy.
-        self.backend.enforce_policy(&handle, &policy)?;
+        if let Err(e) = self.backend.enforce_policy(&handle, &policy) {
+            self.event(
+                event_name::POLICY_APPLY_FAILED,
+                EventKind::Policy,
+                EventOutcome::Failed,
+            )
+            .level(Severity::Error)
+            .zone_id(handle.id.to_string())
+            .zone_name(name)
+            .error("policy_apply_failed", "backend", e.to_string())
+            .emit();
+            return Err(e);
+        }
 
         let now = Utc::now();
         let zone = Zone {
@@ -211,23 +316,60 @@ impl ZoneRegistry {
         self.handles.write().await.insert(name.into(), handle);
 
         tracing::info!(zone = name, "zone created");
+        self.event(
+            event_name::RAUHA_ZONE_CREATE_SUCCEEDED,
+            EventKind::Lifecycle,
+            EventOutcome::Succeeded,
+        )
+        .zone_id(zone.id.to_string())
+        .zone_name(&zone.name)
+        .emit();
         Ok(zone)
     }
 
     pub async fn delete_zone(&self, name: &str, force: bool) -> Result<()> {
+        self.event(
+            event_name::RAUHA_ZONE_DELETE_STARTED,
+            EventKind::Lifecycle,
+            EventOutcome::Started,
+        )
+        .zone_name(name)
+        .field("force", rauha_evidence::FieldValue::Bool(force))
+        .emit();
+
         let _guard = self.zone_mutation_lock.lock().await;
 
-        let zone = self
-            .metadata
-            .get_zone(name)?
-            .ok_or_else(|| RauhaError::ZoneNotFound(name.into()))?;
+        let zone = self.metadata.get_zone(name)?.ok_or_else(|| {
+            let err = RauhaError::ZoneNotFound(name.into());
+            self.event(
+                event_name::RAUHA_ZONE_DELETE_FAILED,
+                EventKind::Lifecycle,
+                EventOutcome::Failed,
+            )
+            .level(Severity::Warn)
+            .zone_name(name)
+            .error("zone_not_found", "not_found", err.to_string())
+            .emit();
+            err
+        })?;
 
         // Check for running containers unless force.
         let containers = self.metadata.list_containers(Some(&zone.id))?;
         if !containers.is_empty() && !force {
-            return Err(RauhaError::ZoneNotEmpty {
+            let err = RauhaError::ZoneNotEmpty {
                 count: containers.len(),
-            });
+            };
+            self.event(
+                event_name::RAUHA_ZONE_DELETE_FAILED,
+                EventKind::Lifecycle,
+                EventOutcome::Failed,
+            )
+            .level(Severity::Warn)
+            .zone_id(zone.id.to_string())
+            .zone_name(name)
+            .error("zone_not_empty", "failed_precondition", err.to_string())
+            .emit();
+            return Err(err);
         }
 
         // Clean up containers if force.
@@ -235,7 +377,8 @@ impl ZoneRegistry {
             for container in &containers {
                 // Stop running containers.
                 if container.state == ContainerState::Running {
-                    if let Some(handle) = self.container_handles.write().await.remove(&container.id) {
+                    if let Some(handle) = self.container_handles.write().await.remove(&container.id)
+                    {
                         let _ = self.backend.stop_container(&handle);
                     }
                 }
@@ -252,6 +395,14 @@ impl ZoneRegistry {
         self.metadata.delete_zone(name)?;
 
         tracing::info!(zone = name, "zone deleted");
+        self.event(
+            event_name::RAUHA_ZONE_DELETE_SUCCEEDED,
+            EventKind::Lifecycle,
+            EventOutcome::Succeeded,
+        )
+        .zone_id(zone.id.to_string())
+        .zone_name(name)
+        .emit();
         Ok(())
     }
 
@@ -266,6 +417,14 @@ impl ZoneRegistry {
     }
 
     pub async fn apply_policy(&self, zone_name: &str, policy: ZonePolicy) -> Result<()> {
+        self.event(
+            event_name::POLICY_APPLY_STARTED,
+            EventKind::Policy,
+            EventOutcome::Started,
+        )
+        .zone_name(zone_name)
+        .emit();
+
         let mut zone = self.get_zone(zone_name).await?;
         let handles = self.handles.read().await;
         let handle = handles
@@ -277,9 +436,32 @@ impl ZoneRegistry {
         match self.backend.hot_reload_policy(handle, &policy) {
             Ok(()) => {}
             Err(RauhaError::ZoneNotFound(_)) => {
-                return Err(RauhaError::ZoneNotFound(zone_name.into()));
+                let err = RauhaError::ZoneNotFound(zone_name.into());
+                self.event(
+                    event_name::POLICY_APPLY_FAILED,
+                    EventKind::Policy,
+                    EventOutcome::Failed,
+                )
+                .level(Severity::Warn)
+                .zone_id(zone.id.to_string())
+                .zone_name(zone_name)
+                .error("zone_not_found", "not_found", err.to_string())
+                .emit();
+                return Err(err);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                self.event(
+                    event_name::POLICY_APPLY_FAILED,
+                    EventKind::Policy,
+                    EventOutcome::Failed,
+                )
+                .level(Severity::Error)
+                .zone_id(zone.id.to_string())
+                .zone_name(zone_name)
+                .error("policy_apply_failed", "backend", e.to_string())
+                .emit();
+                return Err(e);
+            }
         }
 
         zone.policy = policy;
@@ -287,6 +469,14 @@ impl ZoneRegistry {
         self.metadata.put_zone(&zone)?;
 
         tracing::info!(zone = zone_name, "policy updated");
+        self.event(
+            event_name::POLICY_APPLY_SUCCEEDED,
+            EventKind::Policy,
+            EventOutcome::Succeeded,
+        )
+        .zone_id(zone.id.to_string())
+        .zone_name(zone_name)
+        .emit();
         Ok(())
     }
 
@@ -317,8 +507,7 @@ impl ZoneRegistry {
                     let zone_data = std::path::PathBuf::from(&zone_root)
                         .join("zones")
                         .join(&zone_name_owned);
-                    let snapshotter =
-                        rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_data);
+                    let snapshotter = rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_data);
                     let layer_paths =
                         snapshotter.prepare_layers(&safe_name, &digests, &content_root)?;
 
@@ -334,11 +523,12 @@ impl ZoneRegistry {
 
             #[cfg(not(target_os = "linux"))]
             {
-                let base = tokio::task::spawn_blocking(move || {
-                    image_svc.prepare_base_rootfs(&image_ref)
-                })
-                .await
-                .map_err(|e| RauhaError::BackendError(format!("rootfs task panicked: {e}")))??;
+                let base =
+                    tokio::task::spawn_blocking(move || image_svc.prepare_base_rootfs(&image_ref))
+                        .await
+                        .map_err(|e| {
+                            RauhaError::BackendError(format!("rootfs task panicked: {e}"))
+                        })??;
                 spec.rootfs_path = Some(base);
             }
         }
@@ -519,11 +709,8 @@ impl ZoneRegistry {
                 let zone_data = std::path::PathBuf::from(&self.root)
                     .join("zones")
                     .join(&zone_name);
-                let container_root = zone_data
-                    .join("containers")
-                    .join(container_id.to_string());
-                let snapshotter =
-                    rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_data);
+                let container_root = zone_data.join("containers").join(container_id.to_string());
+                let snapshotter = rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_data);
                 if let Err(e) = snapshotter.unmount_overlay(&container_root) {
                     tracing::warn!(container = %container_id, %e, "failed to unmount overlay");
                 }
@@ -541,7 +728,8 @@ impl ZoneRegistry {
     /// Lazily updates state: if a Running container's process has exited,
     /// the state is updated to Stopped before returning.
     pub fn get_container(&self, container_id: &Uuid) -> Result<Container> {
-        let container = self.metadata
+        let container = self
+            .metadata
             .get_container(container_id)?
             .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))?;
 
@@ -560,7 +748,10 @@ impl ZoneRegistry {
         };
 
         // Lazily reap exited containers.
-        containers.into_iter().map(|c| self.maybe_reap_container(c)).collect()
+        containers
+            .into_iter()
+            .map(|c| self.maybe_reap_container(c))
+            .collect()
     }
 
     /// If a container is Running but its process has exited, update state to Stopped.
@@ -674,23 +865,21 @@ impl ZoneRegistry {
 
         if path.exists() {
             // Linux: connect via Unix socket to the shim process.
-            let request_clone = rauha_common::shim::encode(request).map_err(|e| {
-                RauhaError::ShimError {
+            let request_clone =
+                rauha_common::shim::encode(request).map_err(|e| RauhaError::ShimError {
                     zone: zone_name.into(),
                     message: format!("failed to encode request: {e}"),
-                }
-            })?;
+                })?;
 
             let zone_name_owned = zone_name.to_string();
             tokio::task::spawn_blocking(move || {
                 use std::io::Write;
-                let mut stream =
-                    std::os::unix::net::UnixStream::connect(&path).map_err(|e| {
-                        RauhaError::ShimError {
-                            zone: zone_name_owned.clone(),
-                            message: format!("failed to connect to shim: {e}"),
-                        }
-                    })?;
+                let mut stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| {
+                    RauhaError::ShimError {
+                        zone: zone_name_owned.clone(),
+                        message: format!("failed to connect to shim: {e}"),
+                    }
+                })?;
 
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(30)))
@@ -739,18 +928,12 @@ impl ZoneRegistry {
     /// Returns an async stream wrapping the vsock fd. Only works on macOS
     /// (where exec sessions use vsock); on Linux, exec sessions use Unix
     /// sockets and this method is never called.
-    pub async fn connect_exec_vsock(
-        &self,
-        zone_name: &str,
-        port: u32,
-    ) -> Result<VsockAsyncStream> {
+    pub async fn connect_exec_vsock(&self, zone_name: &str, port: u32) -> Result<VsockAsyncStream> {
         let backend = self.backend.clone();
         let zone = zone_name.to_string();
         let fd = tokio::task::spawn_blocking(move || backend.connect_vsock_port(&zone, port))
             .await
-            .map_err(|e| {
-                RauhaError::BackendError(format!("vsock connect task panicked: {e}"))
-            })??;
+            .map_err(|e| RauhaError::BackendError(format!("vsock connect task panicked: {e}")))??;
 
         VsockAsyncStream::new(fd)
             .map_err(|e| RauhaError::BackendError(format!("async vsock wrap failed: {e}")))
@@ -961,15 +1144,18 @@ mod tests {
         let db_path = tmp.path().join("test.redb");
         let content_path = tmp.path().join("content");
         let metadata = Arc::new(MetadataStore::open(&db_path).unwrap());
-        let content = Arc::new(
-            rauha_oci::content::ContentStore::new(&content_path).unwrap(),
-        );
+        let content = Arc::new(rauha_oci::content::ContentStore::new(&content_path).unwrap());
         let image_svc = Arc::new(rauha_oci::image::ImageService::new(
             content,
             tmp.path().to_path_buf(),
         ));
         let backend: Arc<dyn IsolationBackend> = Arc::new(MockBackend::new());
-        ZoneRegistry::new(metadata, backend, image_svc, tmp.path().to_string_lossy().into())
+        ZoneRegistry::new(
+            metadata,
+            backend,
+            image_svc,
+            tmp.path().to_string_lossy().into(),
+        )
     }
 
     fn make_spec(name: &str) -> ContainerSpec {
@@ -1062,7 +1248,10 @@ mod tests {
 
         assert_eq!(container.zone_id, zone.id);
         assert_eq!(container.name, "ctr1");
-        assert_eq!(container.state, rauha_common::container::ContainerState::Created);
+        assert_eq!(
+            container.state,
+            rauha_common::container::ContainerState::Created
+        );
 
         // Verify persisted.
         let loaded = reg.get_container(&container.id).unwrap();
@@ -1132,14 +1321,20 @@ mod tests {
         // Start.
         reg.start_container(&ctr.id).await.unwrap();
         let running = reg.get_container(&ctr.id).unwrap();
-        assert_eq!(running.state, rauha_common::container::ContainerState::Running);
+        assert_eq!(
+            running.state,
+            rauha_common::container::ContainerState::Running
+        );
         assert!(running.started_at.is_some());
         assert!(running.pid.is_some(), "started container must have a PID");
 
         // Stop.
         reg.stop_container(&ctr.id, 10).await.unwrap();
         let stopped = reg.get_container(&ctr.id).unwrap();
-        assert_eq!(stopped.state, rauha_common::container::ContainerState::Stopped);
+        assert_eq!(
+            stopped.state,
+            rauha_common::container::ContainerState::Stopped
+        );
         assert!(stopped.finished_at.is_some());
 
         // Delete.
@@ -1158,7 +1353,10 @@ mod tests {
         reg.create_zone("reap", ZoneType::NonGlobal, ZonePolicy::default())
             .await
             .unwrap();
-        let ctr = reg.create_container("reap", make_spec("ephemeral")).await.unwrap();
+        let ctr = reg
+            .create_container("reap", make_spec("ephemeral"))
+            .await
+            .unwrap();
 
         // Start (MockBackend returns our PID, which is alive).
         reg.start_container(&ctr.id).await.unwrap();
@@ -1172,8 +1370,15 @@ mod tests {
 
         // get_container should lazily reap it.
         let reaped = reg.get_container(&ctr.id).unwrap();
-        assert_eq!(reaped.state, ContainerState::Stopped, "dead PID must be reaped to Stopped");
-        assert!(reaped.finished_at.is_some(), "reaped container must have finished_at");
+        assert_eq!(
+            reaped.state,
+            ContainerState::Stopped,
+            "dead PID must be reaped to Stopped"
+        );
+        assert!(
+            reaped.finished_at.is_some(),
+            "reaped container must have finished_at"
+        );
 
         // list_containers should also show Stopped.
         let listed = reg.list_containers(Some("reap")).unwrap();
