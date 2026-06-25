@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 use rauha_common::error::RauhaError;
 use rauha_evidence::{
@@ -85,11 +86,6 @@ fn rpc_span<T>(
     )
 }
 
-fn emit_rpc_start<T>(request: &Request<T>, rpc_service: &'static str, rpc_method: &'static str) {
-    let span = rpc_span(request, rpc_service, rpc_method);
-    tracing::info!(parent: &span, event.name = "grpc.request.started", "grpc request started");
-}
-
 fn metadata_value<T>(request: &Request<T>, key: &str) -> Option<String> {
     request
         .metadata()
@@ -137,117 +133,137 @@ impl ZoneService for ZoneServiceImpl {
         &self,
         request: Request<pb::zone::CreateZoneRequest>,
     ) -> Result<Response<pb::zone::CreateZoneResponse>, Status> {
-        emit_rpc_start(&request, "rauha.zone.v1.ZoneService", "CreateZone");
-        let req = request.into_inner();
+        let span = rpc_span(&request, "rauha.zone.v1.ZoneService", "CreateZone");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let req = request.into_inner();
 
-        // Zone type from gRPC request field.
-        let zone_type = match req.zone_type.as_str() {
-            "privileged" => rauha_common::zone::ZoneType::Privileged,
-            "global" => rauha_common::zone::ZoneType::Global,
-            _ => rauha_common::zone::ZoneType::NonGlobal,
-        };
+            // Zone type from gRPC request field.
+            let zone_type = match req.zone_type.as_str() {
+                "privileged" => rauha_common::zone::ZoneType::Privileged,
+                "global" => rauha_common::zone::ZoneType::Global,
+                _ => rauha_common::zone::ZoneType::NonGlobal,
+            };
 
-        // Reject oversized policy TOML to prevent memory exhaustion during parsing.
-        const MAX_POLICY_SIZE: usize = 64 * 1024;
-        if req.policy_toml.len() > MAX_POLICY_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "policy_toml exceeds maximum size of {MAX_POLICY_SIZE} bytes"
-            )));
+            // Reject oversized policy TOML to prevent memory exhaustion during parsing.
+            const MAX_POLICY_SIZE: usize = 64 * 1024;
+            if req.policy_toml.len() > MAX_POLICY_SIZE {
+                return Err(Status::invalid_argument(format!(
+                    "policy_toml exceeds maximum size of {MAX_POLICY_SIZE} bytes"
+                )));
+            }
+
+            let policy = if req.policy_toml.is_empty() {
+                rauha_common::zone::ZonePolicy::default()
+            } else {
+                let (_toml_zone_type, parsed_policy) =
+                    crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+                // The gRPC request's zone_type takes precedence over the TOML's
+                // [zone].type field. This allows reusing a policy file across
+                // different zone types.
+                parsed_policy
+            };
+
+            let zone = self
+                .registry
+                .create_zone(&req.name, zone_type, policy)
+                .await
+                .map_err(to_status)?;
+
+            Ok(Response::new(pb::zone::CreateZoneResponse {
+                zone_id: zone.id.to_string(),
+                name: zone.name,
+                state: format!("{:?}", zone.state),
+            }))
         }
-
-        let policy = if req.policy_toml.is_empty() {
-            rauha_common::zone::ZonePolicy::default()
-        } else {
-            let (_toml_zone_type, parsed_policy) =
-                crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
-
-            // The gRPC request's zone_type takes precedence over the TOML's
-            // [zone].type field. This allows reusing a policy file across
-            // different zone types.
-            parsed_policy
-        };
-
-        let zone = self
-            .registry
-            .create_zone(&req.name, zone_type, policy)
-            .await
-            .map_err(to_status)?;
-
-        Ok(Response::new(pb::zone::CreateZoneResponse {
-            zone_id: zone.id.to_string(),
-            name: zone.name,
-            state: format!("{:?}", zone.state),
-        }))
+        .instrument(span)
+        .await
     }
 
     async fn delete_zone(
         &self,
         request: Request<pb::zone::DeleteZoneRequest>,
     ) -> Result<Response<pb::zone::DeleteZoneResponse>, Status> {
-        emit_rpc_start(&request, "rauha.zone.v1.ZoneService", "DeleteZone");
-        let req = request.into_inner();
-        self.registry
-            .delete_zone(&req.name, req.force)
-            .await
-            .map_err(to_status)?;
-        Ok(Response::new(pb::zone::DeleteZoneResponse {}))
+        let span = rpc_span(&request, "rauha.zone.v1.ZoneService", "DeleteZone");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let req = request.into_inner();
+            self.registry
+                .delete_zone(&req.name, req.force)
+                .await
+                .map_err(to_status)?;
+            Ok(Response::new(pb::zone::DeleteZoneResponse {}))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn get_zone(
         &self,
         request: Request<pb::zone::GetZoneRequest>,
     ) -> Result<Response<pb::zone::GetZoneResponse>, Status> {
-        emit_rpc_start(&request, "rauha.zone.v1.ZoneService", "GetZone");
-        let req = request.into_inner();
-        let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
+        let span = rpc_span(&request, "rauha.zone.v1.ZoneService", "GetZone");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let req = request.into_inner();
+            let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
 
-        let containers = self
-            .registry
-            .list_containers(Some(&req.name))
-            .map_err(to_status)?;
+            let containers = self
+                .registry
+                .list_containers(Some(&req.name))
+                .map_err(to_status)?;
 
-        Ok(Response::new(pb::zone::GetZoneResponse {
-            zone: Some(pb::zone::ZoneInfo {
-                id: zone.id.to_string(),
-                name: zone.name,
-                zone_type: format!("{:?}", zone.zone_type),
-                state: format!("{:?}", zone.state),
-                container_count: containers.len() as u32,
-                created_at: zone.created_at.to_rfc3339(),
-            }),
-        }))
+            Ok(Response::new(pb::zone::GetZoneResponse {
+                zone: Some(pb::zone::ZoneInfo {
+                    id: zone.id.to_string(),
+                    name: zone.name,
+                    zone_type: format!("{:?}", zone.zone_type),
+                    state: format!("{:?}", zone.state),
+                    container_count: containers.len() as u32,
+                    created_at: zone.created_at.to_rfc3339(),
+                }),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn list_zones(
         &self,
         request: Request<pb::zone::ListZonesRequest>,
     ) -> Result<Response<pb::zone::ListZonesResponse>, Status> {
-        emit_rpc_start(&request, "rauha.zone.v1.ZoneService", "ListZones");
-        let zones = self.registry.list_zones().map_err(to_status)?;
+        let span = rpc_span(&request, "rauha.zone.v1.ZoneService", "ListZones");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let zones = self.registry.list_zones().map_err(to_status)?;
 
-        let zone_infos = zones
-            .into_iter()
-            .map(|z| {
-                let container_count = self
-                    .registry
-                    .list_containers(Some(&z.name))
-                    .map(|c| c.len() as u32)
-                    .unwrap_or(0);
-                pb::zone::ZoneInfo {
-                    id: z.id.to_string(),
-                    name: z.name,
-                    zone_type: format!("{:?}", z.zone_type),
-                    state: format!("{:?}", z.state),
-                    container_count,
-                    created_at: z.created_at.to_rfc3339(),
-                }
-            })
-            .collect();
+            let zone_infos = zones
+                .into_iter()
+                .map(|z| {
+                    let container_count = self
+                        .registry
+                        .list_containers(Some(&z.name))
+                        .map(|c| c.len() as u32)
+                        .unwrap_or(0);
+                    pb::zone::ZoneInfo {
+                        id: z.id.to_string(),
+                        name: z.name,
+                        zone_type: format!("{:?}", z.zone_type),
+                        state: format!("{:?}", z.state),
+                        container_count,
+                        created_at: z.created_at.to_rfc3339(),
+                    }
+                })
+                .collect();
 
-        Ok(Response::new(pb::zone::ListZonesResponse {
-            zones: zone_infos,
-        }))
+            Ok(Response::new(pb::zone::ListZonesResponse {
+                zones: zone_infos,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn apply_policy(
