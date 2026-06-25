@@ -60,6 +60,50 @@ use pb::image::image_service_server::ImageService;
 use pb::sandbox::sandbox_service_server::SandboxService;
 use pb::zone::zone_service_server::ZoneService;
 
+fn rpc_span<T>(
+    request: &Request<T>,
+    rpc_service: &'static str,
+    rpc_method: &'static str,
+) -> tracing::Span {
+    let request_id = metadata_value(request, "x-request-id").unwrap_or_else(new_request_id);
+    let correlation_id =
+        metadata_value(request, "x-correlation-id").unwrap_or_else(|| request_id.clone());
+    let trace_id = request_id.replace('-', "");
+    let span_id = trace_id
+        .get(..16)
+        .map(str::to_string)
+        .unwrap_or_else(|| trace_id.clone());
+
+    tracing::info_span!(
+        "grpc.request",
+        rpc.service = rpc_service,
+        rpc.method = rpc_method,
+        request_id = %request_id,
+        correlation_id = %correlation_id,
+        trace.id = %trace_id,
+        span.id = %span_id,
+    )
+}
+
+fn emit_rpc_start<T>(request: &Request<T>, rpc_service: &'static str, rpc_method: &'static str) {
+    let span = rpc_span(request, rpc_service, rpc_method);
+    tracing::info!(parent: &span, event.name = "grpc.request.started", "grpc request started");
+}
+
+fn metadata_value<T>(request: &Request<T>, key: &str) -> Option<String> {
+    request
+        .metadata()
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn new_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 // --- Zone Service ---
 
 pub struct ZoneServiceImpl {
@@ -93,6 +137,7 @@ impl ZoneService for ZoneServiceImpl {
         &self,
         request: Request<pb::zone::CreateZoneRequest>,
     ) -> Result<Response<pb::zone::CreateZoneResponse>, Status> {
+        emit_rpc_start(&request, "rauha.zone.v1.ZoneService", "CreateZone");
         let req = request.into_inner();
 
         // Zone type from gRPC request field.
@@ -140,6 +185,7 @@ impl ZoneService for ZoneServiceImpl {
         &self,
         request: Request<pb::zone::DeleteZoneRequest>,
     ) -> Result<Response<pb::zone::DeleteZoneResponse>, Status> {
+        emit_rpc_start(&request, "rauha.zone.v1.ZoneService", "DeleteZone");
         let req = request.into_inner();
         self.registry
             .delete_zone(&req.name, req.force)
@@ -152,6 +198,7 @@ impl ZoneService for ZoneServiceImpl {
         &self,
         request: Request<pb::zone::GetZoneRequest>,
     ) -> Result<Response<pb::zone::GetZoneResponse>, Status> {
+        emit_rpc_start(&request, "rauha.zone.v1.ZoneService", "GetZone");
         let req = request.into_inner();
         let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
 
@@ -174,8 +221,9 @@ impl ZoneService for ZoneServiceImpl {
 
     async fn list_zones(
         &self,
-        _request: Request<pb::zone::ListZonesRequest>,
+        request: Request<pb::zone::ListZonesRequest>,
     ) -> Result<Response<pb::zone::ListZonesResponse>, Status> {
+        emit_rpc_start(&request, "rauha.zone.v1.ZoneService", "ListZones");
         let zones = self.registry.list_zones().map_err(to_status)?;
 
         let zone_infos = zones

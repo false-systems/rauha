@@ -50,7 +50,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["chrono", "env-filter", "fmt", "json"] }
 
 # OCI
 oci-spec = "0.7"

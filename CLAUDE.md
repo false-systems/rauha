@@ -151,6 +151,12 @@ Every deny decision from the 7 LSM hooks is emitted to a BPF ring buffer (`ENFOR
 
 Ownership reading: **Syva enforces; Rauha observes.** The `rauha-evidence` crate is the normalization layer — it consumes raw enforcement records (from the eBPF backend / Syva) plus Rauha lifecycle events and projects them into one stable schema. It does **not** enforce policy. Event names are stable string constants in `rauha_evidence::event_name` (e.g. `zone.file.denied`, `zone.exec.denied`, `zone.escape.cgroup_attach`, `zone.created`, `container.exited`, `image.pulled`, `policy.loaded`, plus pipeline-health events `ringbuf.drop` / `pipeline.shed`). Output goes through pluggable sinks (file / JSON).
 
+Rauha is the telemetry source, not the collector. The daemon emits structured
+JSON to stdout/stderr and may export through OTLP; cloud tags, pod/namespace
+enrichment, Fluent Bit or sidecar wiring, cold storage, and retention policy are
+downstream concerns. Observability config is TOML only; see
+`docs/observability.md`.
+
 User-facing side (CLI in `rauha-cli/src/commands/trace.rs` + formatting in `output.rs`):
 - `rauha trace` — per-zone syscall trace
 - `rauha top` — per-zone resource usage snapshot

@@ -9,10 +9,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rauha_common::observability::{LogFormat, ObservabilityConfig};
 use rauha_evidence::{
     event_name, EnforcementMode, EventKind, EventOutcome, RuntimeEventBuilder, Severity, TrustLevel,
 };
 use tonic::transport::Server;
+use tracing_subscriber::fmt::time::ChronoUtc;
 use tracing_subscriber::EnvFilter;
 
 use server::pb::container::container_service_server::ContainerServiceServer;
@@ -28,9 +30,19 @@ const DEFAULT_ROOT: &str = if cfg!(target_os = "macos") {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("rauhad=info".parse()?))
-        .init();
+    let observability = ObservabilityConfig::from_env_or_default()?;
+    init_tracing(&observability)?;
+    install_panic_hook();
+    let _process_span = tracing::info_span!(
+        "rauhad",
+        service.name = "rauhad",
+        service.version = env!("CARGO_PKG_VERSION"),
+        environment = %observability.environment,
+        host.id = %host_id(),
+        host.name = %host_name(),
+        pid = std::process::id(),
+    )
+    .entered();
 
     let root = std::env::var("RAUHA_ROOT").unwrap_or_else(|_| DEFAULT_ROOT.into());
     let root_path = PathBuf::from(&root);
@@ -192,4 +204,77 @@ fn cleanup_network() {
     tracing::info!("cleaning up network state");
     #[cfg(target_os = "linux")]
     backend::linux::cleanup_network();
+}
+
+fn init_tracing(config: &ObservabilityConfig) -> anyhow::Result<()> {
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(format!("rauhad={}", config.level)))?;
+    let format = match config.format {
+        LogFormat::Json => LogFormat::Json,
+        LogFormat::Text => LogFormat::Text,
+        LogFormat::Auto if stdout_is_tty() => LogFormat::Text,
+        LogFormat::Auto => LogFormat::Json,
+    };
+
+    match format {
+        LogFormat::Json | LogFormat::Auto => tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_timer(ChronoUtc::rfc_3339())
+            .with_env_filter(filter)
+            .with_writer(std::io::stdout)
+            .init(),
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_timer(ChronoUtc::rfc_3339())
+            .with_env_filter(filter)
+            .with_writer(std::io::stdout)
+            .init(),
+    }
+    Ok(())
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown".into());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic payload is not a string".into());
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+
+        tracing::error!(
+            event.name = "process.panic",
+            error.kind = "panic",
+            error.message = %payload,
+            location = %location,
+            backtrace = %backtrace,
+            "process.panic"
+        );
+    }));
+}
+
+fn stdout_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+fn host_id() -> String {
+    std::fs::read_to_string("/etc/machine-id")
+        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(host_name)
+}
+
+fn host_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
 }
