@@ -2,11 +2,20 @@ use std::path::Path;
 
 /// Fork a child process, set up rootfs, and run the container workload.
 ///
-/// Flow:
-/// 1. Create sync pipe
+/// Flow (two-phase handshake):
+/// 1. Create two sync pipes (setup: child->parent, go: parent->child)
 /// 2. fork()
-/// 3. Child: block on pipe -> pivot_root -> execvp
-/// 4. Parent: write child PID to zone cgroup -> signal pipe -> return PID
+/// 3. Child: privileged setup (unshare/mount/pivot_root) -> signal "setup done"
+///    -> block on "go" -> execvp the workload
+/// 4. Parent: wait for "setup done" -> enroll child PID in zone cgroup
+///    -> signal "go" -> return PID
+///
+/// The privileged bootstrap runs *before* cgroup enrollment, so the eBPF
+/// `capable` hook does not judge rauha's own CAP_SYS_ADMIN setup against the
+/// workload's policy. The untrusted workload (`execvp`) is started only after
+/// enrollment is confirmed, so the TOCTOU enforcement boundary still holds:
+/// no image code ever runs outside the zone. Enrollment failure is fatal —
+/// the workload is never started unenforced (fail closed).
 ///
 /// Note: This uses execvp (not shell exec) - no shell injection possible.
 /// The child process image is replaced entirely by the container command.
@@ -59,8 +68,11 @@ pub fn fork_and_exec(
     let log_dir = PathBuf::from("/run/rauha/containers").join(container_id);
     std::fs::create_dir_all(&log_dir)?;
 
-    // Create sync pipe. OwnedFd closes automatically on drop.
-    let (pipe_rd, pipe_wr) = nix::unistd::pipe()?;
+    // Two sync pipes for the two-phase handshake. OwnedFd closes on drop.
+    //   setup pipe: child -> parent ("privileged setup done, safe to enroll")
+    //   go pipe:    parent -> child ("enrolled, proceed to exec the workload")
+    let (setup_rd, setup_wr) = nix::unistd::pipe()?;
+    let (go_rd, go_wr) = nix::unistd::pipe()?;
 
     // Prepare C strings before fork (allocation not async-signal-safe after fork).
     let c_args = cstring_vec(args, "process.args")?;
@@ -85,29 +97,35 @@ pub fn fork_and_exec(
         std::ffi::CString::new(log_dir.join("stderr.log").to_string_lossy().as_bytes())
             .unwrap_or_default();
 
-    // Convert OwnedFd to raw fds for use across fork.
-    // We manage lifetime manually after fork (child/parent each close their end).
-    let rd_raw = pipe_rd.as_raw_fd();
-    let wr_raw = pipe_wr.as_raw_fd();
+    // Convert OwnedFds to raw fds for use across fork.
+    // We manage lifetime manually after fork (each side closes the ends it
+    // does not use, by dropping the corresponding OwnedFd).
+    let setup_rd_raw = setup_rd.as_raw_fd();
+    let setup_wr_raw = setup_wr.as_raw_fd();
+    let go_rd_raw = go_rd.as_raw_fd();
+    let go_wr_raw = go_wr.as_raw_fd();
 
     // Fork.
     match unsafe { unistd::fork() }? {
         ForkResult::Child => {
-            // Drop the write end (closes it).
-            drop(pipe_wr);
-
-            // Block until parent confirms cgroup enrollment.
-            let mut buf = [0u8; 1];
-            let _ = nix::unistd::read(rd_raw, &mut buf);
-            // Drop the read end.
-            drop(pipe_rd);
+            // Close the pipe ends this process does not use.
+            drop(setup_rd);
+            drop(go_wr);
 
             // New session.
             let _ = nix::unistd::setsid();
 
-            // Redirect stdout/stderr to log files.
+            // Redirect stdout/stderr to log files. Must happen before pivot_root
+            // while /run/rauha/... is still reachable on the host filesystem.
             // Uses raw open() with pre-allocated CStrings — async-signal-safe.
             redirect_stdio_raw(&stdout_log, &stderr_log);
+
+            // --- Privileged container bootstrap, BEFORE cgroup enrollment ---
+            // The child is not yet a zone member here, so the eBPF `capable`
+            // hook sees no zone (lookup_caller_zone -> None -> allow) and does
+            // not judge these CAP_SYS_ADMIN operations against the workload's
+            // policy. No image code runs in this window — only this fixed,
+            // trusted setup sequence, after which we block until enrolled.
 
             // Enter a new mount namespace and make all mounts private.
             // pivot_root requires: (1) own mount namespace, (2) private root mount.
@@ -148,6 +166,27 @@ pub fn fork_and_exec(
                 let _ = nix::unistd::sethostname(h);
             }
 
+            // Signal the parent that privileged setup is complete and it is
+            // safe to enroll us in the zone cgroup.
+            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(setup_wr_raw) }, &[1u8]);
+            drop(setup_wr);
+
+            // Block until the parent confirms cgroup enrollment. From here on
+            // the process is inside the enforcement boundary, so the workload
+            // exec below is fully subject to zone policy.
+            let mut buf = [0u8; 1];
+            let n = nix::unistd::read(go_rd_raw, &mut buf);
+            drop(go_rd);
+            // The "go" pipe closing without a byte means the parent could not
+            // enroll us — refuse to run the workload unenforced (fail closed).
+            if !matches!(n, Ok(1)) {
+                let msg = b"cgroup enrollment failed; refusing to start workload unenforced\n";
+                unsafe {
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(125);
+                }
+            }
+
             // Set environment using libc directly — bypasses Rust's env mutex.
             // std::env::set_var/remove_var are NOT async-signal-safe (they hold
             // a global lock that may be held by the parent process's other threads).
@@ -171,21 +210,46 @@ pub fn fork_and_exec(
             }
         }
         ForkResult::Parent { child } => {
-            // Drop read end (closes it).
-            drop(pipe_rd);
+            // Close the pipe ends this process does not use.
+            drop(setup_wr);
+            drop(go_rd);
 
             let child_pid = child.as_raw() as u32;
+            let child_p = nix::unistd::Pid::from_raw(child_pid as i32);
 
-            // Enroll child in zone cgroup.
-            let cgroup_path = format!("/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs");
-            if let Err(e) = std::fs::write(&cgroup_path, child_pid.to_string()) {
-                tracing::warn!(%e, cgroup = cgroup_path, "failed to enroll child in cgroup");
+            // Wait for the child to finish privileged setup before enrolling it,
+            // so its CAP_SYS_ADMIN bootstrap is not judged against zone policy.
+            // A read of 1 byte means setup succeeded; EOF (0) means the child
+            // died during setup (it already wrote its own error to stderr).
+            let mut buf = [0u8; 1];
+            let setup_ok = matches!(nix::unistd::read(setup_rd_raw, &mut buf), Ok(1));
+            drop(setup_rd);
+            if !setup_ok {
+                drop(go_wr);
+                let _ = nix::sys::wait::waitpid(child_p, None);
+                anyhow::bail!(
+                    "container {container_id} failed during pre-enrollment setup \
+                     (see container stderr)"
+                );
             }
 
-            // Signal child to proceed (unblock from sync pipe).
-            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(wr_raw) }, &[1u8]);
-            // Drop write end (closes it).
-            drop(pipe_wr);
+            // Enroll child in zone cgroup. This MUST succeed: a workload running
+            // outside the cgroup gets no eBPF enforcement. On failure, kill the
+            // child and report the error rather than signaling "go" — fail closed.
+            let cgroup_path = format!("/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs");
+            if let Err(e) = std::fs::write(&cgroup_path, child_pid.to_string()) {
+                let _ = nix::sys::signal::kill(child_p, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(child_p, None);
+                drop(go_wr);
+                anyhow::bail!(
+                    "failed to enroll container {container_id} in zone cgroup \
+                     {cgroup_path}: {e}; refusing to start workload unenforced"
+                );
+            }
+
+            // Signal the child to proceed to exec — it is now inside the boundary.
+            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(go_wr_raw) }, &[1u8]);
+            drop(go_wr);
 
             tracing::info!(pid = child_pid, container = container_id, "child forked");
             Ok(child_pid)
