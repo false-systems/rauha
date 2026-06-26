@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 use rauha_common::error::RauhaError;
 use rauha_evidence::{
@@ -60,6 +61,45 @@ use pb::image::image_service_server::ImageService;
 use pb::sandbox::sandbox_service_server::SandboxService;
 use pb::zone::zone_service_server::ZoneService;
 
+fn rpc_span<T>(
+    request: &Request<T>,
+    rpc_service: &'static str,
+    rpc_method: &'static str,
+) -> tracing::Span {
+    let request_id = metadata_value(request, "x-request-id").unwrap_or_else(new_request_id);
+    let correlation_id =
+        metadata_value(request, "x-correlation-id").unwrap_or_else(|| request_id.clone());
+    let trace_id = request_id.replace('-', "");
+    let span_id = trace_id
+        .get(..16)
+        .map(str::to_string)
+        .unwrap_or_else(|| trace_id.clone());
+
+    tracing::info_span!(
+        "grpc.request",
+        rpc.service = rpc_service,
+        rpc.method = rpc_method,
+        request_id = %request_id,
+        correlation_id = %correlation_id,
+        trace.id = %trace_id,
+        span.id = %span_id,
+    )
+}
+
+fn metadata_value<T>(request: &Request<T>, key: &str) -> Option<String> {
+    request
+        .metadata()
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn new_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 // --- Zone Service ---
 
 pub struct ZoneServiceImpl {
@@ -93,113 +133,137 @@ impl ZoneService for ZoneServiceImpl {
         &self,
         request: Request<pb::zone::CreateZoneRequest>,
     ) -> Result<Response<pb::zone::CreateZoneResponse>, Status> {
-        let req = request.into_inner();
+        let span = rpc_span(&request, "rauha.zone.v1.ZoneService", "CreateZone");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let req = request.into_inner();
 
-        // Zone type from gRPC request field.
-        let zone_type = match req.zone_type.as_str() {
-            "privileged" => rauha_common::zone::ZoneType::Privileged,
-            "global" => rauha_common::zone::ZoneType::Global,
-            _ => rauha_common::zone::ZoneType::NonGlobal,
-        };
+            // Zone type from gRPC request field.
+            let zone_type = match req.zone_type.as_str() {
+                "privileged" => rauha_common::zone::ZoneType::Privileged,
+                "global" => rauha_common::zone::ZoneType::Global,
+                _ => rauha_common::zone::ZoneType::NonGlobal,
+            };
 
-        // Reject oversized policy TOML to prevent memory exhaustion during parsing.
-        const MAX_POLICY_SIZE: usize = 64 * 1024;
-        if req.policy_toml.len() > MAX_POLICY_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "policy_toml exceeds maximum size of {MAX_POLICY_SIZE} bytes"
-            )));
+            // Reject oversized policy TOML to prevent memory exhaustion during parsing.
+            const MAX_POLICY_SIZE: usize = 64 * 1024;
+            if req.policy_toml.len() > MAX_POLICY_SIZE {
+                return Err(Status::invalid_argument(format!(
+                    "policy_toml exceeds maximum size of {MAX_POLICY_SIZE} bytes"
+                )));
+            }
+
+            let policy = if req.policy_toml.is_empty() {
+                rauha_common::zone::ZonePolicy::default()
+            } else {
+                let (_toml_zone_type, parsed_policy) =
+                    crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+                // The gRPC request's zone_type takes precedence over the TOML's
+                // [zone].type field. This allows reusing a policy file across
+                // different zone types.
+                parsed_policy
+            };
+
+            let zone = self
+                .registry
+                .create_zone(&req.name, zone_type, policy)
+                .await
+                .map_err(to_status)?;
+
+            Ok(Response::new(pb::zone::CreateZoneResponse {
+                zone_id: zone.id.to_string(),
+                name: zone.name,
+                state: format!("{:?}", zone.state),
+            }))
         }
-
-        let policy = if req.policy_toml.is_empty() {
-            rauha_common::zone::ZonePolicy::default()
-        } else {
-            let (_toml_zone_type, parsed_policy) =
-                crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
-
-            // The gRPC request's zone_type takes precedence over the TOML's
-            // [zone].type field. This allows reusing a policy file across
-            // different zone types.
-            parsed_policy
-        };
-
-        let zone = self
-            .registry
-            .create_zone(&req.name, zone_type, policy)
-            .await
-            .map_err(to_status)?;
-
-        Ok(Response::new(pb::zone::CreateZoneResponse {
-            zone_id: zone.id.to_string(),
-            name: zone.name,
-            state: format!("{:?}", zone.state),
-        }))
+        .instrument(span)
+        .await
     }
 
     async fn delete_zone(
         &self,
         request: Request<pb::zone::DeleteZoneRequest>,
     ) -> Result<Response<pb::zone::DeleteZoneResponse>, Status> {
-        let req = request.into_inner();
-        self.registry
-            .delete_zone(&req.name, req.force)
-            .await
-            .map_err(to_status)?;
-        Ok(Response::new(pb::zone::DeleteZoneResponse {}))
+        let span = rpc_span(&request, "rauha.zone.v1.ZoneService", "DeleteZone");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let req = request.into_inner();
+            self.registry
+                .delete_zone(&req.name, req.force)
+                .await
+                .map_err(to_status)?;
+            Ok(Response::new(pb::zone::DeleteZoneResponse {}))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn get_zone(
         &self,
         request: Request<pb::zone::GetZoneRequest>,
     ) -> Result<Response<pb::zone::GetZoneResponse>, Status> {
-        let req = request.into_inner();
-        let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
+        let span = rpc_span(&request, "rauha.zone.v1.ZoneService", "GetZone");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let req = request.into_inner();
+            let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
 
-        let containers = self
-            .registry
-            .list_containers(Some(&req.name))
-            .map_err(to_status)?;
+            let containers = self
+                .registry
+                .list_containers(Some(&req.name))
+                .map_err(to_status)?;
 
-        Ok(Response::new(pb::zone::GetZoneResponse {
-            zone: Some(pb::zone::ZoneInfo {
-                id: zone.id.to_string(),
-                name: zone.name,
-                zone_type: format!("{:?}", zone.zone_type),
-                state: format!("{:?}", zone.state),
-                container_count: containers.len() as u32,
-                created_at: zone.created_at.to_rfc3339(),
-            }),
-        }))
+            Ok(Response::new(pb::zone::GetZoneResponse {
+                zone: Some(pb::zone::ZoneInfo {
+                    id: zone.id.to_string(),
+                    name: zone.name,
+                    zone_type: format!("{:?}", zone.zone_type),
+                    state: format!("{:?}", zone.state),
+                    container_count: containers.len() as u32,
+                    created_at: zone.created_at.to_rfc3339(),
+                }),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn list_zones(
         &self,
-        _request: Request<pb::zone::ListZonesRequest>,
+        request: Request<pb::zone::ListZonesRequest>,
     ) -> Result<Response<pb::zone::ListZonesResponse>, Status> {
-        let zones = self.registry.list_zones().map_err(to_status)?;
+        let span = rpc_span(&request, "rauha.zone.v1.ZoneService", "ListZones");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let zones = self.registry.list_zones().map_err(to_status)?;
 
-        let zone_infos = zones
-            .into_iter()
-            .map(|z| {
-                let container_count = self
-                    .registry
-                    .list_containers(Some(&z.name))
-                    .map(|c| c.len() as u32)
-                    .unwrap_or(0);
-                pb::zone::ZoneInfo {
-                    id: z.id.to_string(),
-                    name: z.name,
-                    zone_type: format!("{:?}", z.zone_type),
-                    state: format!("{:?}", z.state),
-                    container_count,
-                    created_at: z.created_at.to_rfc3339(),
-                }
-            })
-            .collect();
+            let zone_infos = zones
+                .into_iter()
+                .map(|z| {
+                    let container_count = self
+                        .registry
+                        .list_containers(Some(&z.name))
+                        .map(|c| c.len() as u32)
+                        .unwrap_or(0);
+                    pb::zone::ZoneInfo {
+                        id: z.id.to_string(),
+                        name: z.name,
+                        zone_type: format!("{:?}", z.zone_type),
+                        state: format!("{:?}", z.state),
+                        container_count,
+                        created_at: z.created_at.to_rfc3339(),
+                    }
+                })
+                .collect();
 
-        Ok(Response::new(pb::zone::ListZonesResponse {
-            zones: zone_infos,
-        }))
+            Ok(Response::new(pb::zone::ListZonesResponse {
+                zones: zone_infos,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn apply_policy(
@@ -1140,7 +1204,6 @@ fn sandbox_event_builder(
 ) -> RuntimeEventBuilder {
     RuntimeEventBuilder::new(name, EventKind::Execution, outcome)
         .task_id(task_id)
-        .correlation_id(task_id)
         .zone_name(zone_name)
         .zone_id(zone_id)
         .backend(
@@ -1609,7 +1672,6 @@ fn emit_enforcement_capture_state(
             )
             .level(Severity::Warn)
             .task_id(task_id)
-            .correlation_id(task_id)
             .zone_name(zone_name)
             .zone_id(zone_id)
             .backend(
@@ -1629,7 +1691,6 @@ fn emit_enforcement_capture_state(
             )
             .level(Severity::Warn)
             .task_id(task_id)
-            .correlation_id(task_id)
             .zone_name(zone_name)
             .zone_id(zone_id)
             .backend(
@@ -1649,7 +1710,6 @@ fn emit_enforcement_capture_state(
             )
             .level(Severity::Warn)
             .task_id(task_id)
-            .correlation_id(task_id)
             .zone_name(zone_name)
             .zone_id(zone_id)
             .backend(
@@ -1830,160 +1890,168 @@ impl SandboxService for SandboxServiceImpl {
         &self,
         request: Request<pb::sandbox::RunSandboxRequest>,
     ) -> Result<Response<pb::sandbox::SandboxResult>, Status> {
-        let req = request.into_inner();
-        let task_id = format!("task-{}", uuid::Uuid::new_v4());
-        RuntimeEventBuilder::new(
-            event_name::SANDBOX_RUN_STARTED,
-            EventKind::Execution,
-            EventOutcome::Started,
-        )
-        .task_id(&task_id)
-        .correlation_id(&task_id)
-        .image_ref(&req.image)
-        .command_hash(command_hash(&req.command))
-        .repo_path_safe(&req.repo_path)
-        .backend(
-            self.registry.backend_name(),
-            self.registry.backend_platform(),
-            self.registry.enforcement_mode(),
-        )
-        .trust_level(TrustLevel::BestEffort)
-        .degraded_reason("enforcement_capture_status_reported_separately")
-        .emit();
-
-        if let Err(status) = validate_sandbox_request(&req) {
+        // Correlate the primary sandbox path with its gRPC request like the
+        // zone handlers: open a request span so this handler's logs and all the
+        // sandbox evidence events (emitted inline below) share one trace.id /
+        // span.id / correlation_id. task_id stays a distinct field.
+        let span = rpc_span(&request, "rauha.sandbox.v1.SandboxService", "RunSandbox");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let req = request.into_inner();
+            let task_id = format!("task-{}", uuid::Uuid::new_v4());
             RuntimeEventBuilder::new(
-                event_name::SANDBOX_RUN_FAILED,
+                event_name::SANDBOX_RUN_STARTED,
                 EventKind::Execution,
-                EventOutcome::Failed,
+                EventOutcome::Started,
             )
-            .level(Severity::Warn)
             .task_id(&task_id)
-            .correlation_id(&task_id)
             .image_ref(&req.image)
             .command_hash(command_hash(&req.command))
+            .repo_path_safe(&req.repo_path)
             .backend(
                 self.registry.backend_name(),
                 self.registry.backend_platform(),
                 self.registry.enforcement_mode(),
             )
-            .error(
-                "sandbox_request_invalid",
-                format!("{:?}", status.code()),
-                status.message().to_string(),
-            )
-            .trust_level(TrustLevel::Complete)
+            .trust_level(TrustLevel::BestEffort)
+            .degraded_reason("enforcement_capture_status_reported_separately")
             .emit();
-            return Err(status);
-        }
 
-        // Resolve the zone. An empty name allocates a temporary zone that we own
-        // and (by default) delete afterwards; a named zone must already exist
-        // and is left intact.
-        let (zone_name, zone_id, temp_zone) = if req.name.trim().is_empty() {
-            let name = format!(
-                "sandbox-{}",
-                &uuid::Uuid::new_v4().simple().to_string()[..12]
-            );
-            let zone = self
-                .registry
-                .create_zone(
-                    &name,
-                    rauha_common::zone::ZoneType::NonGlobal,
-                    rauha_common::zone::ZonePolicy::default(),
-                )
-                .await
-                .map_err(to_status)?;
-            sandbox_event_builder(
-                &self.registry,
-                event_name::SANDBOX_ZONE_ALLOCATED,
-                EventOutcome::Succeeded,
-                &task_id,
-                &zone.name,
-                &zone.id.to_string(),
-            )
-            .trust_level(TrustLevel::Complete)
-            .emit();
-            (zone.name, zone.id.to_string(), true)
-        } else {
-            let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
-            (zone.name, zone.id.to_string(), false)
-        };
-        let mut zone_cleanup = (temp_zone && !req.keep_zone)
-            .then(|| ZoneCleanupGuard::new(self.registry.clone(), zone_name.clone()));
-
-        let outcome = self
-            .execute_task(&task_id, &zone_name, &zone_id, &req)
-            .await;
-
-        // Tear down the temporary zone unless the caller asked to keep it.
-        if temp_zone && !req.keep_zone {
-            if let Err(e) = self.registry.delete_zone(&zone_name, true).await {
-                tracing::warn!(zone = zone_name, %e, "failed to delete temporary sandbox zone");
-                sandbox_event_builder(
-                    &self.registry,
-                    event_name::SANDBOX_CLEANUP_PARTIAL,
-                    EventOutcome::Degraded,
-                    &task_id,
-                    &zone_name,
-                    &zone_id,
+            if let Err(status) = validate_sandbox_request(&req) {
+                RuntimeEventBuilder::new(
+                    event_name::SANDBOX_RUN_FAILED,
+                    EventKind::Execution,
+                    EventOutcome::Failed,
                 )
                 .level(Severity::Warn)
-                .error("zone_cleanup_failed", "cleanup", e.to_string())
-                .trust_level(TrustLevel::Partial)
-                .degraded_reason("temporary_zone_delete_failed")
+                .task_id(&task_id)
+                .image_ref(&req.image)
+                .command_hash(command_hash(&req.command))
+                .backend(
+                    self.registry.backend_name(),
+                    self.registry.backend_platform(),
+                    self.registry.enforcement_mode(),
+                )
+                .error(
+                    "sandbox_request_invalid",
+                    format!("{:?}", status.code()),
+                    status.message().to_string(),
+                )
+                .trust_level(TrustLevel::Complete)
                 .emit();
+                return Err(status);
             }
-            if let Some(cleanup) = &mut zone_cleanup {
-                cleanup.disarm();
+
+            // Resolve the zone. An empty name allocates a temporary zone that we own
+            // and (by default) delete afterwards; a named zone must already exist
+            // and is left intact.
+            let (zone_name, zone_id, temp_zone) = if req.name.trim().is_empty() {
+                let name = format!(
+                    "sandbox-{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..12]
+                );
+                let zone = self
+                    .registry
+                    .create_zone(
+                        &name,
+                        rauha_common::zone::ZoneType::NonGlobal,
+                        rauha_common::zone::ZonePolicy::default(),
+                    )
+                    .await
+                    .map_err(to_status)?;
+                sandbox_event_builder(
+                    &self.registry,
+                    event_name::SANDBOX_ZONE_ALLOCATED,
+                    EventOutcome::Succeeded,
+                    &task_id,
+                    &zone.name,
+                    &zone.id.to_string(),
+                )
+                .trust_level(TrustLevel::Complete)
+                .emit();
+                (zone.name, zone.id.to_string(), true)
+            } else {
+                let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
+                (zone.name, zone.id.to_string(), false)
+            };
+            let mut zone_cleanup = (temp_zone && !req.keep_zone)
+                .then(|| ZoneCleanupGuard::new(self.registry.clone(), zone_name.clone()));
+
+            let outcome = self
+                .execute_task(&task_id, &zone_name, &zone_id, &req)
+                .await;
+
+            // Tear down the temporary zone unless the caller asked to keep it.
+            if temp_zone && !req.keep_zone {
+                if let Err(e) = self.registry.delete_zone(&zone_name, true).await {
+                    tracing::warn!(zone = zone_name, %e, "failed to delete temporary sandbox zone");
+                    sandbox_event_builder(
+                        &self.registry,
+                        event_name::SANDBOX_CLEANUP_PARTIAL,
+                        EventOutcome::Degraded,
+                        &task_id,
+                        &zone_name,
+                        &zone_id,
+                    )
+                    .level(Severity::Warn)
+                    .error("zone_cleanup_failed", "cleanup", e.to_string())
+                    .trust_level(TrustLevel::Partial)
+                    .degraded_reason("temporary_zone_delete_failed")
+                    .emit();
+                }
+                if let Some(cleanup) = &mut zone_cleanup {
+                    cleanup.disarm();
+                }
             }
+
+            let exec = outcome.unwrap_or_else(|message| {
+                SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
+            });
+            let run_event = match exec.status {
+                SandboxStatus::Succeeded => (
+                    event_name::SANDBOX_RUN_SUCCEEDED,
+                    EventOutcome::Succeeded,
+                    Severity::Info,
+                ),
+                SandboxStatus::Failed | SandboxStatus::RuntimeError => (
+                    event_name::SANDBOX_RUN_FAILED,
+                    EventOutcome::Failed,
+                    Severity::Warn,
+                ),
+                SandboxStatus::TimedOut => (
+                    event_name::SANDBOX_RUN_FAILED,
+                    EventOutcome::TimedOut,
+                    Severity::Warn,
+                ),
+            };
+            sandbox_event_builder(
+                &self.registry,
+                run_event.0,
+                run_event.1,
+                &task_id,
+                &zone_name,
+                &zone_id,
+            )
+            .level(run_event.2)
+            .duration_ms(exec.duration_ms)
+            .field(
+                "status",
+                FieldValue::String(sandbox_status_str(exec.status).to_string()),
+            )
+            .field(
+                "exit_code",
+                exec.exit_code
+                    .map(|code| FieldValue::I64(code as i64))
+                    .unwrap_or_else(|| FieldValue::String("none".into())),
+            )
+            .trust_level(TrustLevel::BestEffort)
+            .degraded_reason("enforcement_events_are_best_effort")
+            .emit();
+
+            Ok(Response::new(to_proto_result(exec)))
         }
-
-        let exec = outcome.unwrap_or_else(|message| {
-            SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
-        });
-        let run_event = match exec.status {
-            SandboxStatus::Succeeded => (
-                event_name::SANDBOX_RUN_SUCCEEDED,
-                EventOutcome::Succeeded,
-                Severity::Info,
-            ),
-            SandboxStatus::Failed | SandboxStatus::RuntimeError => (
-                event_name::SANDBOX_RUN_FAILED,
-                EventOutcome::Failed,
-                Severity::Warn,
-            ),
-            SandboxStatus::TimedOut => (
-                event_name::SANDBOX_RUN_FAILED,
-                EventOutcome::TimedOut,
-                Severity::Warn,
-            ),
-        };
-        sandbox_event_builder(
-            &self.registry,
-            run_event.0,
-            run_event.1,
-            &task_id,
-            &zone_name,
-            &zone_id,
-        )
-        .level(run_event.2)
-        .duration_ms(exec.duration_ms)
-        .field(
-            "status",
-            FieldValue::String(sandbox_status_str(exec.status).to_string()),
-        )
-        .field(
-            "exit_code",
-            exec.exit_code
-                .map(|code| FieldValue::I64(code as i64))
-                .unwrap_or_else(|| FieldValue::String("none".into())),
-        )
-        .trust_level(TrustLevel::BestEffort)
-        .degraded_reason("enforcement_events_are_best_effort")
-        .emit();
-
-        Ok(Response::new(to_proto_result(exec)))
+        .instrument(span)
+        .await
     }
 }
 

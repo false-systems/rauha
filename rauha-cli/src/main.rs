@@ -4,7 +4,11 @@ use clap::{Parser, Subcommand};
 use commands::output::OutputMode;
 
 #[derive(Parser)]
-#[command(name = "rauha", version, about = "Agent sandbox runtime built on controlled execution zones")]
+#[command(
+    name = "rauha",
+    version,
+    about = "Agent sandbox runtime built on controlled execution zones"
+)]
 struct Cli {
     /// Output JSON instead of human-readable text
     #[arg(long, global = true)]
@@ -59,9 +63,7 @@ enum Commands {
 fn is_streaming_command(cmd: &Commands) -> bool {
     matches!(
         cmd,
-        Commands::Trace(_)
-            | Commands::Top(_)
-            | Commands::Events(_)
+        Commands::Top(_)
             | Commands::Logs(_)
             | Commands::Exec(_)
             | Commands::Attach(_)
@@ -85,9 +87,10 @@ async fn main() {
         OutputMode::Human
     };
 
-    // Reject --json for streaming/interactive commands.
+    // Reject --json for streaming/interactive commands that still lack a
+    // line-delimited machine output contract.
     if out == OutputMode::Json && is_streaming_command(&cli.command) {
-        commands::output::print_error("--json is not supported for streaming/interactive commands (trace, top, events, logs, exec, attach, setup)");
+        commands::output::print_error("--json is not supported for streaming/interactive commands (top, logs, exec, attach, setup)");
         std::process::exit(1);
     }
 
@@ -100,9 +103,9 @@ async fn main() {
         Commands::Delete(args) => commands::run::handle_delete(args, out).await,
         Commands::Image(action) => commands::image::handle(action, out).await,
         Commands::Policy { action } => commands::policy::handle(action, out).await,
-        Commands::Trace(args) => commands::trace::handle_trace(args).await,
+        Commands::Trace(args) => commands::trace::handle_trace(args, out).await,
         Commands::Top(args) => commands::trace::handle_top(args).await,
-        Commands::Events(args) => commands::trace::handle_events(args).await,
+        Commands::Events(args) => commands::trace::handle_events(args, out).await,
         Commands::Logs(args) => commands::logs::handle_logs(args).await,
         Commands::Exec(args) => commands::exec::handle_exec(args).await,
         Commands::Attach(args) => commands::exec::handle_attach(args).await,

@@ -1,4 +1,5 @@
 mod backend;
+mod logging;
 mod logs;
 mod metadata;
 mod network;
@@ -9,11 +10,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rauha_common::observability::ObservabilityConfig;
 use rauha_evidence::{
     event_name, EnforcementMode, EventKind, EventOutcome, RuntimeEventBuilder, Severity, TrustLevel,
 };
 use tonic::transport::Server;
-use tracing_subscriber::EnvFilter;
 
 use server::pb::container::container_service_server::ContainerServiceServer;
 use server::pb::image::image_service_server::ImageServiceServer;
@@ -28,9 +29,9 @@ const DEFAULT_ROOT: &str = if cfg!(target_os = "macos") {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("rauhad=info".parse()?))
-        .init();
+    let observability = ObservabilityConfig::from_env_or_default()?;
+    logging::init(&observability)?;
+    install_panic_hook();
 
     let root = std::env::var("RAUHA_ROOT").unwrap_or_else(|_| DEFAULT_ROOT.into());
     let root_path = PathBuf::from(&root);
@@ -192,4 +193,29 @@ fn cleanup_network() {
     tracing::info!("cleaning up network state");
     #[cfg(target_os = "linux")]
     backend::linux::cleanup_network();
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown".into());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic payload is not a string".into());
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+
+        tracing::error!(
+            event.name = "process.panic",
+            error.kind = "panic",
+            error.message = %payload,
+            location = %location,
+            backtrace = %backtrace,
+            "process.panic"
+        );
+    }));
 }

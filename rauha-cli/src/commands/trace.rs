@@ -1,7 +1,8 @@
 use clap::Args;
+use serde::Serialize;
 use tokio_stream::StreamExt;
 
-use super::connect;
+use super::{connect, output::OutputMode};
 
 mod pb {
     pub mod zone {
@@ -28,11 +29,29 @@ pub struct EventsArgs {
     pub zone: Option<String>,
 }
 
-pub async fn handle_trace(args: TraceArgs) -> anyhow::Result<()> {
-    println!(
-        "Tracing zone {}... (not yet implemented)",
-        args.zone
-    );
+#[derive(Serialize)]
+struct TracePlaceholder<'a> {
+    ok: bool,
+    zone: &'a str,
+    status: &'a str,
+}
+
+pub async fn handle_trace(args: TraceArgs, out: OutputMode) -> anyhow::Result<()> {
+    match out {
+        OutputMode::Human => {
+            println!("Tracing zone {}... (not yet implemented)", args.zone);
+        }
+        OutputMode::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&TracePlaceholder {
+                    ok: false,
+                    zone: &args.zone,
+                    status: "not_implemented",
+                })?
+            );
+        }
+    }
     Ok(())
 }
 
@@ -41,10 +60,17 @@ pub async fn handle_top(_args: TopArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn handle_events(args: EventsArgs) -> anyhow::Result<()> {
+#[derive(Serialize)]
+struct StreamEvent<'a> {
+    timestamp: &'a str,
+    zone_name: &'a str,
+    event_type: &'a str,
+    event: serde_json::Value,
+}
+
+pub async fn handle_events(args: EventsArgs, out: OutputMode) -> anyhow::Result<()> {
     let channel = connect().await?;
-    let mut client =
-        pb::zone::zone_service_client::ZoneServiceClient::new(channel);
+    let mut client = pb::zone::zone_service_client::ZoneServiceClient::new(channel);
 
     let request = pb::zone::WatchEventsRequest {
         zone_name: args.zone.unwrap_or_default(),
@@ -52,19 +78,39 @@ pub async fn handle_events(args: EventsArgs) -> anyhow::Result<()> {
 
     let mut stream = client.watch_events(request).await?.into_inner();
 
-    eprintln!("streaming enforcement events (Ctrl+C to stop)...");
-    eprintln!();
+    if out == OutputMode::Human {
+        eprintln!("streaming enforcement events (Ctrl+C to stop)...");
+        eprintln!();
+    }
 
     while let Some(event) = stream.next().await {
         match event {
-            Ok(e) => {
-                println!(
-                    "{}  {}  {}",
-                    format_timestamp(&e.timestamp),
-                    e.event_type,
-                    e.message,
-                );
-            }
+            Ok(e) => match out {
+                OutputMode::Human => {
+                    println!(
+                        "{}  {}  {}",
+                        format_timestamp(&e.timestamp),
+                        e.event_type,
+                        e.message,
+                    );
+                }
+                OutputMode::Json => {
+                    let event = serde_json::from_str(&e.message).unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "message": e.message,
+                        })
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string(&StreamEvent {
+                            timestamp: &e.timestamp,
+                            zone_name: &e.zone_name,
+                            event_type: &e.event_type,
+                            event,
+                        })?
+                    );
+                }
+            },
             Err(e) => {
                 eprintln!("stream error: {e}");
                 break;

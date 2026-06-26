@@ -294,13 +294,13 @@ pub struct RuntimeEvent {
     pub enforcer_capabilities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "trace.id", skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "parent_span.id", skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "span.id", skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -346,6 +346,9 @@ impl RuntimeEvent {
             backend.platform = self.backend_platform.as_deref().unwrap_or(""),
             backend.enforcement_mode = self.backend_enforcement_mode.map(EnforcementMode::as_str).unwrap_or(""),
             enforcer.backend = self.enforcer_backend.as_deref().unwrap_or(""),
+            trace.id = self.trace_id.as_deref().unwrap_or(""),
+            span.id = self.span_id.as_deref().unwrap_or(""),
+            parent_span.id = self.parent_span_id.as_deref().unwrap_or(""),
             correlation_id = self.correlation_id.as_deref().unwrap_or(""),
             request_id = self.request_id.as_deref().unwrap_or(""),
             trust_level = self.trust_level.map(TrustLevel::as_str).unwrap_or(""),
@@ -370,6 +373,9 @@ impl RuntimeEvent {
             backend.platform = self.backend_platform.as_deref().unwrap_or(""),
             backend.enforcement_mode = self.backend_enforcement_mode.map(EnforcementMode::as_str).unwrap_or(""),
             enforcer.backend = self.enforcer_backend.as_deref().unwrap_or(""),
+            trace.id = self.trace_id.as_deref().unwrap_or(""),
+            span.id = self.span_id.as_deref().unwrap_or(""),
+            parent_span.id = self.parent_span_id.as_deref().unwrap_or(""),
             correlation_id = self.correlation_id.as_deref().unwrap_or(""),
             request_id = self.request_id.as_deref().unwrap_or(""),
             trust_level = self.trust_level.map(TrustLevel::as_str).unwrap_or(""),
@@ -394,6 +400,9 @@ impl RuntimeEvent {
             backend.platform = self.backend_platform.as_deref().unwrap_or(""),
             backend.enforcement_mode = self.backend_enforcement_mode.map(EnforcementMode::as_str).unwrap_or(""),
             enforcer.backend = self.enforcer_backend.as_deref().unwrap_or(""),
+            trace.id = self.trace_id.as_deref().unwrap_or(""),
+            span.id = self.span_id.as_deref().unwrap_or(""),
+            parent_span.id = self.parent_span_id.as_deref().unwrap_or(""),
             correlation_id = self.correlation_id.as_deref().unwrap_or(""),
             request_id = self.request_id.as_deref().unwrap_or(""),
             trust_level = self.trust_level.map(TrustLevel::as_str).unwrap_or(""),
@@ -418,6 +427,9 @@ impl RuntimeEvent {
             backend.platform = self.backend_platform.as_deref().unwrap_or(""),
             backend.enforcement_mode = self.backend_enforcement_mode.map(EnforcementMode::as_str).unwrap_or(""),
             enforcer.backend = self.enforcer_backend.as_deref().unwrap_or(""),
+            trace.id = self.trace_id.as_deref().unwrap_or(""),
+            span.id = self.span_id.as_deref().unwrap_or(""),
+            parent_span.id = self.parent_span_id.as_deref().unwrap_or(""),
             correlation_id = self.correlation_id.as_deref().unwrap_or(""),
             request_id = self.request_id.as_deref().unwrap_or(""),
             trust_level = self.trust_level.map(TrustLevel::as_str).unwrap_or(""),
@@ -553,6 +565,21 @@ impl RuntimeEventBuilder {
         self
     }
 
+    pub fn trace_id(mut self, value: impl Into<String>) -> Self {
+        self.event.trace_id = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn span_id(mut self, value: impl Into<String>) -> Self {
+        self.event.span_id = Some(bound_string(&value.into()));
+        self
+    }
+
+    pub fn parent_span_id(mut self, value: impl Into<String>) -> Self {
+        self.event.parent_span_id = Some(bound_string(&value.into()));
+        self
+    }
+
     pub fn duration_ms(mut self, value: u64) -> Self {
         self.event.duration_ms = Some(value);
         self
@@ -669,7 +696,7 @@ pub struct FalseEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
     pub backend: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "trace.id", skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
     pub what_failed: String,
     pub why_it_matters: String,

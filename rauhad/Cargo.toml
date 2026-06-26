@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+otlp = []
+
 [dependencies]
 rauha-common = { path = "../rauha-common" }
 rauha-enforcer-api = { path = "../rauha-enforcer-api" }
