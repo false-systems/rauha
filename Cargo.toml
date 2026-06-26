@@ -84,6 +84,8 @@ features = ["fs", "mount", "sched", "signal", "user", "net", "hostname", "poll",
 # eBPF (Linux)
 [workspace.dependencies.aya]
 version = "0.13"
+[workspace.dependencies.aya-obj]
+version = "0.2"
 [workspace.dependencies.aya-log]
 version = "0.2"
 

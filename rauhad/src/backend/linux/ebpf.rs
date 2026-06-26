@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use aya::programs::Lsm;
 use aya::{Bpf, BpfLoader, Btf};
+use aya_obj::btf::BtfKind;
 use rauha_common::error::{RauhaError, Result};
 use rauha_ebpf_common::offsets::{
     object_sha256, offsets_sidecar_path, parse_offsets_sidecar, resolve_kernel_offsets_map,
@@ -48,6 +49,9 @@ pub struct EbpfManager {
     // (which owns the actual fds). Do not reorder these fields.
     bpf: Bpf,
     pin_path: PathBuf,
+    /// LSM hooks the running kernel does not expose, skipped at load time.
+    /// Non-empty means enforcement is active but degraded.
+    skipped_hooks: Vec<String>,
     /// Program fds recorded after attach, keyed by program name.
     /// Used in health_check to verify programs are still loaded.
     ///
@@ -151,10 +155,33 @@ impl EbpfManager {
 
         let mut program_fds = HashMap::new();
 
-        // Attach every declared LSM program. Partial enforcement is not safe:
-        // if a kernel lacks a hook we rely on, or an individual attach fails,
-        // Rauha must refuse to start rather than run with a missing boundary.
+        // Attach every declared LSM program that this kernel can support.
+        //
+        // Policy: a hook the running kernel does not expose as a BPF-LSM attach
+        // point is skipped (best-effort, degraded enforcement). Any *other*
+        // failure — the program missing from our own object, or the kernel
+        // rejecting an attach for a hook it does expose — is still fatal: we
+        // refuse to run with a boundary that should exist but silently broke.
+        let mut skipped_hooks: Vec<&str> = Vec::new();
+
         for &(prog_name, hook_name) in LSM_PROGRAMS {
+            // Probe the kernel BTF for `bpf_lsm_<hook>`. If the kernel was not
+            // built exposing this LSM hook to BPF (e.g. cgroup_attach_task is
+            // absent on many stock kernels), skip it gracefully rather than
+            // failing the whole daemon.
+            if btf
+                .id_by_type_name_kind(&format!("bpf_lsm_{hook_name}"), BtfKind::Func)
+                .is_err()
+            {
+                tracing::warn!(
+                    program = prog_name,
+                    hook = hook_name,
+                    "kernel does not expose this BPF-LSM hook; skipping (degraded enforcement)"
+                );
+                skipped_hooks.push(hook_name);
+                continue;
+            }
+
             let prog: &mut Lsm = match bpf.program_mut(prog_name) {
                 Some(p) => match p.try_into() {
                     Ok(lsm) => lsm,
@@ -198,20 +225,46 @@ impl EbpfManager {
             );
         }
 
-        if program_fds.len() != LSM_PROGRAMS.len() {
+        // Every hook the kernel *does* expose must have attached — the loop
+        // hard-fails otherwise — so this should always hold. Kept as a
+        // defensive invariant against future refactors of the loop above.
+        let expected = LSM_PROGRAMS.len() - skipped_hooks.len();
+        if program_fds.len() != expected {
             return Err(RauhaError::EbpfError {
                 message: format!(
-                    "partial LSM attachment: attached {} of {} required programs",
+                    "partial LSM attachment: attached {} of {} attachable programs",
                     program_fds.len(),
-                    LSM_PROGRAMS.len()
+                    expected
                 ),
                 hint: "restart rauhad after fixing kernel BPF-LSM support".into(),
             });
         }
 
+        // Refuse to run with zero enforcement — that is indistinguishable from
+        // having no sandbox at all, and is never what the operator wants.
+        if program_fds.is_empty() {
+            return Err(RauhaError::EbpfError {
+                message: "no LSM hooks could be attached on this kernel".into(),
+                hint: "kernel exposes none of Rauha's BPF-LSM hooks; check \
+                       CONFIG_BPF_LSM=y and `lsm=bpf` in the kernel cmdline"
+                    .into(),
+            });
+        }
+
+        if !skipped_hooks.is_empty() {
+            tracing::warn!(
+                skipped = ?skipped_hooks,
+                attached = program_fds.len(),
+                total = LSM_PROGRAMS.len(),
+                "running with DEGRADED enforcement: some LSM hooks are \
+                 unavailable on this kernel"
+            );
+        }
+
         tracing::info!(
             attached = program_fds.len(),
             total = LSM_PROGRAMS.len(),
+            skipped = skipped_hooks.len(),
             pin_path = %pin_path.display(),
             "eBPF programs loaded"
         );
@@ -219,6 +272,7 @@ impl EbpfManager {
         let mut mgr = Self {
             bpf,
             pin_path,
+            skipped_hooks: skipped_hooks.iter().map(|h| h.to_string()).collect(),
             program_fds,
         };
 
@@ -227,6 +281,12 @@ impl EbpfManager {
         mgr.verify_offset_self_test()?;
 
         Ok(mgr)
+    }
+
+    /// LSM hooks skipped because the running kernel does not expose them.
+    /// Non-empty means enforcement is active but degraded.
+    pub fn skipped_hooks(&self) -> &[String] {
+        &self.skipped_hooks
     }
 
     /// Take ownership of the ENFORCEMENT_EVENTS ring buffer map.

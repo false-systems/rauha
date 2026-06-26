@@ -76,14 +76,25 @@ async fn main() -> anyhow::Result<()> {
         rauha_common::zone::IsolationModel::SyscallPolicy
         | rauha_common::zone::IsolationModel::HardwareBoundary => EnforcementMode::Enforcing,
     };
-    RuntimeEventBuilder::new(
+    // Enforcement may be active but degraded (e.g. a kernel that doesn't expose
+    // every LSM hook). Surface that as structured state so consumers can tell
+    // full from partial enforcement — not only by reading log text.
+    let degraded_reason = backend.enforcement_degraded_reason();
+    let mut backend_event = RuntimeEventBuilder::new(
         event_name::BACKEND_SELECTED,
         EventKind::Backend,
         EventOutcome::Succeeded,
     )
     .backend(backend.name(), platform, enforcement_mode)
-    .trust_level(TrustLevel::Complete)
-    .emit();
+    .trust_level(if degraded_reason.is_some() {
+        TrustLevel::Partial
+    } else {
+        TrustLevel::Complete
+    });
+    if let Some(reason) = degraded_reason {
+        backend_event = backend_event.degraded_reason(reason);
+    }
+    backend_event.emit();
 
     // Create image service.
     let content_store = Arc::new(

@@ -35,6 +35,7 @@ hex = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { workspace = true }
+aya-obj = { workspace = true }
 aya-log = { workspace = true }
 rauha-ebpf-common = { workspace = true }
 nix = { workspace = true }
