@@ -63,6 +63,13 @@ pub trait IsolationBackend: Send + Sync {
     /// The name of this backend (e.g., "linux-ebpf", "macos-virt").
     fn name(&self) -> &str;
 
+    /// Why enforcement is degraded, if it is — e.g. LSM hooks the running
+    /// kernel does not expose. `None` means full enforcement. Backends that
+    /// cannot be partially degraded keep the default.
+    fn enforcement_degraded_reason(&self) -> Option<String> {
+        None
+    }
+
     /// Resolve the backend's compact, kernel-side identifier for a zone.
     ///
     /// Kernel enforcement events carry this compact id (not the user-facing

@@ -1023,6 +1023,15 @@ impl IsolationBackend for LinuxBackend {
         "linux-ebpf"
     }
 
+    fn enforcement_degraded_reason(&self) -> Option<String> {
+        let skipped = self.enforcer.skipped_hooks();
+        if skipped.is_empty() {
+            None
+        } else {
+            Some(format!("lsm_hooks_unavailable:{}", skipped.join(",")))
+        }
+    }
+
     fn kernel_zone_id(&self, zone: &ZoneHandle) -> Option<u32> {
         // The compact id is the same value stamped on enforcement events as
         // `caller_zone`. A poisoned lock or unmapped zone yields None — callers

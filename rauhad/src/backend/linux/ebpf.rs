@@ -49,6 +49,9 @@ pub struct EbpfManager {
     // (which owns the actual fds). Do not reorder these fields.
     bpf: Bpf,
     pin_path: PathBuf,
+    /// LSM hooks the running kernel does not expose, skipped at load time.
+    /// Non-empty means enforcement is active but degraded.
+    skipped_hooks: Vec<String>,
     /// Program fds recorded after attach, keyed by program name.
     /// Used in health_check to verify programs are still loaded.
     ///
@@ -269,6 +272,7 @@ impl EbpfManager {
         let mut mgr = Self {
             bpf,
             pin_path,
+            skipped_hooks: skipped_hooks.iter().map(|h| h.to_string()).collect(),
             program_fds,
         };
 
@@ -277,6 +281,12 @@ impl EbpfManager {
         mgr.verify_offset_self_test()?;
 
         Ok(mgr)
+    }
+
+    /// LSM hooks skipped because the running kernel does not expose them.
+    /// Non-empty means enforcement is active but degraded.
+    pub fn skipped_hooks(&self) -> &[String] {
+        &self.skipped_hooks
     }
 
     /// Take ownership of the ENFORCEMENT_EVENTS ring buffer map.

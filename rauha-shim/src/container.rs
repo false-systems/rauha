@@ -30,6 +30,7 @@ pub fn fork_and_exec(
     use oci_spec::runtime::Spec;
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
 
     let spec: Spec = serde_json::from_str(spec_json)?;
@@ -97,6 +98,12 @@ pub fn fork_and_exec(
         std::ffi::CString::new(log_dir.join("stderr.log").to_string_lossy().as_bytes())
             .unwrap_or_default();
 
+    // Pre-allocate pivot_root paths as CStrings BEFORE fork — the child path
+    // must not allocate (fork-safety invariant).
+    let rootfs_cstr = CString::new(rootfs.as_os_str().as_bytes()).unwrap_or_default();
+    let pivot_old_cstr =
+        CString::new(rootfs.join(".pivot_old").as_os_str().as_bytes()).unwrap_or_default();
+
     // Convert OwnedFds to raw fds for use across fork.
     // We manage lifetime manually after fork (each side closes the ends it
     // does not use, by dropping the corresponding OwnedFd).
@@ -130,31 +137,35 @@ pub fn fork_and_exec(
             // Enter a new mount namespace and make all mounts private.
             // pivot_root requires: (1) own mount namespace, (2) private root mount.
             // Without MS_PRIVATE|MS_REC, inherited shared mounts cause EINVAL.
-            if let Err(e) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS) {
-                let msg = format!("unshare(CLONE_NEWNS) failed: {e}\n");
+            // Error reporting in the child must be async-signal-safe: static
+            // byte messages + libc::write, never format!/alloc. The specific
+            // errno is dropped; the failing operation is still identifiable.
+            if nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS).is_err() {
                 unsafe {
+                    let msg = b"rauha-shim: unshare(CLONE_NEWNS) failed\n";
                     let _ = libc::write(2, msg.as_ptr() as _, msg.len());
                     libc::_exit(1);
                 }
             }
             // Make all mounts private — required for pivot_root to work.
-            if let Err(e) = nix::mount::mount(
+            if nix::mount::mount(
                 None::<&str>,
                 "/",
                 None::<&str>,
                 nix::mount::MsFlags::MS_PRIVATE | nix::mount::MsFlags::MS_REC,
                 None::<&str>,
-            ) {
-                let msg = format!("mount(MS_PRIVATE) failed: {e}\n");
+            )
+            .is_err()
+            {
                 unsafe {
+                    let msg = b"rauha-shim: mount(MS_PRIVATE) failed\n";
                     let _ = libc::write(2, msg.as_ptr() as _, msg.len());
                     libc::_exit(1);
                 }
             }
 
             // pivot_root into the container rootfs.
-            if let Err(e) = do_pivot_root(&rootfs) {
-                let msg = format!("pivot_root failed: {e}\n");
+            if let Err(msg) = do_pivot_root(&rootfs_cstr, &pivot_old_cstr) {
                 unsafe {
                     let _ = libc::write(2, msg.as_ptr() as _, msg.len());
                     libc::_exit(1);
@@ -202,9 +213,9 @@ pub fn fork_and_exec(
             let _ = nix::unistd::chdir(cwd_cstr.as_c_str());
 
             // Replace process with container command (execvp, no shell involved).
-            let err = nix::unistd::execvp(&c_args[0], &c_args);
-            let msg = format!("execvp failed: {err:?}\n");
+            let _ = nix::unistd::execvp(&c_args[0], &c_args);
             unsafe {
+                let msg = b"rauha-shim: execvp failed\n";
                 let _ = libc::write(2, msg.as_ptr() as _, msg.len());
                 libc::_exit(127);
             }
@@ -248,8 +259,18 @@ pub fn fork_and_exec(
             }
 
             // Signal the child to proceed to exec — it is now inside the boundary.
-            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(go_wr_raw) }, &[1u8]);
+            let signaled = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(go_wr_raw) }, &[1u8]);
             drop(go_wr);
+            // A failed/short write (e.g. EPIPE) means the child went away between
+            // "setup done" and "go" — it will never exec the workload. Reap it
+            // and report failure rather than claiming a container started.
+            if !matches!(signaled, Ok(1)) {
+                let _ = nix::sys::wait::waitpid(child_p, None);
+                anyhow::bail!(
+                    "container {container_id} exited before workload exec \
+                     (enrollment signal not delivered)"
+                );
+            }
 
             tracing::info!(pid = child_pid, container = container_id, "child forked");
             Ok(child_pid)
@@ -334,28 +355,44 @@ pub fn try_wait(pid: u32) -> Option<i32> {
 }
 
 /// Perform pivot_root to change the container's root filesystem.
+///
+/// Runs in the post-fork child, so it must be async-signal-safe: no heap
+/// allocation. Paths are pre-allocated `CStr`s; directory create/remove use
+/// `libc` directly (not `std::fs`); errors are returned as static `&str`
+/// messages for the caller to `libc::write` + `_exit`.
 #[cfg(target_os = "linux")]
-fn do_pivot_root(new_root: &Path) -> anyhow::Result<()> {
+fn do_pivot_root(
+    new_root: &std::ffi::CStr,
+    old_root: &std::ffi::CStr,
+) -> Result<(), &'static [u8]> {
     use nix::mount::{mount, umount2, MntFlags, MsFlags};
 
     // Bind-mount new_root onto itself (required by pivot_root).
     mount(
         Some(new_root),
         new_root,
-        None::<&str>,
+        None::<&std::ffi::CStr>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
-        None::<&str>,
-    )?;
+        None::<&std::ffi::CStr>,
+    )
+    .map_err(|_| &b"rauha-shim: bind-mount rootfs failed\n"[..])?;
 
-    let old_root = new_root.join(".pivot_old");
-    std::fs::create_dir_all(&old_root)?;
+    // Create the pivot-old mountpoint (ignore EEXIST). libc::mkdir is
+    // async-signal-safe; std::fs would allocate.
+    unsafe {
+        libc::mkdir(old_root.as_ptr(), 0o755);
+    }
 
-    nix::unistd::pivot_root(new_root, &old_root)?;
-    nix::unistd::chdir("/")?;
+    nix::unistd::pivot_root(new_root, old_root)
+        .map_err(|_| &b"rauha-shim: pivot_root failed\n"[..])?;
+    nix::unistd::chdir(c"/").map_err(|_| &b"rauha-shim: chdir(/) failed\n"[..])?;
 
     // Unmount old root.
-    umount2("/.pivot_old", MntFlags::MNT_DETACH)?;
-    std::fs::remove_dir("/.pivot_old").ok();
+    umount2(c"/.pivot_old", MntFlags::MNT_DETACH)
+        .map_err(|_| &b"rauha-shim: umount old root failed\n"[..])?;
+    unsafe {
+        libc::rmdir(c"/.pivot_old".as_ptr());
+    }
 
     Ok(())
 }

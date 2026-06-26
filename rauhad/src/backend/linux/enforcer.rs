@@ -95,6 +95,18 @@ impl LinuxEnforcer {
         self.event_tx.clone()
     }
 
+    /// LSM hooks the running kernel does not expose (skipped at load). Non-empty
+    /// means kernel enforcement is active but degraded.
+    pub(super) fn skipped_hooks(&self) -> Vec<String> {
+        match lock_backend(&self.ebpf, "linux_enforcer.ebpf") {
+            Ok(guard) => guard
+                .as_ref()
+                .map(|m| m.skipped_hooks().to_vec())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub(super) fn set_zone_policy(&self, zone_id: u32, policy: &ZonePolicy) -> Result<()> {
         self.with_bpf("policy enforcement", |bpf| {
             MapManager::set_zone_policy(bpf, zone_id, policy)
