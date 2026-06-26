@@ -53,6 +53,17 @@ pub fn init(config: &ObservabilityConfig) -> anyhow::Result<()> {
                 .init();
         }
     }
+
+    // Sink routing beyond stdout is parsed and documented but not yet wired.
+    // Be honest about it at startup rather than silently ignoring the config.
+    if !config.sinks.stdout || config.sinks.rotating_file.is_some() {
+        tracing::warn!(
+            stdout = config.sinks.stdout,
+            rotating_file = config.sinks.rotating_file.is_some(),
+            "observability sink routing is not yet implemented; logs always go to \
+             stdout regardless of [observability.sinks] (stdout=false / rotating_file ignored)"
+        );
+    }
     Ok(())
 }
 
@@ -114,7 +125,7 @@ where
 
         let meta = event.metadata();
         map.insert("timestamp".into(), json!(now_rfc3339()));
-        map.insert("level".into(), json!(meta.level().as_str()));
+        map.insert("log.level".into(), json!(meta.level().as_str()));
         map.insert("target".into(), json!(meta.target()));
 
         // Constant resource attributes (top-level, every line).
@@ -207,7 +218,8 @@ impl Visit for JsonVisitor<'_> {
 }
 
 fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    // RFC3339 UTC, millisecond precision, per the observability schema.
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn stdout_is_tty() -> bool {

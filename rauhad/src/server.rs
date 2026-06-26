@@ -1204,7 +1204,6 @@ fn sandbox_event_builder(
 ) -> RuntimeEventBuilder {
     RuntimeEventBuilder::new(name, EventKind::Execution, outcome)
         .task_id(task_id)
-        .correlation_id(task_id)
         .zone_name(zone_name)
         .zone_id(zone_id)
         .backend(
@@ -1673,7 +1672,6 @@ fn emit_enforcement_capture_state(
             )
             .level(Severity::Warn)
             .task_id(task_id)
-            .correlation_id(task_id)
             .zone_name(zone_name)
             .zone_id(zone_id)
             .backend(
@@ -1693,7 +1691,6 @@ fn emit_enforcement_capture_state(
             )
             .level(Severity::Warn)
             .task_id(task_id)
-            .correlation_id(task_id)
             .zone_name(zone_name)
             .zone_id(zone_id)
             .backend(
@@ -1713,7 +1710,6 @@ fn emit_enforcement_capture_state(
             )
             .level(Severity::Warn)
             .task_id(task_id)
-            .correlation_id(task_id)
             .zone_name(zone_name)
             .zone_id(zone_id)
             .backend(
@@ -1894,160 +1890,168 @@ impl SandboxService for SandboxServiceImpl {
         &self,
         request: Request<pb::sandbox::RunSandboxRequest>,
     ) -> Result<Response<pb::sandbox::SandboxResult>, Status> {
-        let req = request.into_inner();
-        let task_id = format!("task-{}", uuid::Uuid::new_v4());
-        RuntimeEventBuilder::new(
-            event_name::SANDBOX_RUN_STARTED,
-            EventKind::Execution,
-            EventOutcome::Started,
-        )
-        .task_id(&task_id)
-        .correlation_id(&task_id)
-        .image_ref(&req.image)
-        .command_hash(command_hash(&req.command))
-        .repo_path_safe(&req.repo_path)
-        .backend(
-            self.registry.backend_name(),
-            self.registry.backend_platform(),
-            self.registry.enforcement_mode(),
-        )
-        .trust_level(TrustLevel::BestEffort)
-        .degraded_reason("enforcement_capture_status_reported_separately")
-        .emit();
-
-        if let Err(status) = validate_sandbox_request(&req) {
+        // Correlate the primary sandbox path with its gRPC request like the
+        // zone handlers: open a request span so this handler's logs and all the
+        // sandbox evidence events (emitted inline below) share one trace.id /
+        // span.id / correlation_id. task_id stays a distinct field.
+        let span = rpc_span(&request, "rauha.sandbox.v1.SandboxService", "RunSandbox");
+        async move {
+            tracing::info!(event.name = "grpc.request.started", "grpc request started");
+            let req = request.into_inner();
+            let task_id = format!("task-{}", uuid::Uuid::new_v4());
             RuntimeEventBuilder::new(
-                event_name::SANDBOX_RUN_FAILED,
+                event_name::SANDBOX_RUN_STARTED,
                 EventKind::Execution,
-                EventOutcome::Failed,
+                EventOutcome::Started,
             )
-            .level(Severity::Warn)
             .task_id(&task_id)
-            .correlation_id(&task_id)
             .image_ref(&req.image)
             .command_hash(command_hash(&req.command))
+            .repo_path_safe(&req.repo_path)
             .backend(
                 self.registry.backend_name(),
                 self.registry.backend_platform(),
                 self.registry.enforcement_mode(),
             )
-            .error(
-                "sandbox_request_invalid",
-                format!("{:?}", status.code()),
-                status.message().to_string(),
-            )
-            .trust_level(TrustLevel::Complete)
+            .trust_level(TrustLevel::BestEffort)
+            .degraded_reason("enforcement_capture_status_reported_separately")
             .emit();
-            return Err(status);
-        }
 
-        // Resolve the zone. An empty name allocates a temporary zone that we own
-        // and (by default) delete afterwards; a named zone must already exist
-        // and is left intact.
-        let (zone_name, zone_id, temp_zone) = if req.name.trim().is_empty() {
-            let name = format!(
-                "sandbox-{}",
-                &uuid::Uuid::new_v4().simple().to_string()[..12]
-            );
-            let zone = self
-                .registry
-                .create_zone(
-                    &name,
-                    rauha_common::zone::ZoneType::NonGlobal,
-                    rauha_common::zone::ZonePolicy::default(),
-                )
-                .await
-                .map_err(to_status)?;
-            sandbox_event_builder(
-                &self.registry,
-                event_name::SANDBOX_ZONE_ALLOCATED,
-                EventOutcome::Succeeded,
-                &task_id,
-                &zone.name,
-                &zone.id.to_string(),
-            )
-            .trust_level(TrustLevel::Complete)
-            .emit();
-            (zone.name, zone.id.to_string(), true)
-        } else {
-            let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
-            (zone.name, zone.id.to_string(), false)
-        };
-        let mut zone_cleanup = (temp_zone && !req.keep_zone)
-            .then(|| ZoneCleanupGuard::new(self.registry.clone(), zone_name.clone()));
-
-        let outcome = self
-            .execute_task(&task_id, &zone_name, &zone_id, &req)
-            .await;
-
-        // Tear down the temporary zone unless the caller asked to keep it.
-        if temp_zone && !req.keep_zone {
-            if let Err(e) = self.registry.delete_zone(&zone_name, true).await {
-                tracing::warn!(zone = zone_name, %e, "failed to delete temporary sandbox zone");
-                sandbox_event_builder(
-                    &self.registry,
-                    event_name::SANDBOX_CLEANUP_PARTIAL,
-                    EventOutcome::Degraded,
-                    &task_id,
-                    &zone_name,
-                    &zone_id,
+            if let Err(status) = validate_sandbox_request(&req) {
+                RuntimeEventBuilder::new(
+                    event_name::SANDBOX_RUN_FAILED,
+                    EventKind::Execution,
+                    EventOutcome::Failed,
                 )
                 .level(Severity::Warn)
-                .error("zone_cleanup_failed", "cleanup", e.to_string())
-                .trust_level(TrustLevel::Partial)
-                .degraded_reason("temporary_zone_delete_failed")
+                .task_id(&task_id)
+                .image_ref(&req.image)
+                .command_hash(command_hash(&req.command))
+                .backend(
+                    self.registry.backend_name(),
+                    self.registry.backend_platform(),
+                    self.registry.enforcement_mode(),
+                )
+                .error(
+                    "sandbox_request_invalid",
+                    format!("{:?}", status.code()),
+                    status.message().to_string(),
+                )
+                .trust_level(TrustLevel::Complete)
                 .emit();
+                return Err(status);
             }
-            if let Some(cleanup) = &mut zone_cleanup {
-                cleanup.disarm();
+
+            // Resolve the zone. An empty name allocates a temporary zone that we own
+            // and (by default) delete afterwards; a named zone must already exist
+            // and is left intact.
+            let (zone_name, zone_id, temp_zone) = if req.name.trim().is_empty() {
+                let name = format!(
+                    "sandbox-{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..12]
+                );
+                let zone = self
+                    .registry
+                    .create_zone(
+                        &name,
+                        rauha_common::zone::ZoneType::NonGlobal,
+                        rauha_common::zone::ZonePolicy::default(),
+                    )
+                    .await
+                    .map_err(to_status)?;
+                sandbox_event_builder(
+                    &self.registry,
+                    event_name::SANDBOX_ZONE_ALLOCATED,
+                    EventOutcome::Succeeded,
+                    &task_id,
+                    &zone.name,
+                    &zone.id.to_string(),
+                )
+                .trust_level(TrustLevel::Complete)
+                .emit();
+                (zone.name, zone.id.to_string(), true)
+            } else {
+                let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
+                (zone.name, zone.id.to_string(), false)
+            };
+            let mut zone_cleanup = (temp_zone && !req.keep_zone)
+                .then(|| ZoneCleanupGuard::new(self.registry.clone(), zone_name.clone()));
+
+            let outcome = self
+                .execute_task(&task_id, &zone_name, &zone_id, &req)
+                .await;
+
+            // Tear down the temporary zone unless the caller asked to keep it.
+            if temp_zone && !req.keep_zone {
+                if let Err(e) = self.registry.delete_zone(&zone_name, true).await {
+                    tracing::warn!(zone = zone_name, %e, "failed to delete temporary sandbox zone");
+                    sandbox_event_builder(
+                        &self.registry,
+                        event_name::SANDBOX_CLEANUP_PARTIAL,
+                        EventOutcome::Degraded,
+                        &task_id,
+                        &zone_name,
+                        &zone_id,
+                    )
+                    .level(Severity::Warn)
+                    .error("zone_cleanup_failed", "cleanup", e.to_string())
+                    .trust_level(TrustLevel::Partial)
+                    .degraded_reason("temporary_zone_delete_failed")
+                    .emit();
+                }
+                if let Some(cleanup) = &mut zone_cleanup {
+                    cleanup.disarm();
+                }
             }
+
+            let exec = outcome.unwrap_or_else(|message| {
+                SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
+            });
+            let run_event = match exec.status {
+                SandboxStatus::Succeeded => (
+                    event_name::SANDBOX_RUN_SUCCEEDED,
+                    EventOutcome::Succeeded,
+                    Severity::Info,
+                ),
+                SandboxStatus::Failed | SandboxStatus::RuntimeError => (
+                    event_name::SANDBOX_RUN_FAILED,
+                    EventOutcome::Failed,
+                    Severity::Warn,
+                ),
+                SandboxStatus::TimedOut => (
+                    event_name::SANDBOX_RUN_FAILED,
+                    EventOutcome::TimedOut,
+                    Severity::Warn,
+                ),
+            };
+            sandbox_event_builder(
+                &self.registry,
+                run_event.0,
+                run_event.1,
+                &task_id,
+                &zone_name,
+                &zone_id,
+            )
+            .level(run_event.2)
+            .duration_ms(exec.duration_ms)
+            .field(
+                "status",
+                FieldValue::String(sandbox_status_str(exec.status).to_string()),
+            )
+            .field(
+                "exit_code",
+                exec.exit_code
+                    .map(|code| FieldValue::I64(code as i64))
+                    .unwrap_or_else(|| FieldValue::String("none".into())),
+            )
+            .trust_level(TrustLevel::BestEffort)
+            .degraded_reason("enforcement_events_are_best_effort")
+            .emit();
+
+            Ok(Response::new(to_proto_result(exec)))
         }
-
-        let exec = outcome.unwrap_or_else(|message| {
-            SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
-        });
-        let run_event = match exec.status {
-            SandboxStatus::Succeeded => (
-                event_name::SANDBOX_RUN_SUCCEEDED,
-                EventOutcome::Succeeded,
-                Severity::Info,
-            ),
-            SandboxStatus::Failed | SandboxStatus::RuntimeError => (
-                event_name::SANDBOX_RUN_FAILED,
-                EventOutcome::Failed,
-                Severity::Warn,
-            ),
-            SandboxStatus::TimedOut => (
-                event_name::SANDBOX_RUN_FAILED,
-                EventOutcome::TimedOut,
-                Severity::Warn,
-            ),
-        };
-        sandbox_event_builder(
-            &self.registry,
-            run_event.0,
-            run_event.1,
-            &task_id,
-            &zone_name,
-            &zone_id,
-        )
-        .level(run_event.2)
-        .duration_ms(exec.duration_ms)
-        .field(
-            "status",
-            FieldValue::String(sandbox_status_str(exec.status).to_string()),
-        )
-        .field(
-            "exit_code",
-            exec.exit_code
-                .map(|code| FieldValue::I64(code as i64))
-                .unwrap_or_else(|| FieldValue::String("none".into())),
-        )
-        .trust_level(TrustLevel::BestEffort)
-        .degraded_reason("enforcement_events_are_best_effort")
-        .emit();
-
-        Ok(Response::new(to_proto_result(exec)))
+        .instrument(span)
+        .await
     }
 }
 

@@ -25,6 +25,9 @@ environment = "unknown"
 [observability.drop]
 events = ["shim.__ping__"]
 
+# NOTE: sink routing is parsed but NOT yet wired — logs always go to stdout
+# regardless of these settings. Setting stdout=false or rotating_file logs a
+# startup warning. (Tracked for a follow-up slice.)
 [observability.sinks]
 stdout = true
 
@@ -53,10 +56,11 @@ Environment fallbacks:
 ## Standard Keys
 
 Daemon log lines use JSON by default unless `format = "text"` is configured or
-`format = "auto"` detects an interactive stdout. Operational records include:
+`format = "auto"` detects an interactive stdout. `timestamp` is RFC3339 UTC with
+millisecond precision. Operational records include:
 
 - `timestamp`
-- `level`
+- `log.level`
 - `message`
 - `service.name`
 - `service.version`
