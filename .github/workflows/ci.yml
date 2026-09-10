@@ -13,7 +13,7 @@ permissions:
 jobs:
   quality:
     name: Workspace quality
-    runs-on: arc-arm64
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +40,7 @@ jobs:
 
   ebpf:
     name: eBPF build
-    runs-on: arc-arm64
+    runs-on: arc-arm64   # stays: loads eBPF, needs a kernel a hosted runner does not give
     steps:
       - uses: actions/checkout@v4
 
