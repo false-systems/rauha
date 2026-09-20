@@ -40,6 +40,17 @@ jobs:
 
   ebpf:
     name: eBPF build
+    # Same rule as `privileged` below, and for the same reason: this is a
+    # self-hosted runner inside the false-infra cluster, and a fork pull request
+    # on a public repository would be running its own code there. The guard was
+    # on the privileged job and not on this one (false-infra#207).
+    #
+    # It cannot move to a hosted runner the way `quality` did — loading eBPF
+    # needs a kernel a hosted runner does not give — so the job is skipped for
+    # fork contributions instead. A maintainer moves the contribution onto a
+    # repository branch and it runs there, which is already the stated policy
+    # for `privileged`.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: arc-arm64   # stays: loads eBPF, needs a kernel a hosted runner does not give
     steps:
       - uses: actions/checkout@v4
