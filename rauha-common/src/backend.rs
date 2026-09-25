@@ -67,7 +67,7 @@ pub trait IsolationBackend: Send + Sync {
     /// different semantics for what "cross-zone access denied" means.
     fn isolation_model(&self) -> IsolationModel;
 
-    /// The name of this backend (e.g., "linux-ebpf", "macos-virt").
+    /// The name of this backend (e.g., "linux-ebpf").
     fn name(&self) -> &str;
 
     /// Why enforcement is degraded, if it is — e.g. LSM hooks the running
@@ -89,22 +89,11 @@ pub trait IsolationBackend: Send + Sync {
 
     /// Send a shim request via the backend's native transport.
     ///
-    /// On macOS, this routes through vsock to the guest agent inside the VM.
-    /// On Linux, the registry handles shim communication directly via Unix
-    /// socket, so this default (error) is fine.
+    /// The Linux backend uses this for requests it drives itself; the
+    /// registry talks to the shim over its Unix socket directly.
     fn shim_request(&self, _zone_name: &str, _request: &ShimRequest) -> Result<ShimResponse> {
         Err(crate::error::RauhaError::BackendError(
             "shim_request not supported by this backend".into(),
-        ))
-    }
-
-    /// Connect to a vsock port on a zone's VM for exec I/O relay.
-    ///
-    /// Returns a raw fd for bidirectional streaming. Only implemented by the
-    /// macOS backend — Linux exec uses Unix sockets instead.
-    fn connect_vsock_port(&self, _zone_name: &str, _port: u32) -> Result<std::os::fd::OwnedFd> {
-        Err(crate::error::RauhaError::BackendError(
-            "vsock not available on this backend".into(),
         ))
     }
 }

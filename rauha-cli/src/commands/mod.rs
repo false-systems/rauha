@@ -6,7 +6,6 @@ pub mod policy;
 pub mod receipt;
 pub mod run;
 pub mod sandbox;
-pub mod setup;
 pub mod trace;
 pub mod zone;
 

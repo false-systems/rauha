@@ -2,6 +2,7 @@ mod backend;
 mod logging;
 mod logs;
 mod metadata;
+#[cfg(target_os = "linux")]
 mod network;
 mod server;
 mod zone;
@@ -21,10 +22,13 @@ use server::pb::image::image_service_server::ImageServiceServer;
 use server::pb::sandbox::sandbox_service_server::SandboxServiceServer;
 use server::pb::zone::zone_service_server::ZoneServiceServer;
 
-const DEFAULT_ROOT: &str = if cfg!(target_os = "macos") {
-    "/tmp/rauha"
-} else {
+// Linux is the supported platform; non-Linux builds keep a writable default
+// so unit tests and tooling work on any OS. The daemon itself refuses to
+// start without a real backend (see backend::create_backend).
+const DEFAULT_ROOT: &str = if cfg!(target_os = "linux") {
     "/var/lib/rauha"
+} else {
+    "/tmp/rauha"
 };
 
 #[tokio::main]
@@ -37,8 +41,6 @@ async fn main() -> anyhow::Result<()> {
     let root_path = PathBuf::from(&root);
     let platform = if cfg!(target_os = "linux") {
         "linux"
-    } else if cfg!(target_os = "macos") {
-        "macos"
     } else {
         std::env::consts::OS
     };

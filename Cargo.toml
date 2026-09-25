@@ -8,7 +8,6 @@ members = [
     "rauhad",
     "rauha-cli",
     "rauha-shim",
-    "rauha-guest-agent",
     "rauha-oci",
     "containerd-shim-rauha-v2",
     "rauha-enforce",
@@ -89,21 +88,6 @@ version = "0.13"
 version = "0.2"
 [workspace.dependencies.aya-log]
 version = "0.2"
-
-# macOS Virtualization.framework bindings
-[workspace.dependencies.objc2]
-version = "0.6"
-features = ["exception"]
-[workspace.dependencies.block2]
-version = "0.6"
-[workspace.dependencies.objc2-virtualization]
-version = "0.3"
-features = ["dispatch2"]
-[workspace.dependencies.dispatch2]
-version = "0.3"
-features = ["alloc", "objc2"]
-[workspace.dependencies.objc2-foundation]
-version = "0.3"
 
 # Internal
 [workspace.dependencies.rauha-ebpf-common]

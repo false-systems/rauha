@@ -17,7 +17,6 @@ becoming a runtime.
 - metadata
 - logs and audit events
 - Kubernetes/containerd integration
-- macOS VM-per-zone backend
 - user-facing enforcement event surfaces
 
 ## Syva Owns
@@ -115,7 +114,9 @@ The important rules are:
 - Syva owns Linux kernel enforcement.
 - Rauha translates Rauha policy into Syva/kernel-facing policy.
 - Rauha exposes Syva events through Rauha APIs and sandbox results.
-- macOS does not use Syva.
+- Linux is the only platform with enforcement; there is no macOS backend
+  anymore (removed — a future VM tier would run the same Linux stack inside a
+  VM).
 - unsupported platforms use an explicit noop/unsupported enforcer with honest
   capabilities. A backend without kernel enforcement must reject LSM-required
   rules instead of silently accepting them.

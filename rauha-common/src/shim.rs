@@ -85,17 +85,13 @@ pub enum ShimResponse {
         socket_path: String,
         session_id: Option<String>,
     },
-    /// An exec session is ready. Connect via the appropriate transport for
-    /// bidirectional I/O with the exec process.
-    ///
-    /// Linux shim sets `socket_path`; macOS guest agent sets `vsock_port`.
+    /// An exec session is ready. Connect to the returned Unix socket path
+    /// for bidirectional I/O with the exec process.
     ExecReady {
         /// Internal session identifier used for follow-up control messages.
         session_id: Option<String>,
-        /// Unix socket path (Linux shim).
-        socket_path: Option<String>,
-        /// Vsock port number (macOS guest agent).
-        vsock_port: Option<u32>,
+        /// Unix socket path serving the exec session I/O.
+        socket_path: String,
     },
 }
 
@@ -265,13 +261,7 @@ mod tests {
             },
             ShimResponse::ExecReady {
                 session_id: Some("exec-456".into()),
-                socket_path: Some("/run/rauha/containers/abc/exec-456.sock".into()),
-                vsock_port: None,
-            },
-            ShimResponse::ExecReady {
-                session_id: Some("exec-vsock".into()),
-                socket_path: None,
-                vsock_port: Some(6001),
+                socket_path: "/run/rauha/containers/abc/exec-456.sock".into(),
             },
         ];
 

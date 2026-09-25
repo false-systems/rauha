@@ -15,14 +15,12 @@ pass. It is an inventory, not a claim that every item is fixed.
   attach, image service, and policy parsing at the API boundary.
 - `rauhad/src/backend/linux/*` emits cgroup, namespace, veth, nftables, eBPF,
   BPF map, enforcement event reader, and Linux shim lifecycle logs.
-- `rauhad/src/backend/macos/*` emits VM, APFS, pf, vsock, and macOS container
-  lifecycle logs. `vm.rs` still has `eprintln!` debug-style lines.
 - `rauha-evidence` already normalizes Linux enforcement events and owns sinks,
   but daemon lifecycle and sandbox runtime paths were not using a central
   `event.name` contract.
 - `rauha-cli` uses `println!`/`eprintln!` for user-facing output. That is
   acceptable; CLI output is not daemon evidence.
-- `rauha-shim` and `rauha-guest-agent` emit child/container lifecycle logs.
+- `rauha-shim` emits child/container lifecycle logs.
   Some exec logs include `?command`, which can carry sensitive argv.
 - `rauha-enforce` is legacy and has monitor/status output plus eBPF logs. It
   should not be extended as the primary Rauha evidence path.
@@ -42,12 +40,9 @@ pass. It is an inventory, not a claim that every item is fixed.
 
 ## Unsafe Or Noisy Logs
 
-- `rauha-shim/src/main.rs` and `rauha-guest-agent/src/main.rs` log `?command`
+- `rauha-shim/src/main.rs` logs `?command`
   for exec operations. These should become command hashes plus redacted
   user-visible argv only when safe.
-- `rauhad/src/backend/macos/vm.rs` contains direct `eprintln!` diagnostics. They
-  should become structured backend events or be downgraded behind explicit
-  local debugging.
 - Several backend warnings are prose-only and need stable `error.code` /
   `error.kind` fields.
 - CLI `logs` intentionally prints container stdout/stderr. That must stay a

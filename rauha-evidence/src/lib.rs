@@ -133,7 +133,6 @@ pub mod event_name {
 }
 
 pub const BACKEND_LINUX_EBPF: &str = "linux-ebpf";
-pub const BACKEND_MACOS_VM: &str = "macos-vm";
 
 const MAX_FIELD_CHARS: usize = 4096;
 pub const RUNTIME_EVENT_VERSION: u32 = 1;

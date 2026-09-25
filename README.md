@@ -8,7 +8,7 @@ anything leaves. No Dockerfiles. No secret mounts. No cleanup.
 
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 [![release](https://img.shields.io/badge/release-v0.1.0-2ea44f.svg)](Cargo.toml)
-[![platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS-informational.svg)](#requirements)
+[![platform](https://img.shields.io/badge/platform-Linux-informational.svg)](#requirements)
 [![enforcement](https://img.shields.io/badge/enforcement-Syv%C3%A4%20(Linux%20BPF--LSM)-8a2be2.svg)](#rauha-and-syvä)
 
 Today, letting a coding agent work on a real repository means assembling a
@@ -106,19 +106,17 @@ the market survey and hardening roadmap are in
   the same workload keeps its cgroup, kernel membership, and file ownership —
   probed on every Linux release.
 - **Same model on your laptop and your cluster.** Linux builds zones from
-  cgroups, namespaces, and an OCI rootfs, with Syvä enforcing in the kernel;
-  macOS gives each zone its own VM. One daemon, one policy format, two backends.
+  cgroups, namespaces, and an OCI rootfs, with Syvä enforcing in the kernel.
 - **Neutral.** Claude, Codex, or your own agent — Rauha does not care which.
 
 ## How it works
 
 `rauhad` is a platform-agnostic daemon behind one `IsolationBackend` trait; the
-`rauha` CLI and `containerd-shim-rauha-v2` are thin gRPC clients. On Linux,
-`rauhad` spawns one `rauha-shim` per zone, which supervises `crun` for each
+`rauha` CLI and `containerd-shim-rauha-v2` are thin gRPC clients. `rauhad`
+spawns one `rauha-shim` per zone, which supervises `crun` for each
 container and keeps lifecycle, logs, exec IPC, and evidence together. Zones get
 their own network namespace, an IP on the `rauha0` bridge, and nftables rules
-that default to drop. On macOS the zone is a Virtualization.framework VM with an
-APFS-cloned rootfs and a guest agent over vsock.
+that default to drop.
 
 Policy is TOML (`policies/standard.toml`): capabilities, resources, network mode
 and egress, filesystem rules, devices, syscalls, and cross-zone communication.
@@ -161,27 +159,25 @@ path.** See [`docs/rauha-syva-boundary.md`](docs/rauha-syva-boundary.md).
 - **A sandbox, not a hardware boundary** — BPF-LSM is OS-level isolation and is
   additive-only: it can deny, but cannot override SELinux/AppArmor. Covert
   channels through shared kernel resources are out of scope.
-- **The two backends are different isolation models** — cgroups/namespaces on
-  Linux vs. a VM per zone on macOS; they are not byte-for-byte equivalent.
+- **Linux-only** — the former macOS VM backend was removed (it could confine
+  but not observe, and had drifted to non-compiling); a future VM tier would
+  run the same Linux stack inside a VM instead of a parallel macOS backend.
 - **Kubernetes integration requires containerd + RuntimeClass wiring**;
   installation docs and examples are still being written.
 
 ## Requirements
 
-Rauha runs on Linux and macOS; full kernel enforcement is Linux-only.
+Rauha runs on Linux. The workspace also compiles and its unit tests run on
+other platforms (e.g. macOS dev machines), but the daemon refuses to start
+there — there is no non-Linux backend.
 
 - **Linux** — 6.1+ with `CONFIG_BPF_LSM=y`, `CONFIG_BPF_SYSCALL=y`,
   `CONFIG_DEBUG_INFO_BTF=y`; boot parameter `lsm=lockdown,capability,bpf`; BTF
   at `/sys/kernel/btf/vmlinux`. The Linux daemon
   **fails closed**: it requires root and a working BPF-LSM kernel and refuses to
-  start without enforcement. There is no degraded Linux mode. For rootless
-  local iteration, use the macOS backend.
-- **macOS** — 15+ on Apple Silicon or Intel with VT-x. Sign `rauhad` after every
-  build: `codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad`.
-  Install VM assets with `rauha setup`.
+  start without enforcement. There is no degraded Linux mode.
 
-Root directory: `/var/lib/rauha` on Linux, `/tmp/rauha` on macOS (override with
-`RAUHA_ROOT`).
+Root directory: `/var/lib/rauha` (override with `RAUHA_ROOT`).
 
 ## Build, test, and verify
 

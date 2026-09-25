@@ -19,7 +19,7 @@ same journals.
 | **RunHead** | A CAS-controlled pointer to an immutable manifest of the Run's current state (see §5). |
 | **Journal** | Append-only, hash-chained record of everything that happened to the Run (§3). |
 | **Cell** | A replaceable materialization of a Run checkpoint: the zone, its workspace, its capability handles. A Cell may be destroyed and rebuilt at any time. |
-| **Custodian** | The small trusted process beside the Cell (today: `rauhad` + `rauha-shim`, or the macOS VM host). Owns the process/VM, capability handles, enforcement, freezing, and the fencing epoch. Present at every tier. |
+| **Custodian** | The small trusted process beside the Cell (today: `rauhad` + `rauha-shim`). Owns the process/VM, capability handles, enforcement, freezing, and the fencing epoch. Present at every tier. |
 | **Supervisor** | Owns the Run's lifecycle: reduces the journal into state, decides pause/resume/delegation, coordinates retries and humans. Rust in tier 0; OTP/Vartio remotely. |
 | **Capability** | A brokered service outside the boundary (git, credentials/egress, services, proof gates, human, remote). The agent holds a handle, never the underlying secret. |
 | **Effect** | An externally visible action performed through a capability (§6). |
@@ -151,7 +151,7 @@ partition and holds the only real handles.
   needed during the partition.
 - **RP-12** On lease expiry the custodian (a) revokes every capability grant
   (`capability.revoked`), (b) freezes the Cell — `cgroup.freeze` on Linux, VM
-  pause on macOS — (c) appends `run.frozen{reason: lease_expired}`. Order
+  pause in a future VM tier — (c) appends `run.frozen{reason: lease_expired}`. Order
   matters: no effect may slip out between (a) and (b).
 - **RP-13** Every capability broker rejects an effect whose `epoch` is lower
   than the current claimed epoch. This is what stops a stale supervisor from

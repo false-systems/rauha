@@ -34,26 +34,13 @@ flowchart TB
         syva --> ring
     end
 
-    subgraph macos["macOS backend"]
-        vm["Virtualization.framework VM per zone"]
-        agent["rauha-guest-agent"]
-        vsock["virtio-vsock"]
-        apfs["APFS clonefile rootfs"]
-
-        vm --> agent
-        agent --> vsock
-        apfs --> vm
-    end
-
     backend --> linux
-    backend --> macos
 
     evidence["rauha-evidence\ncanonical event schema · redaction · projections"]
     surfaces["logs · trace · events · sandbox result envelope"]
     sinks["JSON / console / watch API / OTLP"]
 
     ring --> evidence
-    vsock --> evidence
     daemon --> surfaces
     evidence --> surfaces
     evidence --> sinks
@@ -63,18 +50,17 @@ flowchart TB
 
 | Crate | Role |
 | --- | --- |
-| `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux/macOS backends |
+| `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux backend |
 | `rauha-cli` (`rauha`) | Operator CLI over the daemon's gRPC API |
 | `rauha-common` | Shared types, the `IsolationBackend` trait, policy parsing, sandbox result types, shim IPC protocol |
 | `rauha-enforcer-api` | Enforcement backend trait, kernel-facing policy/event types, capabilities, `NoopEnforcer`, and shared conformance harness |
 | `rauha-shim` | Per-*zone* sync process (Linux) — forks and runs container processes |
-| `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
 | `rauha-evidence` | Evidence-grade observability schema, projections, and sinks (does not enforce) |
 | `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd's Task API to `rauhad` for Kubernetes |
 | `rauha-enforce` | Legacy in-repo enforcement seed — superseded by Syvä; do not extend |
 | `rauha-ebpf` / `rauha-ebpf-common` | In-repo Linux eBPF LSM programs and shared `repr(C)` types (separate build) |
-| `xtask` | Build helper for eBPF and guest-agent artifacts |
+| `xtask` | Build helper for eBPF artifacts |
 
 ## One shim per zone, not per container
 
@@ -92,9 +78,8 @@ runtime metadata, policy, the audit stream, and optional kernel enforcement.
 
 User-visible zone IDs are UUIDs (persisted in redb, the source of truth on crash
 recovery); kernel-side they compact to `u32` BPF map keys. On startup `rauhad`
-reconciles from redb — re-establishing cgroups, networking, and (on Linux) BPF
-map state — then cleans up orphaned kernel state. On macOS the zone boundary is
-the VM itself, so no cgroups or namespaces are needed.
+reconciles from redb — re-establishing cgroups, networking, and BPF
+map state — then cleans up orphaned kernel state.
 
 ## Control surface
 

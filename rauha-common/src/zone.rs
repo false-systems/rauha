@@ -314,7 +314,7 @@ pub enum IsolationModel {
 ///
 /// The meaning of `is_isolated` depends on `model`:
 /// - `SyscallPolicy`: all BPF programs loaded, maps consistent, cgroup exists
-/// - `HardwareBoundary`: VM is running, sandbox profile applied
+/// - `HardwareBoundary`: VM is running, its boundary policy applied
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsolationReport {
     pub zone_id: Uuid,

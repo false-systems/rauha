@@ -88,8 +88,6 @@ impl ZoneRegistry {
     pub fn backend_platform(&self) -> &'static str {
         if cfg!(target_os = "linux") {
             "linux"
-        } else if cfg!(target_os = "macos") {
-            "macos"
         } else {
             std::env::consts::OS
         }
@@ -122,7 +120,7 @@ impl ZoneRegistry {
     ///
     /// Used to correlate kernel enforcement events (which carry the compact id)
     /// back to a zone by name. Returns `None` for an unknown zone or a backend
-    /// that assigns no kernel id (macOS, or eBPF not loaded).
+    /// that assigns no kernel id (or eBPF not loaded).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub async fn kernel_zone_id(&self, zone_name: &str) -> Option<u32> {
         let handle = self.handles.read().await.get(zone_name).cloned()?;
@@ -771,9 +769,8 @@ impl ZoneRegistry {
 
     /// If a container is Running but its process has exited, update state to Stopped.
     ///
-    /// On Linux, uses kill(pid, 0) to check host-side PID liveness.
-    /// On macOS, the PID is from inside the VM — host-side kill() cannot check it,
-    /// so we skip the liveness check (macOS containers are reaped via guest agent).
+    /// Uses kill(pid, 0) to check host-side PID liveness (Linux only; on other
+    /// platforms the stub never reports death).
     fn maybe_reap_container(&self, mut container: Container) -> Result<Container> {
         if container.state == ContainerState::Running {
             if let Some(pid) = container.pid.filter(|&p| p > 0) {
@@ -796,7 +793,6 @@ impl ZoneRegistry {
     }
 
     /// Check if a process is dead. Linux only — uses kill(pid, 0).
-    /// On macOS, PIDs are from inside VMs so host kill() can't check them.
     #[cfg(target_os = "linux")]
     fn is_process_dead(pid: u32) -> bool {
         let ret = unsafe { libc::kill(pid as i32, 0) };
@@ -815,7 +811,7 @@ impl ZoneRegistry {
 
     #[cfg(not(target_os = "linux"))]
     fn is_process_dead(_pid: u32) -> bool {
-        // On macOS, container PIDs are inside VMs — can't check from host.
+        // Non-Linux builds never report death; liveness is a kernel-side fact.
         false
     }
 
@@ -827,8 +823,6 @@ impl ZoneRegistry {
         let mut stats = self.backend.zone_stats(handle)?;
 
         // Backfill memory_limit from policy if the backend didn't set it.
-        // macOS VM backend returns 0 because limits are set at VM boot,
-        // not readable from the guest agent.
         if stats.memory_limit_bytes == 0 {
             match self.metadata.get_zone(zone_name) {
                 Ok(Some(zone)) => {
@@ -865,11 +859,8 @@ impl ZoneRegistry {
             .map(|(name, _)| name.clone())
     }
 
-    /// Send a shim request for a zone.
-    ///
-    /// On Linux, connects via Unix socket to the zone's shim process.
-    /// On macOS (or when no Unix socket exists), delegates to the backend,
-    /// which routes through vsock to the guest agent inside the VM.
+    /// Send a shim request for a zone: connect via Unix socket to the zone's
+    /// shim process and exchange one length-prefixed postcard message.
     pub async fn shim_request(
         &self,
         zone_name: &str,
@@ -922,127 +913,12 @@ impl ZoneRegistry {
             })
             .await
             .map_err(|e| RauhaError::BackendError(format!("shim task panicked: {e}")))?
-        } else if cfg!(target_os = "macos") {
-            // macOS: no Unix socket — route through backend (vsock to guest agent).
-            let backend = self.backend.clone();
-            let zone = zone_name.to_string();
-            let request = request.clone();
-            tokio::task::spawn_blocking(move || backend.shim_request(&zone, &request))
-                .await
-                .map_err(|e| RauhaError::BackendError(format!("shim task panicked: {e}")))?
         } else {
             Err(RauhaError::ShimError {
                 zone: zone_name.into(),
                 message: format!("shim socket not found at {socket_path}"),
             })
         }
-    }
-
-    /// Connect to a vsock port on a zone's VM for exec I/O relay.
-    ///
-    /// Returns an async stream wrapping the vsock fd. Only works on macOS
-    /// (where exec sessions use vsock); on Linux, exec sessions use Unix
-    /// sockets and this method is never called.
-    pub async fn connect_exec_vsock(&self, zone_name: &str, port: u32) -> Result<VsockAsyncStream> {
-        let backend = self.backend.clone();
-        let zone = zone_name.to_string();
-        let fd = tokio::task::spawn_blocking(move || backend.connect_vsock_port(&zone, port))
-            .await
-            .map_err(|e| RauhaError::BackendError(format!("vsock connect task panicked: {e}")))??;
-
-        VsockAsyncStream::new(fd)
-            .map_err(|e| RauhaError::BackendError(format!("async vsock wrap failed: {e}")))
-    }
-}
-
-/// Async I/O wrapper for a vsock file descriptor.
-///
-/// Uses `AsyncFd` to provide `AsyncRead + AsyncWrite` on a raw vsock fd
-/// from Virtualization.framework. This avoids type-punning the fd as a
-/// Unix stream — the wrapper is honest about what it wraps.
-pub(crate) struct VsockAsyncStream {
-    inner: tokio::io::unix::AsyncFd<std::fs::File>,
-}
-
-impl VsockAsyncStream {
-    fn new(fd: std::os::fd::OwnedFd) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd;
-        let file = std::fs::File::from(fd);
-        // AsyncFd requires the fd to be in nonblocking mode.
-        let raw = file.as_raw_fd();
-        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-        if flags >= 0 {
-            unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        }
-        Ok(Self {
-            inner: tokio::io::unix::AsyncFd::new(file)?,
-        })
-    }
-}
-
-impl tokio::io::AsyncRead for VsockAsyncStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        loop {
-            let mut guard = match self.inner.poll_read_ready(cx) {
-                std::task::Poll::Ready(Ok(g)) => g,
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            };
-
-            match guard.try_io(|inner| {
-                use std::io::Read;
-                inner.get_ref().read(buf.initialize_unfilled())
-            }) {
-                Ok(Ok(n)) => {
-                    buf.advance(n);
-                    return std::task::Poll::Ready(Ok(()));
-                }
-                Ok(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-}
-
-impl tokio::io::AsyncWrite for VsockAsyncStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        loop {
-            let mut guard = match self.inner.poll_write_ready(cx) {
-                std::task::Poll::Ready(Ok(g)) => g,
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            };
-
-            match guard.try_io(|inner| {
-                use std::io::Write;
-                inner.get_ref().write(buf)
-            }) {
-                Ok(result) => return std::task::Poll::Ready(result),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
     }
 }
 

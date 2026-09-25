@@ -57,19 +57,13 @@ enum Commands {
     Exec(commands::exec::ExecArgs),
     /// Attach to a running container
     Attach(commands::exec::AttachArgs),
-    /// Set up macOS environment (VM assets, pf firewall, entitlements)
-    Setup(commands::setup::SetupArgs),
 }
 
 /// Commands that do not support --json (streaming or interactive).
 fn is_streaming_command(cmd: &Commands) -> bool {
     matches!(
         cmd,
-        Commands::Top(_)
-            | Commands::Logs(_)
-            | Commands::Exec(_)
-            | Commands::Attach(_)
-            | Commands::Setup(_)
+        Commands::Top(_) | Commands::Logs(_) | Commands::Exec(_) | Commands::Attach(_)
     )
 }
 
@@ -92,7 +86,9 @@ async fn main() {
     // Reject --json for streaming/interactive commands that still lack a
     // line-delimited machine output contract.
     if out == OutputMode::Json && is_streaming_command(&cli.command) {
-        commands::output::print_error("--json is not supported for streaming/interactive commands (top, logs, exec, attach, setup)");
+        commands::output::print_error(
+            "--json is not supported for streaming/interactive commands (top, logs, exec, attach)",
+        );
         std::process::exit(1);
     }
 
@@ -112,7 +108,6 @@ async fn main() {
         Commands::Logs(args) => commands::logs::handle_logs(args).await,
         Commands::Exec(args) => commands::exec::handle_exec(args).await,
         Commands::Attach(args) => commands::exec::handle_attach(args).await,
-        Commands::Setup(args) => commands::setup::handle(args).await,
     };
 
     if let Err(e) = result {

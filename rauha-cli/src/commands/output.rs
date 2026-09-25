@@ -4,7 +4,7 @@
 //! In human mode, the caller provides a closure that prints formatted text.
 //! In JSON mode, the value is serialized to stdout as a single JSON object
 //! per line. `events --json` emits one object per event; interactive commands
-//! (logs, exec, attach, top, setup) reject `--json` at startup.
+//! (logs, exec, attach, top) reject `--json` at startup.
 
 use serde::Serialize;
 
