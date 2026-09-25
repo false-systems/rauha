@@ -767,7 +767,7 @@ impl ZoneRegistry {
             .collect()
     }
 
-    /// If a container is Running but its process is exited, update state to Stopped.
+    /// If a container is Running but its process has exited, update state to Stopped.
     ///
     /// Uses kill(pid, 0) to check host-side PID liveness (Linux only; on other
     /// platforms the stub never reports death).
