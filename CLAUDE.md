@@ -28,18 +28,12 @@ cargo clippy --workspace --all-targets -- -D warnings   # CI gate
 cargo build --bin rauhad             # Build just the daemon
 cargo build --bin rauha              # Build just the CLI
 cargo build --bin rauha-shim         # Build the per-zone shim
-cargo build --bin rauha-guest-agent  # Build the macOS VM guest agent
 cargo build --bin rauha-enforce      # Build standalone enforcement agent
 cargo build -p containerd-shim-rauha-v2  # Build the containerd shim
 
-# eBPF programs (separate build, requires nightly Rust)
+# eBPF programs (separate build, requires nightly Rust and a Linux host)
 cargo xtask build-ebpf               # Debug build
 cargo xtask build-ebpf --release     # Release build
-cargo xtask build-guest-agent        # Cross-compile guest agent (aarch64-unknown-linux-musl)
-cargo xtask build-initramfs          # Build initramfs with guest agent (for macOS VMs)
-
-# macOS: sign rauhad after every build (required for Virtualization.framework)
-codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad
 
 # Run the daemon (development, listens on [::1]:9876)
 RUST_LOG=rauhad=debug cargo run --bin rauhad
@@ -90,7 +84,7 @@ RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test -- case_001  # one case
 Proto files are in `proto/` (zone.proto, container.proto, image.proto, sandbox.proto). They compile automatically via `build.rs` in rauhad and rauha-cli. `sandbox.proto` defines `SandboxService.RunSandbox` (package `rauha.sandbox.v1`) — the agent-sandbox task contract that runs a command in its own zone and captures stdout/stderr/exit-code plus enforcement events into one result. `SandboxServiceImpl` (`rauhad/src/server.rs`) implements it on top of the zone/container primitives: resolve-or-allocate a zone, create+start one container, poll to exit (or timeout), read shim log files for output, and drain the enforcement-event broadcast scoped to the task's zone. Temporary zones (empty `name`) are torn down after the run unless `keep_zone` is set; a runtime failure that prevents producing a result comes back as a `runtime_error` result, not a gRPC error. The `rauha sandbox` CLI mirrors the task's exit code.
 
 Most read-only/list commands accept `--json`; `events --json` emits JSON Lines.
-Interactive commands (`top`, `logs`, `exec`, `attach`, `setup`) do not support
+Interactive commands (`top`, `logs`, `exec`, `attach`) do not support
 it, and the unimplemented `trace` command exits with an error.
 
 ## Core Principles
@@ -112,7 +106,7 @@ Both platform backends implement this trait. rauhad is platform-agnostic — it 
 
 - **rauhad** is async (tokio) — gRPC server, concurrent zone management
 - **rauha-shim** is deliberately sync — `fork()` in a multithreaded async runtime is UB. The shim is single-threaded so it can safely fork, setns, pivot_root, and run the container process
-- IPC between daemon and shim: length-prefixed postcard over Unix socket (`rauha-common/src/shim.rs`). The protocol includes attach/exec commands — Linux shim returns a Unix socket path, macOS guest agent returns a vsock port for bidirectional I/O.
+- IPC between daemon and shim: length-prefixed postcard over Unix socket (`rauha-common/src/shim.rs`). The protocol includes attach/exec commands — the shim returns a Unix socket path for bidirectional I/O.
 
 ### One Shim Per Zone (Not Per Container)
 
@@ -129,28 +123,11 @@ The shim no longer builds containers itself; `rauha-shim/src/container.rs` deleg
 
 Never enroll via OCI `startContainer` hooks: crun runs them after pivot_root and privilege drop, resolving `path` in the *image* rootfs — untrusted code with no `CAP_SYS_ADMIN`. `createRuntime` hooks (host binary, state JSON on stdin) are the spec-blessed alternative if a hook is ever needed. Analysis and crun source references: `docs/positioning-and-roadmap.md` § Enrollment.
 
-**Fork-safety invariant (still applies to `attach.rs` exec/PTY paths and the macOS guest agent):** all code after `fork()`/`clone3()` in the child must be async-signal-safe — no `std::env::set_var`/`vars`, no `eprintln!`/`panic!`, no heap allocation. Use `libc::putenv` with pre-allocated `CString`s, `libc::write` for output, and `libc::_exit`. Pre-allocate all strings and paths before fork.
+**Fork-safety invariant (still applies to `attach.rs` exec/PTY paths):** all code after `fork()`/`clone3()` in the child must be async-signal-safe — no `std::env::set_var`/`vars`, no `eprintln!`/`panic!`, no heap allocation. Use `libc::putenv` with pre-allocated `CString`s, `libc::write` for output, and `libc::_exit`. Pre-allocate all strings and paths before fork.
 
-### macOS Backend: VM-Per-Zone (`rauhad/src/backend/macos/`)
+### Platform Policy (Linux-only)
 
-On macOS, each zone is a lightweight Linux VM via Apple's Virtualization.framework. The VM itself is the isolation boundary — no cgroups or namespaces needed.
-
-- **vm.rs** — VM lifecycle. VZVirtualMachine must be created and operated from a GCD serial dispatch queue (one queue per VM).
-- **vsock.rs** — virtio-vsock (port 5123) bridge between rauhad and the guest agent inside the VM.
-- **apfs.rs** — APFS `clonefile()` for instant, zero-copy rootfs clones (macOS equivalent of overlayfs).
-- **pf.rs** — macOS packet filter (pf) firewall anchors, one per zone, generated from ZonePolicy.
-
-The `rauha-guest-agent` runs inside the VM and handles `ShimRequest`/`ShimResponse` messages (same postcard protocol as the Linux shim). It's simpler than `rauha-shim`: no cgroup enrollment (VM is the boundary), no `setns` (already in the right namespace).
-
-- **attach.rs** — PTY fork + vsock relay for exec sessions. Mirrors the Linux shim's attach but uses vsock ports (starting at 6000) instead of Unix sockets, and chroots into virtiofs-mounted rootfs at `/mnt/rauha/containers/{id}/...`. The post-fork async-signal-safety rules apply to the exec child path too — not just initial container fork.
-
-Resource limits (CPU/memory) are set at VM boot and require restart to change. Filesystem sharing uses virtio-fs, mounting the container rootfs from host into the VM at `/mnt/rauha`.
-
-macOS requires the `com.apple.security.virtualization` entitlement — see `rauhad/rauhad.entitlements`. After every build of rauhad, re-sign: `codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad`.
-
-ObjC exceptions from Virtualization.framework are caught via `objc2::exception::catch` — without this, they abort the Rust process. All VZ API calls in `vm.rs` must go through exception-safe wrappers. VM operations (start, stop, vsock connect) must be dispatched to the VM's serial dispatch queue.
-
-pf firewall rules require root. When running rauhad without root (development), pf errors are logged as warnings and network isolation is inactive.
+Rauha is Linux-only. The former macOS VM-per-zone backend (Virtualization.framework, `rauha-guest-agent`, pf, APFS clonefile) was removed: it could confine but not observe — no deny events, no enforcement counters, no receipts — and it had drifted to non-compiling since CI is Linux-only. If a VM tier returns, the likely shape is the **same Linux stack inside a VM** (one enforcement code path, one receipt schema), not a parallel macOS backend. The workspace still compiles and its unit tests run on any OS; the daemon refuses to start without the Linux backend (`create_backend` returns `UnsupportedPlatform`).
 
 ### Zone Networking (`rauhad/src/network/`, `rauhad/src/backend/linux/nftables.rs`)
 
@@ -162,9 +139,7 @@ Zones get full network connectivity on Linux via: veth pairs → rauha0 bridge (
 - **dns.rs** — generates resolv.conf; filters localhost stubs, falls back to 1.1.1.1/8.8.8.8
 - **nftables.rs** — NAT masquerade + per-zone forward chains; forward chain defaults to drop; jump rules cleaned by handle on zone deletion
 
-Network setup failures (nftables, bridge, pf) are logged as warnings, not fatal errors — zones still run without network filtering. This allows rootless development on both platforms.
-
-On macOS, VMs get NAT from Virtualization.framework. pf handles per-zone firewall rules (requires root). `allowed_zones` cross-VM support is not yet implemented.
+Network setup failures (nftables, bridge) are logged as warnings, not fatal errors — zones still run without network filtering.
 
 ### Enforcement Event Streaming (`rauhad/src/backend/linux/events.rs`)
 
@@ -226,21 +201,18 @@ What's still documented here for context: it loaded the same eBPF LSM programs a
 - **redb** (`{root}/metadata/rauha.redb`) — persisted zone/container metadata. Source of truth on crash recovery. Uses postcard serialization — adding fields to `Zone`/`Container` structs can break deserialization of old entries. `list_zones()`/`get_zone()` skip incompatible entries with a warning rather than crashing. If the daemon won't start after schema changes, delete the stale db: `rm {root}/metadata/rauha.redb`.
 - **BPF maps** (pinned at `/sys/fs/bpf/rauha/`) — in-kernel enforcement state. Reconciled from redb on daemon startup. Linux only.
 - **Content store** (`{root}/content/blobs/sha256/`) — content-addressable OCI blob storage.
-- **VM assets** (`/var/lib/rauha/vm/vmlinux`, `initramfs.img`) — kernel and initramfs for macOS VMs. Installed via `rauha setup`.
 
-Root directory: `/var/lib/rauha` on Linux, `/tmp/rauha` on macOS (dev default, override with `RAUHA_ROOT`).
+Root directory: `/var/lib/rauha` (override with `RAUHA_ROOT`).
 
 On startup, rauhad runs `reconcile()`: loads all zones from redb, calls `recover_zone()` on each to re-establish kernel state (BPF maps, cgroups, network), then `cleanup_orphans()` to remove stale kernel state. Stale BPF pins are removed before loading new programs — redb is the source of truth.
 
 ### eBPF Programs (`rauha-ebpf/src/`)
 
-Seven LSM hooks enforce zone boundaries at the kernel level: `file_open`, `bprm_check_security`, `ptrace_access_check`, `task_kill`, `cgroup_attach_task`, `capable`, `socket_connect`. All kernel memory reads use `bpf_probe_read_kernel` (not raw pointer dereference). Kernel struct offsets are hardcoded in `rauha-ebpf/src/main.rs::offsets` module and validated at startup via pahole + a runtime self-test. Unsupported hooks are skipped gracefully at load time — the daemon continues with whatever subset the kernel supports. At **runtime**, hook logic that errors (e.g. a failed `bpf_probe_read_kernel`) **fails closed**: the hook returns `-EPERM` (deny) and emits an error event rather than allowing the operation. Shared kernel/userspace types live in `rauha-ebpf-common`.
+Seven LSM hooks enforce zone boundaries at the kernel level: `file_open`, `bprm_check_security`, `ptrace_access_check`, `task_kill`, `cgroup_attach_task`, `capable`, `socket_connect`. All kernel memory reads use `bpf_probe_read_kernel` (not raw pointer dereference). Kernel struct offsets are **generated at build time from the target kernel's BTF** (`cargo xtask build-ebpf` → pahole → compiled in behind the `generated-offsets` feature, with a sidecar manifest binding them to the object's SHA-256), re-validated against the local kernel's BTF at load time, and verified by a runtime self-test. Unsupported hooks are skipped gracefully at load time — the daemon continues with whatever subset the kernel supports. At **runtime**, hook logic that errors (e.g. a failed `bpf_probe_read_kernel`) **fails closed**: the hook returns `-EPERM` (deny) and emits an error event rather than allowing the operation. Shared kernel/userspace types live in `rauha-ebpf-common`.
 
 Seven BPF maps: `ZONE_MEMBERSHIP` (cgroup→zone), `ZONE_POLICY` (zone→policy flags), `INODE_ZONE_MAP` (inode→zone for file isolation), `ZONE_ALLOWED_COMMS` (cross-zone permission pairs), `SELF_TEST` (startup offset validation), `ENFORCEMENT_COUNTERS` (per-hook allow/deny/error counts, PerCpuArray), `ENFORCEMENT_EVENTS` (ring buffer, deny events to userspace).
 
-The offset self-test (`SELF_TEST` map) compares `bpf_get_current_cgroup_id()` against the offset-chain-derived cgroup_id on first `file_open`. If they differ, `EbpfManager::load()` returns an error and the daemon runs in degraded mode (no eBPF enforcement). This prevents silent enforcement failure from wrong offsets.
-
-At load time, userspace reads real offsets from BTF via `pahole` and injects them into eBPF globals via `BpfLoader::set_global()`. If `pahole` is not available, sensible defaults for Linux 6.1+ are used. If pahole finds an offset mismatch vs. defaults, loading fails — no silent enforcement with wrong offsets. The self-test then verifies the full offset chain at runtime.
+The offset self-test (`SELF_TEST` map) compares `bpf_get_current_cgroup_id()` against the offset-chain-derived cgroup_id on first `file_open`. If they differ, `EbpfManager::load()` returns an error — wrong offsets can never silently mis-enforce. The hardcoded `offsets_default.rs` is only for plain crate builds, which are not production artifacts.
 
 Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Requires `-Zub-checks=no` (BPF verifier rejects the alignment panic intrinsics). Not part of the normal workspace build.
 
@@ -250,7 +222,6 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 - Linux-only code uses `#[cfg(target_os = "linux")]` with stub implementations for other platforms.
 - Policies are TOML. See `policies/standard.toml` for the canonical example.
 - Tests go in `#[cfg(test)]` modules within source files, not in separate test files.
-- macOS backend code uses `#[cfg(target_os = "macos")]` and ObjC2 bindings for Virtualization.framework.
 
 ## Workspace Crates
 
@@ -258,10 +229,9 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 |-------|---------|
 | `rauha-common` | Shared types, `IsolationBackend` trait, error types, policy parsing, sandbox result types, shim IPC protocol |
 | `rauha-enforcer-api` | `EnforcerBackend` trait, kernel-facing policy/event types, `Capabilities`, `NoopEnforcer`, shared conformance harness |
-| `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux/macOS backends |
+| `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux backend |
 | `rauha-cli` | CLI binary — connects to rauhad via gRPC |
 | `rauha-shim` | Per-zone sync supervisor (Linux only) — crun create/enroll/start per container, pidfd lifetime, exec/attach |
-| `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
 | `rauha-evidence` | Evidence-grade observability schema, projections, and sinks. Normalizes Syva/backend enforcement records + Rauha lifecycle events into one schema. Does not enforce. Consumed only by `rauhad`. |
 | `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd Task ttrpc API to rauhad gRPC for Kubernetes |
@@ -283,17 +253,15 @@ The oracle must not be modified as a side effect of modifying the system. It has
 
 ## Platform Requirements
 
-### Linux (eBPF enforcement)
+### Linux (the only supported platform)
 
 - Linux 6.1+ with `CONFIG_BPF_LSM=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`
 - Boot parameter: `lsm=lockdown,capability,bpf`
 - BTF at `/sys/kernel/btf/vmlinux`
 - `crun` at `/usr/bin/crun` (container construction is delegated to it); `jq` for the security probes
 
-### macOS (Virtualization.framework)
+### Other platforms
 
-- macOS 15+ (Sequoia) for full Containers API support
-- Apple Silicon or Intel with VT-x
-- rauhad binary must be signed after every build: `codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad`
-- VM assets must be installed at `/var/lib/rauha/vm/` (vmlinux + initramfs.img) — use `rauha setup`
-- Running without root works for development (pf network isolation will be inactive)
+- The workspace compiles and unit tests run anywhere (useful on macOS dev
+  machines; use a Lima VM for anything needing the daemon). rauhad refuses to
+  start on non-Linux (`UnsupportedPlatform`) — there is no second backend.

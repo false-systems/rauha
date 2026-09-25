@@ -760,42 +760,18 @@ impl ContainerService for ContainerServiceImpl {
 
         let (tx, rx) = mpsc::channel(256);
 
-        // Connect to the exec session and spawn relay tasks.
-        // The transport differs by platform but the relay logic is identical.
+        // Connect to the exec session and spawn relay tasks over its Unix socket.
         match response {
             rauha_common::shim::ShimResponse::ExecReady {
                 session_id,
-                socket_path: Some(path),
-                ..
+                socket_path,
             } => {
-                let stream = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
-                    Status::internal(format!("failed to connect to exec socket: {e}"))
-                })?;
-                let (r, w) = stream.into_split();
-                spawn_exec_relay(
-                    r,
-                    w,
-                    tx,
-                    in_stream,
-                    Some(PtyResizeTarget {
-                        registry: self.registry.clone(),
-                        zone_name: zone_name.clone(),
-                        container_id: container_id.to_string(),
-                        session_id,
-                    }),
-                );
-            }
-            rauha_common::shim::ShimResponse::ExecReady {
-                session_id,
-                vsock_port: Some(port),
-                ..
-            } => {
-                let stream = self
-                    .registry
-                    .connect_exec_vsock(&zone_name, port)
+                let stream = tokio::net::UnixStream::connect(&socket_path)
                     .await
-                    .map_err(|e| Status::internal(format!("failed to connect exec vsock: {e}")))?;
-                let (r, w) = tokio::io::split(stream);
+                    .map_err(|e| {
+                        Status::internal(format!("failed to connect to exec socket: {e}"))
+                    })?;
+                let (r, w) = stream.into_split();
                 spawn_exec_relay(
                     r,
                     w,
@@ -965,9 +941,6 @@ impl ContainerService for ContainerServiceImpl {
 }
 
 /// Spawn read and write relay tasks between an exec I/O stream and gRPC.
-///
-/// Generic over the stream type so it works with both Unix sockets (Linux)
-/// and vsock streams (macOS).
 fn spawn_exec_relay<R, W>(
     reader: R,
     writer: W,

@@ -11,10 +11,6 @@ path = "src/main.rs"
 [dependencies]
 # Shared types
 rauha-common = { path = "../rauha-common" }
-rauha-ebpf-common = { path = "../rauha-ebpf-common", features = ["userspace"] }
-
-# eBPF
-aya.workspace = true
 
 # Async runtime
 tokio.workspace = true
@@ -42,5 +38,7 @@ prost-types = "0.13"
 # Serialization (JSON)
 serde_json = "1"
 
-# Utilities
+[target.'cfg(target_os = "linux")'.dependencies]
+rauha-ebpf-common = { path = "../rauha-ebpf-common", features = ["userspace"] }
+aya.workspace = true
 nix.workspace = true

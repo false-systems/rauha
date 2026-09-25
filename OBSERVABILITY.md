@@ -23,11 +23,9 @@ Linux:
 4. The existing gRPC `WatchEvents` API projects the same canonical event into
    the existing `ZoneEvent` message without changing the proto contract.
 
-macOS:
-
-The macOS backend has no ring buffer. Guest-agent/vsock events must normalize
-into the same `FalseEvent` schema at the adapter edge before reaching sinks.
-That adapter is intentionally not implemented in this observe-only pass.
+(There is no second platform: the former macOS backend had no ring buffer and
+was removed; a future VM tier would run the same Linux stack and reuse this
+pipeline.)
 
 ## Event Taxonomy
 

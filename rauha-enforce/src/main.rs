@@ -10,19 +10,32 @@
 //!   rauha-enforce status
 //!   rauha-enforce events --follow
 
+// This crate is Linux-only (BPF-LSM enforcement); every item is gated so the
+// workspace still builds on other platforms for tests and tooling.
+#[cfg(target_os = "linux")]
 mod ebpf;
+#[cfg(target_os = "linux")]
 mod events;
+#[cfg(target_os = "linux")]
 mod policy;
+#[cfg(target_os = "linux")]
 mod watcher;
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "linux")]
 use tracing_subscriber::EnvFilter;
 
+#[cfg(target_os = "linux")]
 #[derive(Parser)]
 #[command(
     name = "rauha-enforce",
@@ -45,6 +58,7 @@ struct Cli {
     containerd_sock: String,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Subcommand)]
 enum Commands {
     /// Show current enforcement status.
@@ -58,6 +72,7 @@ enum Commands {
 }
 
 #[tokio::main]
+#[cfg(target_os = "linux")]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("rauha_enforce=info".parse()?))
@@ -73,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Main enforcement loop.
+#[cfg(target_os = "linux")]
 async fn cmd_run(
     policy_dir: PathBuf,
     ebpf_obj: Option<PathBuf>,
@@ -213,6 +229,7 @@ async fn cmd_run(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn print_status_summary(
     policies: &std::collections::HashMap<String, rauha_common::zone::ZonePolicy>,
     assignments: &[watcher::ZoneAssignment],
@@ -256,6 +273,7 @@ fn print_status_summary(
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn cmd_status() -> anyhow::Result<()> {
     // Check if BPF maps are pinned (enforcement is active).
     let pin_path = std::path::Path::new("/sys/fs/bpf/rauha");
@@ -273,6 +291,7 @@ async fn cmd_status() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn cmd_events(follow: bool) -> anyhow::Result<()> {
     if !follow {
         println!("use --follow to stream events in real time");
@@ -286,4 +305,10 @@ async fn cmd_events(follow: bool) -> anyhow::Result<()> {
     // TODO: open pinned ENFORCEMENT_EVENTS map directly for read-only event tailing.
     println!("(events are logged by the main rauha-enforce process)");
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("rauha-enforce is Linux-only: it programs the BPF-LSM enforcement boundary.");
+    std::process::exit(1);
 }

@@ -26,7 +26,8 @@ is either shipped, probed on every release, or explicitly marked *planned*.
   daemon mid-workload; the same PID keeps its cgroup, BPF membership, and inode
   ownership. (shipped: `recovery-probe.sh`)
 - **A microVM tier through the same OCI bundle interface** — selection policy
-  TBD. (*planned* — `obl_tier`; macOS VM-per-zone is the existing proof point)
+  TBD. (*planned* — `obl_tier`; the former macOS VM backend was removed — a
+  future tier would run the same Linux stack inside a VM, e.g. via krun)
 
 ## Product contract: the behaviour diff
 
@@ -237,8 +238,9 @@ Sources: [gVisor perf](https://gvisor.dev/docs/architecture_guide/performance/),
    (one shim per pod = one shim per zone) whose pod status carries the receipt.
 6. **Lossless-or-declared telemetry** — `ringbuf.drop`/`pipeline.shed` already
    exist; the receipt states `evidence_complete: bool`.
-7. **One policy TOML, two platforms, one receipt schema** — BPF-LSM on Linux, VM
-   boundary on macOS.
+7. **One policy TOML, one platform now, one receipt schema** — BPF-LSM on
+   Linux; a future VM tier reuses the same Linux stack inside the VM instead
+   of a second enforcement philosophy.
 8. **OCSF/OTel projection** of `rauha-evidence` for free SIEM adoption.
 
 ## Enrollment: fixing the crun boundary
