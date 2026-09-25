@@ -24,6 +24,8 @@ boundary stopped. Docker runs the process. Rauha operates the work.
 
 > *Rauha* (Finnish) — *peace*. What you get when untrusted execution stays inside its boundary.
 
+> **New work targets the cell: local containment and effect enforcement, and the boundary-grade sensor backend Selko attaches (owner matrix, `perusta:docs/system/authority-matrix-v0.md`). The Run / receipt / `compare` / `accept` / supervisor framing in `docs/product-thesis.md` and `docs/run-protocol-v0.md` predates that matrix — comparison is Ruuma's, acceptance is Vartio's, stop and settle are Ote's, recording is Selko's — and is maintained as legacy until a named decision retires or absorbs it. Do not extend it.** (system briefing S-08, 2026-09-02)
+
 ## What you get today
 
 One command, one result:
@@ -155,7 +157,17 @@ path.** See [`docs/rauha-syva-boundary.md`](docs/rauha-syva-boundary.md).
   The roadmap closes them with Landlock, cgroup device BPF, and seccomp.
 - **Sandbox event capture is best-effort** — enforcement events ride a
   daemon-wide broadcast and can be absent or partial; they are not an
-  audit-complete log.
+  audit-complete log. In the contract's single assurance vocabulary
+  (`perusta:docs/system/assurance-v0.md`, ruling S-07) that sentence reads:
+  Rauha's LSM hooks are one more *sensor* (`signed_by: rauha-lsm/<version>`)
+  whose `source` is `boundary` for the domains it hooks from below — `file`,
+  `process`, `capability`, `privilege`, and `network` through the socket hook —
+  but whose `loss` is `unknown` until the broadcast's drops are counted
+  (run-protocol RP-24), so every domain is `authoritative: no` and any drift
+  comparison over such a commit is `INVALID`, never a false `SAME`. Counting
+  the drops (system SO-06) is what earns `authoritative: yes`; nothing in the
+  profile is upgraded by anyone else. `trust_level` in Rauha's own events is
+  an operational field and never a profile value.
 - **A sandbox, not a hardware boundary** — BPF-LSM is OS-level isolation and is
   additive-only: it can deny, but cannot override SELinux/AppArmor. Covert
   channels through shared kernel resources are out of scope.
