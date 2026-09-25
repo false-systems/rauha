@@ -29,21 +29,22 @@ jobs:
       - name: Install bpf-linker
         run: cargo binstall --no-confirm bpf-linker@0.11.0
 
-      # false-systems/sykli is private; the runner's GITHUB_TOKEN cannot read it.
-      # SYKLI_READ_TOKEN must be a fine-grained PAT or GitHub App token with
-      # contents:read on that repository. The token never lands on disk: it is
-      # supplied to git through a credential helper for this step only.
+      # false-systems/sykli is currently public, so the install below needs
+      # no token. If it ever goes private again, set the SYKLI_READ_TOKEN
+      # repository secret (fine-grained PAT or GitHub App token with
+      # contents:read on that repository): the credential helper is then
+      # configured for this step only and the token never lands on disk.
       - name: Install Sykli
         env:
           SYKLI_READ_TOKEN: ${{ secrets.SYKLI_READ_TOKEN }}
         run: |
-          if [ -z "$SYKLI_READ_TOKEN" ]; then
-            echo "::error::SYKLI_READ_TOKEN is not set; the privileged gate needs a token with contents:read on false-systems/sykli (see issue #55)"
-            exit 1
+          if [ -n "$SYKLI_READ_TOKEN" ]; then
+            git config --global credential.helper '!f() { printf "username=x-access-token\npassword=%s\n" "$SYKLI_READ_TOKEN"; }; f'
           fi
-          git config --global credential.helper '!f() { printf "username=x-access-token\npassword=%s\n" "$SYKLI_READ_TOKEN"; }; f'
           CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/false-systems/sykli --rev 71d264367852c9f5df737f223be3b6efbf791ca8 --locked
-          git config --global --unset credential.helper
+          if [ -n "$SYKLI_READ_TOKEN" ]; then
+            git config --global --unset credential.helper
+          fi
 
       - name: Run locked security graph
         run: bash tests/security/run.sh
