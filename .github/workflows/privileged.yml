@@ -41,7 +41,7 @@ jobs:
           if [ -n "$SYKLI_READ_TOKEN" ]; then
             git config --global credential.helper '!f() { printf "username=x-access-token\npassword=%s\n" "$SYKLI_READ_TOKEN"; }; f'
           fi
-          CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/false-systems/sykli --rev 71d264367852c9f5df737f223be3b6efbf791ca8 --locked
+          CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/false-systems/sykli --rev 71d264367852c9f5df737f223be3b6efbf791ca8 --locked sykli
           if [ -n "$SYKLI_READ_TOKEN" ]; then
             git config --global --unset credential.helper
           fi
