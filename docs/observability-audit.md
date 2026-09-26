@@ -22,8 +22,6 @@ pass. It is an inventory, not a claim that every item is fixed.
   acceptable; CLI output is not daemon evidence.
 - `rauha-shim` emits child/container lifecycle logs.
   Some exec logs include `?command`, which can carry sensitive argv.
-- `rauha-enforce` is legacy and has monitor/status output plus eBPF logs. It
-  should not be extended as the primary Rauha evidence path.
 
 ## Missing Correlation Fields
 

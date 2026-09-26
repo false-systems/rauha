@@ -20,7 +20,6 @@ critique), **partially confirmed** (holds with caveats).
 | rauha-shim | 1,489 | per-zone supervisor (Linux) |
 | rauha-guest-agent | 1,255 | **macOS-only** |
 | rauha-evidence | 1,605 | evidence schema + receipts |
-| rauha-enforce | 1,182 | legacy (superseded by Syva) |
 | rauha-ebpf-common | 650 | shared kernel types |
 | rauha-ebpf | 766 | kernel-side programs |
 | rauha-enforcer-api | 784 | enforcement trait seam |
@@ -60,8 +59,8 @@ the pf rules, the vsock relay, or the guest agent on a schedule either).
 
 - Platform gating is clean: 17 `cfg(target_os = "macos")` / 19
   `cfg(target_os = "linux")` attributes in rauhad, one `IsolationBackend` seam.
-- The legacy `rauha-enforce` crate is fenced off ("do not extend") — dead
-  weight but not active surface.
+- The legacy `rauha-enforce` crate has since been **removed entirely**
+  (superseded by Syvä) — no dead weight left behind.
 - The positioning doc already frames macOS as the "proof point" for a future
   microVM tier, not a co-equal product platform.
 

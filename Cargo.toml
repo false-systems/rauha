@@ -10,7 +10,6 @@ members = [
     "rauha-shim",
     "rauha-oci",
     "containerd-shim-rauha-v2",
-    "rauha-enforce",
     "xtask",
 ]
 
