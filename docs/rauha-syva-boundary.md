@@ -43,7 +43,6 @@ The Rauha repository still contains Linux eBPF code:
 - `rauhad/src/backend/linux/ebpf.rs`
 - `rauhad/src/backend/linux/maps.rs`
 - `rauhad/src/backend/linux/events.rs`
-- `rauha-enforce`
 
 That code is still useful, but architecturally it should sit behind a Syva
 enforcement boundary.

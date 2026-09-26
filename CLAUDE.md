@@ -28,7 +28,6 @@ cargo clippy --workspace --all-targets -- -D warnings   # CI gate
 cargo build --bin rauhad             # Build just the daemon
 cargo build --bin rauha              # Build just the CLI
 cargo build --bin rauha-shim         # Build the per-zone shim
-cargo build --bin rauha-enforce      # Build standalone enforcement agent
 cargo build -p containerd-shim-rauha-v2  # Build the containerd shim
 
 # eBPF programs (separate build, requires nightly Rust and a Linux host)
@@ -176,13 +175,9 @@ Bridges containerd's Task ttrpc API to rauhad's gRPC: `kubelet → containerd �
 - Connects to rauhad at `RAUHA_ADDR` or defaults to `http://[::1]:9876`
 - Use `runtimeClassName: rauha` in pod specs
 
-### rauha-enforce (legacy — superseded by Syvä)
+### rauha-enforce (removed — superseded by Syvä)
 
-The `rauha-enforce/` crate in this repo is a **legacy seed**. The standalone enforcement product has been extracted to **Syvä**, a separate repo (`github.com/false-systems/syva`, local at `~/projects/syva`). Syvä has evolved well past the original extraction: it now has a control plane (`syva-cp`), three adapters (`syva-adapter-{file,k8s,api}`), local and cp operating modes, and its own oracle+harness eval framework.
-
-Don't extend `rauha-enforce/` — new enforcement work goes in the syva repo. Bug fixes only if absolutely necessary. The crate still builds for now; the daemonset YAML in `deploy/` is also legacy.
-
-What's still documented here for context: it loaded the same eBPF LSM programs as rauhad, used label-driven zone assignment via the `rauha.dev/zone` OCI annotation, and refused to load if BPF maps were already pinned at `/sys/fs/bpf/rauha/` (mutual exclusion with rauhad).
+The legacy `rauha-enforce/` crate and its daemonset YAML (`deploy/`) were removed. The standalone enforcement product lives in **Syvä**, a separate repo (`github.com/false-systems/syva`, local at `~/projects/syva`): control plane (`syva-cp`), three adapters (`syva-adapter-{file,k8s,api}`), local and cp operating modes, and its own oracle+harness eval framework. All new enforcement work goes there.
 
 ### Policy Admission: enforced, audited, or refused (`rauhad/src/backend/linux/mod.rs`)
 
@@ -235,7 +230,6 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
 | `rauha-evidence` | Evidence-grade observability schema, projections, and sinks. Normalizes Syva/backend enforcement records + Rauha lifecycle events into one schema. Does not enforce. Consumed only by `rauhad`. |
 | `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd Task ttrpc API to rauhad gRPC for Kubernetes |
-| `rauha-enforce` | **Legacy** — superseded by Syvä (separate repo at `github.com/false-systems/syva`). Do not extend. |
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, not in workspace, separate build) |
 | `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF programs and userspace |
 | `xtask` | Build helper for eBPF compilation |

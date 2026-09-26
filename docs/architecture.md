@@ -58,7 +58,6 @@ flowchart TB
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
 | `rauha-evidence` | Evidence-grade observability schema, projections, and sinks (does not enforce) |
 | `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd's Task API to `rauhad` for Kubernetes |
-| `rauha-enforce` | Legacy in-repo enforcement seed — superseded by Syvä; do not extend |
 | `rauha-ebpf` / `rauha-ebpf-common` | In-repo Linux eBPF LSM programs and shared `repr(C)` types (separate build) |
 | `xtask` | Build helper for eBPF artifacts |
 
