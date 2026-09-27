@@ -68,7 +68,7 @@ impl EbpfManager {
     ///
     /// The object file is expected at `{ebpf_obj_path}`. On production systems
     /// this is typically `/usr/lib/rauha/rauha-ebpf` or built by `cargo xtask build-ebpf`.
-    pub fn load(ebpf_obj_path: &Path) -> Result<Self> {
+    pub fn load(ebpf_obj_path: &Path, bpf_pin_dir: &str) -> Result<Self> {
         check_kernel_version()?;
 
         if !ebpf_obj_path.exists() {
@@ -78,7 +78,7 @@ impl EbpfManager {
             });
         }
 
-        let pin_path = PathBuf::from(BPF_PIN_PATH);
+        let pin_path = PathBuf::from(bpf_pin_dir);
 
         // Remove any stale pinned maps from a previous run (crash recovery).
         // EbpfLoader::map_pin_path() reuses existing pins, which would leave

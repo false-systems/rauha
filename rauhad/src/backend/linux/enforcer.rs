@@ -41,8 +41,8 @@ pub(super) struct LinuxEnforcer {
 }
 
 impl LinuxEnforcer {
-    pub(super) fn new(root: &str) -> Result<Self> {
-        let mut ebpf = Self::load_ebpf(root)?;
+    pub(super) fn new(root: &str, bpf_pin_dir: &str) -> Result<Self> {
+        let mut ebpf = Self::load_ebpf(root, bpf_pin_dir)?;
         tracing::info!("eBPF programs loaded — kernel enforcement active");
 
         let ring_buf = ebpf
@@ -64,10 +64,10 @@ impl LinuxEnforcer {
         })
     }
 
-    fn load_ebpf(root: &str) -> Result<EbpfManager> {
+    fn load_ebpf(root: &str, bpf_pin_dir: &str) -> Result<EbpfManager> {
         for path in Self::ebpf_candidates(root) {
             if path.exists() {
-                return EbpfManager::load(&path);
+                return EbpfManager::load(&path, bpf_pin_dir);
             }
         }
 
@@ -536,7 +536,10 @@ mod tests {
         }
 
         let root = tempfile::tempdir().expect("temp root");
-        let enforcer = match LinuxEnforcer::new(root.path().to_str().expect("utf-8 root")) {
+        let enforcer = match LinuxEnforcer::new(
+            root.path().to_str().expect("utf-8 root"),
+            "/sys/fs/bpf/rauha",
+        ) {
             Ok(enforcer) => enforcer,
             Err(e) => {
                 eprintln!(

@@ -26,13 +26,14 @@ pub struct LogLine {
 /// all existing content has been read.
 pub fn tail_logs(
     container_id: &str,
+    run_dir: &str,
     follow: bool,
     tail: u32,
     cancelled: &AtomicBool,
     mut on_line: impl FnMut(LogLine) -> bool,
 ) {
-    let stdout_path = log_path(container_id, "stdout");
-    let stderr_path = log_path(container_id, "stderr");
+    let stdout_path = log_path(run_dir, container_id, "stdout");
+    let stderr_path = log_path(run_dir, container_id, "stderr");
 
     // Read initial tail lines from both files.
     let mut stdout_lines = read_tail_lines(&stdout_path, tail);
@@ -120,8 +121,9 @@ pub fn tail_logs(
     }
 }
 
-fn log_path(container_id: &str, stream: &str) -> PathBuf {
-    PathBuf::from("/run/rauha/containers")
+fn log_path(run_dir: &str, container_id: &str, stream: &str) -> PathBuf {
+    PathBuf::from(run_dir)
+        .join("containers")
         .join(container_id)
         .join(format!("{stream}.log"))
 }
@@ -131,14 +133,18 @@ fn log_path(container_id: &str, stream: &str) -> PathBuf {
 /// Returns `(stdout, stderr)`. A missing log file yields an empty string —
 /// a container that produced no output is not an error. Synchronous file I/O,
 /// so callers in async contexts should wrap this in `spawn_blocking`.
-pub fn read_all_capped(container_id: &str, max_bytes_per_stream: usize) -> (String, String) {
+pub fn read_all_capped(
+    container_id: &str,
+    run_dir: &str,
+    max_bytes_per_stream: usize,
+) -> (String, String) {
     let stdout = read_text_capped(
-        &log_path(container_id, "stdout"),
+        &log_path(run_dir, container_id, "stdout"),
         "stdout",
         max_bytes_per_stream,
     );
     let stderr = read_text_capped(
-        &log_path(container_id, "stderr"),
+        &log_path(run_dir, container_id, "stderr"),
         "stderr",
         max_bytes_per_stream,
     );

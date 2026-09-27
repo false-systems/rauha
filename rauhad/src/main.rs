@@ -1,10 +1,13 @@
 mod backend;
+mod config;
 mod logging;
 mod logs;
 mod metadata;
 #[cfg(target_os = "linux")]
 mod network;
 mod server;
+#[cfg(test)]
+mod testutil;
 mod zone;
 
 use std::net::SocketAddr;
@@ -39,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
 
     let root = std::env::var("RAUHA_ROOT").unwrap_or_else(|_| DEFAULT_ROOT.into());
     let root_path = PathBuf::from(&root);
+    let daemon_config = Arc::new(config::DaemonConfig::load(&root)?);
     let platform = if cfg!(target_os = "linux") {
         "linux"
     } else {
@@ -68,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create platform backend.
     #[cfg(target_os = "linux")]
-    let (backend_box, event_tx) = backend::create_backend(&root)?;
+    let (backend_box, event_tx) = backend::create_backend(&root, daemon_config.clone())?;
     #[cfg(not(target_os = "linux"))]
     let backend_box = backend::create_backend(&root)?;
     let backend: Arc<dyn rauha_common::backend::IsolationBackend> = Arc::from(backend_box);
@@ -114,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         backend,
         image_service.clone(),
         root.clone(),
+        daemon_config.clone(),
     ));
 
     // Reconcile persisted metadata with kernel state.
@@ -140,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
     let sandbox_svc =
         server::SandboxServiceImpl::new(registry.clone(), None, receipt_signer.clone());
 
-    let addr: SocketAddr = "[::1]:9876".parse()?;
+    let addr: SocketAddr = daemon_config.server.addr.parse()?;
     tracing::info!(%addr, "listening on gRPC");
     RuntimeEventBuilder::new(
         event_name::DAEMON_READY,

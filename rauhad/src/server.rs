@@ -154,10 +154,10 @@ impl ZoneService for ZoneServiceImpl {
             };
 
             // Reject oversized policy TOML to prevent memory exhaustion during parsing.
-            const MAX_POLICY_SIZE: usize = 64 * 1024;
-            if req.policy_toml.len() > MAX_POLICY_SIZE {
+            let max_policy_size = self.registry.config().limits.policy_max_bytes;
+            if req.policy_toml.len() > max_policy_size {
                 return Err(Status::invalid_argument(format!(
-                    "policy_toml exceeds maximum size of {MAX_POLICY_SIZE} bytes"
+                    "policy_toml exceeds maximum size of {max_policy_size} bytes"
                 )));
             }
 
@@ -280,10 +280,10 @@ impl ZoneService for ZoneServiceImpl {
     ) -> Result<Response<pb::zone::ApplyPolicyResponse>, Status> {
         let req = request.into_inner();
 
-        const MAX_POLICY_SIZE: usize = 64 * 1024;
-        if req.policy_toml.len() > MAX_POLICY_SIZE {
+        let max_policy_size = self.registry.config().limits.policy_max_bytes;
+        if req.policy_toml.len() > max_policy_size {
             return Err(Status::invalid_argument(format!(
-                "policy_toml exceeds maximum size of {MAX_POLICY_SIZE} bytes"
+                "policy_toml exceeds maximum size of {max_policy_size} bytes"
             )));
         }
 
@@ -664,6 +664,7 @@ impl ContainerService for ContainerServiceImpl {
         let follow = req.follow;
         let tail = req.tail;
         let id_str = container_id.to_string();
+        let run_dir = self.registry.config().paths.run_dir.clone();
 
         // Cancellation flag: set when the tx channel is dropped (client disconnects).
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -677,7 +678,7 @@ impl ContainerService for ContainerServiceImpl {
         });
 
         tokio::task::spawn_blocking(move || {
-            crate::logs::tail_logs(&id_str, follow, tail, &cancelled, |log_line| {
+            crate::logs::tail_logs(&id_str, &run_dir, follow, tail, &cancelled, |log_line| {
                 tx.blocking_send(Ok(pb::container::ContainerLogEntry {
                     source: log_line.source,
                     line: log_line.line,
@@ -1156,8 +1157,6 @@ use rauha_common::sandbox::{
     EnforcementEventSummary, SandboxEventSummary, SandboxExecResult, SandboxStatus,
 };
 
-const SANDBOX_LOG_MAX_BYTES_PER_STREAM: usize = 1024 * 1024;
-
 fn command_hash(command: &[String]) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1524,8 +1523,10 @@ impl SandboxServiceImpl {
         // Capture stdout/stderr from the shim-written log files (blocking I/O),
         // bounded so a chatty task cannot exceed tonic's default message size.
         let cid = container_id.to_string();
+        let run_dir = self.registry.config().paths.run_dir.clone();
+        let log_cap = self.registry.config().evidence.sandbox_log_max_bytes;
         let (stdout, stderr) = tokio::task::spawn_blocking(move || {
-            crate::logs::read_all_capped(&cid, SANDBOX_LOG_MAX_BYTES_PER_STREAM)
+            crate::logs::read_all_capped(&cid, &run_dir, log_cap)
         })
         .await
         .unwrap_or_default();
