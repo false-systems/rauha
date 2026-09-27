@@ -32,14 +32,14 @@ gates:
     program: cargo
     args: [test, -p, rauha-common, -p, rauha-shim, -p, rauhad, --locked]
     timeout_seconds: 900
-  sykli-security:
-    description: Locked Sykli graph on the current Linux host or the sole running Lima VM
+  security-gate:
+    description: Privileged security gate on the current Linux host or the sole running Lima VM
     program: tests/security/run.sh
     args: []
     timeout_seconds: 3600
 gate_groups:
   security-full:
-    gates: [rust-format, rust-unit, sykli-security]
+    gates: [rust-format, rust-unit, security-gate]
 stewardship:
   auto_sweep: true
   sessions_retention_days: 7
@@ -49,5 +49,5 @@ boundaries:
 - Rauha owns zone semantics, cross-zone policy, task APIs, evidence, receipts, backend selection, and macOS VM lifecycle.
 - Linux container construction delegates to a mature OCI executor; the custom bootstrap is temporary.
 - Strict admission fails closed when any requested primitive is unavailable; degraded execution requires explicit audit mode.
-- Sykli remains an external Rust binary; this repository owns only sykli.json, sykli.lock, and its invocation.
+- The security gate is tests/security/linux-gate.sh, invoked via tests/security/run.sh; no external work-graph evaluator is required.
 - Repository configuration never contains credentials or secret material.
