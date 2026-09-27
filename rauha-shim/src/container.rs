@@ -8,7 +8,43 @@ use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-const CRUN: &str = "/usr/bin/crun";
+/// Resolve the crun binary, once per process. The daemon passes its
+/// configured `[executor] crun` value via `RAUHA_CRUN`: "auto" (default)
+/// searches PATH and known locations, or an absolute path is used directly.
+/// Never a hardcoded single path — see the never-hardcode convention.
+/// Cached: crun invocations are frequent (create, start, exec, delete) and
+/// the search walks PATH only once.
+pub fn crun_path() -> anyhow::Result<&'static PathBuf> {
+    static CRUN: std::sync::LazyLock<Result<PathBuf, String>> = std::sync::LazyLock::new(|| {
+        if let Ok(configured) = std::env::var("RAUHA_CRUN") {
+            if configured != "auto" {
+                let path = PathBuf::from(&configured);
+                if !path.is_file() {
+                    return Err(format!("configured OCI runtime is missing: {configured}"));
+                }
+                return Ok(path);
+            }
+        }
+
+        let mut candidates: Vec<PathBuf> = std::env::var("PATH")
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .map(|dir| dir.join("crun"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        candidates.push(PathBuf::from("/usr/local/bin/crun"));
+        candidates.push(PathBuf::from("/usr/bin/crun"));
+        candidates.push(PathBuf::from("/bin/crun"));
+
+        candidates.into_iter().find(|c| c.is_file()).ok_or_else(|| {
+            "crun not found: install crun, or set executor.crun in rauha.toml \
+                 (passed to the shim as RAUHA_CRUN)"
+                .to_string()
+        })
+    });
+    CRUN.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
+}
 
 /// An OCI init process supervised by the zone shim.
 pub struct RuntimeProcess {
@@ -134,9 +170,9 @@ pub fn start_with_crun(
 
     #[cfg(target_os = "linux")]
     {
-        if !Path::new(CRUN).is_file() {
-            anyhow::bail!("required OCI runtime is missing: {CRUN}");
-        }
+        // Fail fast if the OCI runtime is missing; runtime_command resolves
+        // the same path when building each crun invocation.
+        crun_path()?;
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -152,7 +188,7 @@ pub fn start_with_crun(
 
         let pid_file = bundle.join("init.pid");
         let _ = std::fs::remove_file(&pid_file);
-        let log_dir = PathBuf::from("/run/rauha/containers").join(container_id);
+        let log_dir = run_dir().join("containers").join(container_id);
         std::fs::create_dir_all(&log_dir)?;
 
         let status = runtime_command(&runtime_root)
@@ -237,8 +273,19 @@ pub fn start_with_crun(
     }
 }
 
+/// Runtime dir for sockets and container logs. The daemon passes its
+/// configured `[paths] run_dir` via `RAUHA_RUN_DIR` (default `/run/rauha`).
+#[cfg(target_os = "linux")]
+pub(crate) fn run_dir() -> PathBuf {
+    PathBuf::from(std::env::var("RAUHA_RUN_DIR").unwrap_or_else(|_| "/run/rauha".into()))
+}
+
 fn runtime_command(runtime_root: &Path) -> Command {
-    let mut command = Command::new(CRUN);
+    let mut command = Command::new(
+        crun_path()
+            .cloned()
+            .unwrap_or_else(|_| PathBuf::from("crun")),
+    );
     command
         .arg("--root")
         .arg(runtime_root)

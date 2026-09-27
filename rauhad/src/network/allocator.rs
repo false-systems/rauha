@@ -36,6 +36,8 @@ impl IpAllocator {
     }
 
     /// Create an allocator with the default 10.89.0.0/16 subnet.
+    /// Tests-only helper — production code constructs from daemon config.
+    #[cfg(test)]
     pub fn default_subnet() -> Self {
         Self::new([10, 89, 0, 0], 16)
     }

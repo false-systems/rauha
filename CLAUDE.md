@@ -199,6 +199,29 @@ The legacy `rauha-enforce/` crate and its daemonset YAML (`deploy/`) were remove
 
 Root directory: `/var/lib/rauha` (override with `RAUHA_ROOT`).
 
+### Daemon configuration (`rauha.toml`)
+
+Never hardcode: every environment-varying value is config with a default,
+from one schema (`rauhad/src/config.rs`). Resolution: `RAUHA_CONFIG` env
+var → `{root}/rauha.toml` → defaults. A missing file is fine; a malformed
+one is a startup error. Unknown fields are rejected. The shim receives
+`run_dir` and `crun` via `RAUHA_RUN_DIR` / `RAUHA_CRUN` env vars set by the
+daemon at spawn.
+
+```toml
+[server]    addr = "[::1]:9876"
+[network]   subnet = "10.89.0.0/16"   # zone bridge CIDR (max /16, network address)
+            bridge = "rauha0"
+            dns_fallback = ["1.1.1.1", "8.8.8.8"]  # only when host resolv.conf is unusable
+[executor]  crun = "auto"             # auto = PATH + known locations; or absolute path
+[paths]     run_dir = "/run/rauha"    # sockets, container logs
+            netns_dir = "/var/run/netns"
+            bpf_pin_dir = "/sys/fs/bpf/rauha"
+[evidence]  sandbox_log_max_bytes = 1048576
+[limits]    policy_max_bytes = 65536
+[policy]    safe_writable_roots = ["/proc", "/sys", "/dev", "/run"]
+```
+
 On startup, rauhad runs `reconcile()`: loads all zones from redb, calls `recover_zone()` on each to re-establish kernel state (BPF maps, cgroups, network), then `cleanup_orphans()` to remove stale kernel state. Stale BPF pins are removed before loading new programs — redb is the source of truth.
 
 ### eBPF Programs (`rauha-ebpf/src/`)

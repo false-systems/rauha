@@ -20,13 +20,12 @@ use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::ZoneNetworkState;
 use sha2::{Digest, Sha256};
 
-const BRIDGE_NAME: &str = "rauha0";
-
-/// Ensure the rauha0 bridge exists with a gateway IP and IP forwarding enabled.
-pub fn ensure_bridge(gateway: Ipv4Addr, prefix_len: u8) -> Result<()> {
+/// Ensure the zone bridge exists with a gateway IP and IP forwarding enabled.
+/// The bridge name comes from daemon config (default `rauha0`).
+pub fn ensure_bridge(gateway: Ipv4Addr, prefix_len: u8, bridge: &str) -> Result<()> {
     // Check if bridge already exists.
     let output = Command::new("ip")
-        .args(["link", "show", BRIDGE_NAME])
+        .args(["link", "show", bridge])
         .output()
         .map_err(|e| RauhaError::NetworkError {
             message: format!("failed to check bridge: {e}"),
@@ -35,16 +34,16 @@ pub fn ensure_bridge(gateway: Ipv4Addr, prefix_len: u8) -> Result<()> {
 
     if !output.status.success() {
         // Create the bridge.
-        run_ip(&["link", "add", "name", BRIDGE_NAME, "type", "bridge"])?;
-        run_ip(&["link", "set", BRIDGE_NAME, "up"])?;
-        tracing::info!(bridge = BRIDGE_NAME, "created network bridge");
+        run_ip(&["link", "add", "name", bridge, "type", "bridge"])?;
+        run_ip(&["link", "set", bridge, "up"])?;
+        tracing::info!(%bridge, "created network bridge");
     }
 
     // Assign gateway IP if not already present.
     let cidr = format!("{gateway}/{prefix_len}");
-    if !bridge_has_addr(&cidr)? {
-        run_ip(&["addr", "add", &cidr, "dev", BRIDGE_NAME])?;
-        tracing::info!(bridge = BRIDGE_NAME, addr = %cidr, "assigned gateway IP to bridge");
+    if !bridge_has_addr(&cidr, bridge)? {
+        run_ip(&["addr", "add", &cidr, "dev", bridge])?;
+        tracing::info!(%bridge, addr = %cidr, "assigned gateway IP to bridge");
     }
 
     // Enable IP forwarding.
@@ -54,9 +53,9 @@ pub fn ensure_bridge(gateway: Ipv4Addr, prefix_len: u8) -> Result<()> {
 }
 
 /// Check if the bridge already has a specific address assigned.
-fn bridge_has_addr(cidr: &str) -> Result<bool> {
+fn bridge_has_addr(cidr: &str, bridge: &str) -> Result<bool> {
     let output = Command::new("ip")
-        .args(["addr", "show", "dev", BRIDGE_NAME])
+        .args(["addr", "show", "dev", bridge])
         .output()
         .map_err(|e| RauhaError::NetworkError {
             message: format!("failed to check bridge addresses: {e}"),
@@ -96,7 +95,11 @@ fn enable_ip_forwarding() -> Result<()> {
 ///
 /// If `net_state` is provided, assigns the zone IP and adds a default route
 /// via the gateway.
-pub fn create_veth_pair(zone_name: &str, net_state: Option<&ZoneNetworkState>) -> Result<()> {
+pub fn create_veth_pair(
+    zone_name: &str,
+    net_state: Option<&ZoneNetworkState>,
+    bridge: &str,
+) -> Result<()> {
     let host_if = veth_host_name(zone_name);
     let zone_peer_if = veth_peer_name(zone_name);
     let zone_if = "eth0";
@@ -118,7 +121,7 @@ pub fn create_veth_pair(zone_name: &str, net_state: Option<&ZoneNetworkState>) -
     let configure = (|| {
         run_ip(&["link", "set", &zone_peer_if, "netns", &ns_name])?;
         run_ip_netns(&ns_name, &["link", "set", &zone_peer_if, "name", zone_if])?;
-        run_ip(&["link", "set", &host_if, "master", BRIDGE_NAME])?;
+        run_ip(&["link", "set", &host_if, "master", bridge])?;
         run_ip(&["link", "set", &host_if, "up"])?;
         run_ip_netns(&ns_name, &["link", "set", zone_if, "up"])?;
         run_ip_netns(&ns_name, &["link", "set", "lo", "up"])?;
@@ -188,10 +191,10 @@ pub fn destroy_veth_pair(zone_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Destroy the rauha0 bridge (called on daemon shutdown).
-pub fn destroy_bridge() -> Result<()> {
+/// Destroy the zone bridge (called on daemon shutdown).
+pub fn destroy_bridge(bridge: &str) -> Result<()> {
     let output = Command::new("ip")
-        .args(["link", "show", BRIDGE_NAME])
+        .args(["link", "show", bridge])
         .output()
         .map_err(|e| RauhaError::NetworkError {
             message: format!("failed to check bridge: {e}"),
@@ -202,10 +205,10 @@ pub fn destroy_bridge() -> Result<()> {
         return Ok(()); // Already gone.
     }
 
-    run_ip(&["link", "set", BRIDGE_NAME, "down"])?;
-    run_ip(&["link", "delete", BRIDGE_NAME, "type", "bridge"])?;
+    run_ip(&["link", "set", bridge, "down"])?;
+    run_ip(&["link", "delete", bridge, "type", "bridge"])?;
 
-    tracing::info!(bridge = BRIDGE_NAME, "destroyed network bridge");
+    tracing::info!(%bridge, "destroyed network bridge");
     Ok(())
 }
 

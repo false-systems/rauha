@@ -35,9 +35,10 @@ pub fn serve_attach_session(
     use std::os::fd::BorrowedFd;
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
 
-    let socket_dir = PathBuf::from("/run/rauha/containers").join(container_id);
+    let socket_dir = crate::container::run_dir()
+        .join("containers")
+        .join(container_id);
     std::fs::create_dir_all(&socket_dir)?;
     let socket_path = socket_dir.join(format!("attach-{session_id}.sock"));
 

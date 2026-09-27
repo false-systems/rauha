@@ -20,12 +20,14 @@ const TABLE_FAMILY: &str = "inet";
 const BRIDGE_FAMILY: &str = "bridge";
 
 /// Ensure the rauha nftables table and NAT masquerade chain exist.
-/// Called once during LinuxBackend::new().
-pub fn ensure_nat(subnet_cidr: &str) -> Result<()> {
+/// Called once during LinuxBackend::new(). The bridge name comes from
+/// daemon config (default `rauha0`).
+pub fn ensure_nat(subnet_cidr: &str, bridge: &str) -> Result<()> {
     // nft -f applies the complete batch as one kernel transaction. A syntax or
     // runtime failure therefore leaves the previous enforcement table intact.
     run_nft_script(&base_ruleset(
         subnet_cidr,
+        bridge,
         table_exists(TABLE_FAMILY)?,
         table_exists(BRIDGE_FAMILY)?,
     ))?;
@@ -42,18 +44,23 @@ pub fn ensure_nat(subnet_cidr: &str) -> Result<()> {
 /// whose rules failed to apply, or whose rules are mid-replacement, is cut off
 /// rather than left open. The inet forward `iifname "rauha0"` accept is only
 /// reachable for frames that already passed a bridge input chain.
-fn base_ruleset(subnet_cidr: &str, replace_inet: bool, replace_bridge: bool) -> String {
+fn base_ruleset(
+    subnet_cidr: &str,
+    bridge: &str,
+    replace_inet: bool,
+    replace_bridge: bool,
+) -> String {
     format!(
         "{delete_inet}{delete_bridge}add table inet rauha\n\
          add chain inet rauha postrouting {{ type nat hook postrouting priority srcnat; }}\n\
-         add rule inet rauha postrouting ip saddr {subnet_cidr} oifname != \"rauha0\" masquerade\n\
+         add rule inet rauha postrouting ip saddr {subnet_cidr} oifname != \"{bridge}\" masquerade\n\
          add chain inet rauha forward {{ type filter hook forward priority filter; policy drop; }}\n\
          add rule inet rauha forward ct state established,related accept\n\
-         add rule inet rauha forward iifname \"rauha0\" accept\n\
-         add rule inet rauha forward oifname \"rauha0\" accept\n\
+         add rule inet rauha forward iifname \"{bridge}\" accept\n\
+         add rule inet rauha forward oifname \"{bridge}\" accept\n\
          add chain inet rauha input {{ type filter hook input priority filter; policy accept; }}\n\
          add rule inet rauha input ct state established,related accept\n\
-         add rule inet rauha input iifname \"rauha0\" drop\n\
+         add rule inet rauha input iifname \"{bridge}\" drop\n\
          add table bridge rauha\n\
          add chain bridge rauha forward {{ type filter hook forward priority filter; policy drop; }}\n\
          add chain bridge rauha input {{ type filter hook input priority filter; policy drop; }}\n\
@@ -472,7 +479,7 @@ mod tests {
 
     #[test]
     fn base_ruleset_replaces_both_tables_and_blocks_host_input() {
-        let rules = base_ruleset("10.89.0.0/16", true, true);
+        let rules = base_ruleset("10.89.0.0/16", "rauha0", true, true);
         assert!(rules.starts_with(
             "delete table inet rauha\ndelete table bridge rauha\nadd table inet rauha"
         ));

@@ -24,6 +24,9 @@ pub struct ZoneRegistry {
     image_service: Arc<rauha_oci::image::ImageService>,
     #[allow(dead_code)] // Used on Linux for overlayfs snapshotter paths.
     root: String,
+    /// Daemon configuration — the single source of runtime knobs
+    /// (never hardcode; see `config.rs`).
+    config: std::sync::Arc<crate::config::DaemonConfig>,
     /// In-memory cache of zone handles for fast backend operations.
     handles: RwLock<HashMap<String, ZoneHandle>>,
     /// In-memory cache of container handles (needed for start/stop operations).
@@ -63,16 +66,23 @@ impl ZoneRegistry {
         backend: Arc<dyn IsolationBackend>,
         image_service: Arc<rauha_oci::image::ImageService>,
         root: String,
+        config: std::sync::Arc<crate::config::DaemonConfig>,
     ) -> Self {
         Self {
             metadata,
             backend,
             image_service,
             root,
+            config,
             handles: RwLock::new(HashMap::new()),
             container_handles: RwLock::new(HashMap::new()),
             zone_mutation_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The daemon configuration — the single source of runtime knobs.
+    pub fn config(&self) -> &crate::config::DaemonConfig {
+        &self.config
     }
 
     /// Return the root data directory path.
@@ -643,7 +653,6 @@ impl ZoneRegistry {
     }
 
     /// Query the zone shim for container state and persist stopped metadata.
-    #[allow(dead_code)] // Used by sandbox wait support in the next PR.
     pub async fn get_container_state(&self, container_id: &Uuid) -> Result<(String, Option<i32>)> {
         let container = self
             .metadata
@@ -866,8 +875,8 @@ impl ZoneRegistry {
         zone_name: &str,
         request: &rauha_common::shim::ShimRequest,
     ) -> Result<rauha_common::shim::ShimResponse> {
-        let socket_path = format!("/run/rauha/shim-{zone_name}.sock");
-        let path = std::path::PathBuf::from(&socket_path);
+        let path = std::path::PathBuf::from(&self.config.paths.run_dir)
+            .join(format!("shim-{zone_name}.sock"));
 
         if path.exists() {
             // Linux: connect via Unix socket to the shim process.
@@ -916,7 +925,7 @@ impl ZoneRegistry {
         } else {
             Err(RauhaError::ShimError {
                 zone: zone_name.into(),
-                message: format!("shim socket not found at {socket_path}"),
+                message: format!("shim socket not found at {}", path.display()),
             })
         }
     }
@@ -1046,6 +1055,7 @@ mod tests {
             backend,
             image_svc,
             tmp.path().to_string_lossy().into(),
+            std::sync::Arc::new(crate::config::DaemonConfig::default()),
         )
     }
 

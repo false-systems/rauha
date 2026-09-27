@@ -6,19 +6,21 @@
 /// Addresses that only work on the host (systemd-resolved, macOS mDNSResponder).
 const LOCAL_STUBS: &[&str] = &["127.0.0.53", "127.0.0.1"];
 
-/// Fallback nameservers when no usable host nameservers are found.
-const FALLBACK_NAMESERVERS: &[&str] = &["1.1.1.1", "8.8.8.8"];
-
 /// Generate a resolv.conf suitable for use inside containers.
 ///
 /// Reads the host's /etc/resolv.conf. If all nameservers are localhost
-/// stubs (e.g. systemd-resolved's 127.0.0.53), falls back to public DNS.
-pub fn generate_resolv_conf() -> String {
-    generate_resolv_conf_from(std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default())
+/// stubs (e.g. systemd-resolved's 127.0.0.53), uses the configured
+/// fallback nameservers. An explicitly empty `dns_fallback` means "no
+/// fallback" — the operator chose to derive everything from the host.
+pub fn generate_resolv_conf_with_fallback(fallback: &[String]) -> String {
+    generate_resolv_conf_from(
+        std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
+        fallback,
+    )
 }
 
 /// Testable inner function that operates on the content string directly.
-fn generate_resolv_conf_from(host_content: String) -> String {
+fn generate_resolv_conf_from(host_content: String, fallback: &[String]) -> String {
     let mut nameservers = Vec::new();
     let mut other_lines = Vec::new();
 
@@ -37,9 +39,9 @@ fn generate_resolv_conf_from(host_content: String) -> String {
         // Skip comments and empty lines.
     }
 
-    // If no usable nameservers found, use fallback.
+    // If no usable nameservers found, use the configured fallback.
     if nameservers.is_empty() {
-        nameservers = FALLBACK_NAMESERVERS.iter().map(|s| s.to_string()).collect();
+        nameservers = fallback.to_vec();
     }
 
     let mut output = String::new();
@@ -65,7 +67,7 @@ nameserver 8.8.8.8
 nameserver 8.8.4.4
 search example.com
 ";
-        let result = generate_resolv_conf_from(host.into());
+        let result = generate_resolv_conf_from(host.into(), &[]);
         assert!(result.contains("nameserver 8.8.8.8"));
         assert!(result.contains("nameserver 8.8.4.4"));
         assert!(result.contains("search example.com"));
@@ -79,7 +81,7 @@ nameserver 127.0.0.53
 options edns0 trust-ad
 search .
 ";
-        let result = generate_resolv_conf_from(host.into());
+        let result = generate_resolv_conf_from(host.into(), &[]);
         // Should NOT contain 127.0.0.53.
         assert!(!result.contains("127.0.0.53"));
         // Should have fallback nameservers.
@@ -95,7 +97,7 @@ search .
 nameserver 127.0.0.53
 nameserver 10.0.0.1
 ";
-        let result = generate_resolv_conf_from(host.into());
+        let result = generate_resolv_conf_from(host.into(), &[]);
         assert!(!result.contains("127.0.0.53"));
         assert!(result.contains("nameserver 10.0.0.1"));
         // Should NOT include fallbacks since we have a real nameserver.
@@ -104,7 +106,7 @@ nameserver 10.0.0.1
 
     #[test]
     fn empty_resolv_conf() {
-        let result = generate_resolv_conf_from(String::new());
+        let result = generate_resolv_conf_from(String::new(), &[]);
         assert!(result.contains("nameserver 1.1.1.1"));
         assert!(result.contains("nameserver 8.8.8.8"));
     }
@@ -112,7 +114,7 @@ nameserver 10.0.0.1
     #[test]
     fn localhost_127_0_0_1() {
         let host = "nameserver 127.0.0.1\n";
-        let result = generate_resolv_conf_from(host.into());
+        let result = generate_resolv_conf_from(host.into(), &[]);
         assert!(!result.contains("127.0.0.1"));
         assert!(result.contains("nameserver 1.1.1.1"));
     }

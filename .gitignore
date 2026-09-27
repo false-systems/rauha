@@ -1,6 +1,6 @@
 target/
 *.redb
-.sykli/
+.gate/
 .teko/
 .toimija/current.*
 .toimija/sessions/

@@ -16,8 +16,9 @@ pub type EventSender = tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent
 #[cfg(target_os = "linux")]
 pub fn create_backend(
     root: &str,
+    config: std::sync::Arc<crate::config::DaemonConfig>,
 ) -> rauha_common::error::Result<(Box<dyn IsolationBackend>, Option<EventSender>)> {
-    let backend = linux::LinuxBackend::new(root)?;
+    let backend = linux::LinuxBackend::new(root, config)?;
     let event_tx = backend.event_sender();
     Ok((Box::new(backend), event_tx))
 }

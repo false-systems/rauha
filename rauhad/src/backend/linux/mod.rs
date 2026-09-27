@@ -19,11 +19,11 @@ pub(crate) mod nftables;
 
 /// Clean up Linux network state (nftables table + bridge).
 /// Called during daemon shutdown.
-pub fn cleanup_network() {
+pub fn cleanup_network(bridge: &str) {
     if let Err(e) = nftables::cleanup_nat() {
         tracing::warn!(%e, "failed to clean up nftables table");
     }
-    if let Err(e) = network::destroy_bridge() {
+    if let Err(e) = network::destroy_bridge(bridge) {
         tracing::warn!(%e, "failed to destroy network bridge");
     }
 }
@@ -114,17 +114,24 @@ pub struct LinuxBackend {
     zone_degradations: Mutex<HashMap<String, BTreeSet<String>>>,
     /// IP address allocator for zone networking.
     ip_allocator: Mutex<IpAllocator>,
+    /// Daemon configuration (never hardcode: paths, subnet, DNS, capacities
+    /// all come from here).
+    config: std::sync::Arc<crate::config::DaemonConfig>,
 }
 
 impl LinuxBackend {
-    pub fn new(root: &str) -> Result<Self> {
+    pub fn new(root: &str, config: std::sync::Arc<crate::config::DaemonConfig>) -> Result<Self> {
         let cgroup = CgroupManager::new()?;
-        let ip_allocator = IpAllocator::default_subnet();
+        let (subnet_octets, prefix_len) = config.subnet_octets()?;
+        let ip_allocator = IpAllocator::new(subnet_octets, prefix_len);
+        let bridge = config.network.bridge.as_str();
 
-        let enforcer = LinuxEnforcer::new(root)?;
+        let enforcer = LinuxEnforcer::new(root, &config.paths.bpf_pin_dir)?;
 
         // Ensure the network bridge exists with a gateway IP.
-        if let Err(e) = network::ensure_bridge(ip_allocator.gateway(), ip_allocator.prefix_len()) {
+        if let Err(e) =
+            network::ensure_bridge(ip_allocator.gateway(), ip_allocator.prefix_len(), bridge)
+        {
             tracing::warn!(%e, "failed to create network bridge — zones will have no networking");
         }
 
@@ -140,7 +147,7 @@ impl LinuxBackend {
                 ip_allocator.prefix_len()
             )
         };
-        nftables::ensure_nat(&subnet_cidr)?;
+        nftables::ensure_nat(&subnet_cidr, bridge)?;
 
         Ok(Self {
             root: root.into(),
@@ -154,6 +161,7 @@ impl LinuxBackend {
             zone_policies: Mutex::new(HashMap::new()),
             zone_degradations: Mutex::new(HashMap::new()),
             ip_allocator: Mutex::new(ip_allocator),
+            config,
         })
     }
 
@@ -184,13 +192,13 @@ impl LinuxBackend {
     }
 
     /// Get the socket path for a zone's shim.
-    fn shim_socket_path(zone_name: &str) -> PathBuf {
-        PathBuf::from(format!("/run/rauha/shim-{zone_name}.sock"))
+    fn shim_socket_path(&self, zone_name: &str) -> PathBuf {
+        PathBuf::from(&self.config.paths.run_dir).join(format!("shim-{zone_name}.sock"))
     }
 
     /// Ensure a shim process is running for a zone, spawning one if needed.
     fn ensure_shim(&self, zone_name: &str) -> Result<()> {
-        let socket_path = Self::shim_socket_path(zone_name);
+        let socket_path = self.shim_socket_path(zone_name);
 
         // Check if shim is already connected and responsive.
         {
@@ -220,12 +228,14 @@ impl LinuxBackend {
             message: format!("failed to create zone dir: {e}"),
         })?;
 
-        // Ensure /run/rauha exists.
-        std::fs::create_dir_all("/run/rauha").ok();
+        // Ensure the runtime dir exists.
+        std::fs::create_dir_all(&self.config.paths.run_dir).ok();
 
         let shim_bin = find_shim_binary()?;
 
         Command::new(&shim_bin)
+            .env("RAUHA_RUN_DIR", &self.config.paths.run_dir)
+            .env("RAUHA_CRUN", &self.config.executor.crun)
             .arg("--zone-name")
             .arg(zone_name)
             .arg("--socket")
@@ -366,13 +376,13 @@ impl LinuxBackend {
     }
 }
 
-fn unsupported_linux_controls(policy: &ZonePolicy) -> Vec<String> {
+fn unsupported_linux_controls(policy: &ZonePolicy, safe_writable_roots: &[String]) -> Vec<String> {
     let mut unsupported = Vec::new();
     if policy
         .filesystem
         .writable_paths
         .iter()
-        .any(|path| !safe_writable_path(path))
+        .any(|path| !safe_writable_path(path, safe_writable_roots))
     {
         unsupported.push("filesystem.writable_paths".to_string());
     }
@@ -387,13 +397,13 @@ fn unsupported_linux_controls(policy: &ZonePolicy) -> Vec<String> {
     unsupported
 }
 
-fn safe_writable_path(path: &str) -> bool {
+fn safe_writable_path(path: &str, safe_writable_roots: &[String]) -> bool {
     let path = Path::new(path);
     path.is_absolute()
         && path != Path::new("/")
-        && !["/proc", "/sys", "/dev", "/run"]
+        && !safe_writable_roots
             .iter()
-            .any(|reserved| path.starts_with(reserved))
+            .any(|reserved| path.starts_with(reserved.as_str()))
         && path
             .components()
             .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
@@ -410,8 +420,12 @@ fn device_numbers(path: &str) -> Option<(i64, i64)> {
     }
 }
 
-fn admit_linux_policy(policy: &ZonePolicy, skipped_hooks: &[String]) -> Result<()> {
-    let mut unsupported = unsupported_linux_controls(policy);
+fn admit_linux_policy(
+    policy: &ZonePolicy,
+    skipped_hooks: &[String],
+    safe_writable_roots: &[String],
+) -> Result<()> {
+    let mut unsupported = unsupported_linux_controls(policy, safe_writable_roots);
     for hook in skipped_hooks {
         unsupported.push(format!("lsm.{hook}"));
     }
@@ -513,7 +527,11 @@ fn oci_devices(policy: &ZonePolicy) -> Result<Vec<oci_spec::runtime::LinuxDevice
         .collect()
 }
 
-fn oci_mounts(policy: &ZonePolicy, rootfs: &Path) -> Result<Vec<oci_spec::runtime::Mount>> {
+fn oci_mounts(
+    policy: &ZonePolicy,
+    rootfs: &Path,
+    safe_writable_roots: &[String],
+) -> Result<Vec<oci_spec::runtime::Mount>> {
     use oci_spec::runtime::{get_default_mounts, MountBuilder};
 
     let mut mounts = get_default_mounts();
@@ -524,7 +542,7 @@ fn oci_mounts(policy: &ZonePolicy, rootfs: &Path) -> Result<Vec<oci_spec::runtim
         .filesystem
         .writable_paths
         .iter()
-        .filter(|path| safe_writable_path(path))
+        .filter(|path| safe_writable_path(path, safe_writable_roots))
     {
         let relative = declared.trim_start_matches('/');
         let mut current = rootfs.to_path_buf();
@@ -659,7 +677,11 @@ impl IsolationBackend for LinuxBackend {
         zone_type: ZoneType,
         policy: &ZonePolicy,
     ) -> Result<()> {
-        admit_linux_policy(policy, &self.enforcer.skipped_hooks())?;
+        admit_linux_policy(
+            policy,
+            &self.enforcer.skipped_hooks(),
+            &self.config.policy.safe_writable_roots,
+        )?;
         tracing::info!(zone = zone.name, "recovering zone state from metadata");
 
         // Allocate a compact zone_id (these are ephemeral, not persisted).
@@ -684,8 +706,8 @@ impl IsolationBackend for LinuxBackend {
             }
 
             if policy.network.mode != NetworkMode::Host {
-                if !namespace::netns_exists(&zone.name) {
-                    match namespace::create_netns(&zone.name) {
+                if !namespace::netns_exists(&zone.name, &self.config.paths.netns_dir) {
+                    match namespace::create_netns(&zone.name, &self.config.paths.netns_dir) {
                         Ok(()) => self.clear_degradation(&zone.name, "netns")?,
                         Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
                         Err(e) => {
@@ -694,8 +716,14 @@ impl IsolationBackend for LinuxBackend {
                         }
                     }
                 }
-                if namespace::netns_exists(&zone.name) && !network::veth_exists(&zone.name) {
-                    match network::create_veth_pair(&zone.name, zone.network_state.as_ref()) {
+                if namespace::netns_exists(&zone.name, &self.config.paths.netns_dir)
+                    && !network::veth_exists(&zone.name)
+                {
+                    match network::create_veth_pair(
+                        &zone.name,
+                        zone.network_state.as_ref(),
+                        &self.config.network.bridge,
+                    ) {
                         Ok(()) => self.clear_degradation(&zone.name, "network:veth")?,
                         Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
                         Err(e) => {
@@ -805,7 +833,7 @@ impl IsolationBackend for LinuxBackend {
         }
 
         // Clean up orphaned network namespaces.
-        let netns_dir = std::path::Path::new("/var/run/netns");
+        let netns_dir = std::path::Path::new(&self.config.paths.netns_dir);
         if netns_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(netns_dir) {
                 for entry in entries.flatten() {
@@ -814,7 +842,8 @@ impl IsolationBackend for LinuxBackend {
                     if let Some(zone_name) = name_str.strip_prefix("rauha-") {
                         if !known_names.contains(zone_name) && !live_orphans.contains(zone_name) {
                             tracing::warn!(netns = %name_str, "cleaning up orphaned netns");
-                            let _ = namespace::destroy_netns(zone_name);
+                            let _ =
+                                namespace::destroy_netns(zone_name, &self.config.paths.netns_dir);
                         }
                     }
                 }
@@ -825,7 +854,11 @@ impl IsolationBackend for LinuxBackend {
     }
 
     fn create_zone(&self, config: &ZoneConfig) -> Result<ZoneHandle> {
-        admit_linux_policy(&config.policy, &self.enforcer.skipped_hooks())?;
+        admit_linux_policy(
+            &config.policy,
+            &self.enforcer.skipped_hooks(),
+            &self.config.policy.safe_writable_roots,
+        )?;
         tracing::info!(zone = config.name, backend = "linux-ebpf", "creating zone");
 
         let zone_uuid = Uuid::new_v4();
@@ -856,7 +889,7 @@ impl IsolationBackend for LinuxBackend {
                 }
             }
             let _ = network::destroy_veth_pair(&config.name);
-            let _ = namespace::destroy_netns(&config.name);
+            let _ = namespace::destroy_netns(&config.name, &self.config.paths.netns_dir);
             let _ = self.cgroup.destroy_zone_cgroup(&config.name);
             let _ = self.remove_zone_id(&zone_uuid);
             match lock_backend(&self.zone_name_map, "zone_name_map") {
@@ -889,11 +922,15 @@ impl IsolationBackend for LinuxBackend {
                 }
             };
 
-            if let Err(e) = namespace::create_netns(&config.name) {
+            if let Err(e) = namespace::create_netns(&config.name, &self.config.paths.netns_dir) {
                 rollback_zone("network-namespace", Some(&ip_state));
                 return Err(e);
             }
-            if let Err(e) = network::create_veth_pair(&config.name, Some(&ip_state)) {
+            if let Err(e) = network::create_veth_pair(
+                &config.name,
+                Some(&ip_state),
+                &self.config.network.bridge,
+            ) {
                 if config.policy.admission == PolicyAdmission::Strict {
                     rollback_zone("network-veth", Some(&ip_state));
                     return Err(e);
@@ -1011,14 +1048,14 @@ impl IsolationBackend for LinuxBackend {
 
         // Tear down network.
         let _ = network::destroy_veth_pair(&zone.name);
-        let _ = namespace::destroy_netns(&zone.name);
+        let _ = namespace::destroy_netns(&zone.name, &self.config.paths.netns_dir);
 
         lock_backend(&self.zone_name_map, "zone_name_map")?.remove(&zone.name);
         lock_backend(&self.zone_policies, "zone_policies")?.remove(&zone.name);
         lock_backend(&self.zone_degradations, "zone_degradations")?.remove(&zone.name);
 
         // Clean up shim socket.
-        let socket_path = Self::shim_socket_path(&zone.name);
+        let socket_path = self.shim_socket_path(&zone.name);
         let _ = std::fs::remove_file(&socket_path);
 
         tracing::info!(zone = zone.name, "zone destroyed");
@@ -1026,7 +1063,11 @@ impl IsolationBackend for LinuxBackend {
     }
 
     fn enforce_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
-        admit_linux_policy(policy, &self.enforcer.skipped_hooks())?;
+        admit_linux_policy(
+            policy,
+            &self.enforcer.skipped_hooks(),
+            &self.config.policy.safe_writable_roots,
+        )?;
         tracing::info!(zone = zone.name, "enforcing policy");
 
         // Update BPF policy map. Route through the enforcement seam's neutral
@@ -1054,7 +1095,11 @@ impl IsolationBackend for LinuxBackend {
     }
 
     fn hot_reload_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
-        admit_linux_policy(policy, &self.enforcer.skipped_hooks())?;
+        admit_linux_policy(
+            policy,
+            &self.enforcer.skipped_hooks(),
+            &self.config.policy.safe_writable_roots,
+        )?;
         tracing::info!(zone = zone.name, "hot-reloading policy");
 
         let previous = lock_backend(&self.zone_policies, "zone_policies")?
@@ -1149,7 +1194,9 @@ impl IsolationBackend for LinuxBackend {
         if let Some(parent) = resolv_conf_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let resolv_content = crate::network::dns::generate_resolv_conf();
+        let resolv_content = crate::network::dns::generate_resolv_conf_with_fallback(
+            &self.config.network.dns_fallback,
+        );
         if let Err(e) = std::fs::write(&resolv_conf_path, &resolv_content) {
             tracing::warn!(%e, "failed to write resolv.conf — DNS may not work inside container");
         }
@@ -1182,7 +1229,10 @@ impl IsolationBackend for LinuxBackend {
             namespaces.push(
                 LinuxNamespaceBuilder::default()
                     .typ(LinuxNamespaceType::Network)
-                    .path(format!("/var/run/netns/rauha-{}", zone.name))
+                    .path(namespace::netns_path(
+                        &zone.name,
+                        &self.config.paths.netns_dir,
+                    ))
                     .build()
                     .unwrap(),
             );
@@ -1197,7 +1247,11 @@ impl IsolationBackend for LinuxBackend {
         if let Some(seccomp) = oci_seccomp(&policy)? {
             linux.set_seccomp(Some(seccomp));
         }
-        let mounts = oci_mounts(&policy, &rootfs_dir)?;
+        let mounts = oci_mounts(
+            &policy,
+            &rootfs_dir,
+            &self.config.policy.safe_writable_roots,
+        )?;
         let runtime_spec = serde_json::to_value(
             oci_spec::runtime::SpecBuilder::default()
                 .annotations(HashMap::from([(
@@ -1434,7 +1488,9 @@ impl IsolationBackend for LinuxBackend {
             });
         }
         if let Some(policy) = admitted_policy.as_ref() {
-            for control in unsupported_linux_controls(policy) {
+            for control in
+                unsupported_linux_controls(policy, &self.config.policy.safe_writable_roots)
+            {
                 policy_controls_ok = false;
                 checks.push(IsolationCheck {
                     name: format!("policy:{control}"),
@@ -1587,7 +1643,8 @@ impl IsolationBackend for LinuxBackend {
             .map(|policy| policy.network.mode)
             .unwrap_or(NetworkMode::Isolated);
         let requires_netns = network_mode != NetworkMode::Host;
-        let netns_ok = !requires_netns || namespace::netns_exists(&zone.name);
+        let netns_ok =
+            !requires_netns || namespace::netns_exists(&zone.name, &self.config.paths.netns_dir);
         checks.push(IsolationCheck {
             name: "netns".into(),
             passed: netns_ok,
@@ -1778,6 +1835,9 @@ mod tests {
 
     #[test]
     fn strict_admission_rejects_unsupported_controls() {
+        let safe = crate::config::DaemonConfig::default()
+            .policy
+            .safe_writable_roots;
         let mut policy = ZonePolicy::default();
         policy.filesystem.writable_paths = vec!["/proc".into()];
         policy.devices.allowed = vec!["/dev/sda".into()];
@@ -1785,30 +1845,36 @@ mod tests {
         policy.network.allowed_ingress = vec!["0.0.0.0/0:8080".into()];
 
         assert_eq!(
-            unsupported_linux_controls(&policy),
+            unsupported_linux_controls(&policy, &safe),
             vec!["filesystem.writable_paths", "devices.allowed",]
         );
 
-        let err = admit_linux_policy(&policy, &[]).expect_err("strict policy must fail closed");
+        let err =
+            admit_linux_policy(&policy, &[], &safe).expect_err("strict policy must fail closed");
         assert!(err.to_string().contains("filesystem.writable_paths"));
 
         policy.admission = PolicyAdmission::Audit;
-        admit_linux_policy(&policy, &[]).expect("audit mode explicitly accepts degraded admission");
+        admit_linux_policy(&policy, &[], &safe)
+            .expect("audit mode explicitly accepts degraded admission");
     }
 
     #[test]
     fn supported_controls_build_oci_seccomp_devices_and_mounts() {
         let root = tempfile::tempdir().unwrap();
+        let safe = crate::config::DaemonConfig::default()
+            .policy
+            .safe_writable_roots;
         std::fs::create_dir(root.path().join("tmp")).unwrap();
         let mut policy = ZonePolicy::default();
         policy.filesystem.writable_paths = vec!["/tmp".into()];
         policy.devices.allowed = vec!["/dev/null".into()];
         policy.syscalls.deny = vec!["mount".into()];
 
-        assert!(unsupported_linux_controls(&policy).is_empty());
+        assert!(unsupported_linux_controls(&policy, &safe).is_empty());
         assert_eq!(oci_devices(&policy).unwrap().len(), 1);
         assert!(oci_seccomp(&policy).unwrap().is_some());
-        let mounts = serde_json::to_value(oci_mounts(&policy, root.path()).unwrap()).unwrap();
+        let mounts =
+            serde_json::to_value(oci_mounts(&policy, root.path(), &safe).unwrap()).unwrap();
         assert!(mounts
             .as_array()
             .unwrap()
@@ -1818,8 +1884,14 @@ mod tests {
 
     #[test]
     fn strict_admission_rejects_missing_kernel_hooks() {
-        let err = admit_linux_policy(&ZonePolicy::default(), &["cgroup_attach_task".into()])
-            .expect_err("strict policy must reject degraded kernel enforcement");
+        let err = admit_linux_policy(
+            &ZonePolicy::default(),
+            &["cgroup_attach_task".into()],
+            &crate::config::DaemonConfig::default()
+                .policy
+                .safe_writable_roots,
+        )
+        .expect_err("strict policy must reject degraded kernel enforcement");
         assert!(err.to_string().contains("lsm.cgroup_attach_task"));
     }
 

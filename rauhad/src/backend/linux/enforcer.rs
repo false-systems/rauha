@@ -26,6 +26,8 @@ type TraitZones = HashMap<String, (u32, ZoneType)>;
 
 pub(super) struct LinuxEnforcer {
     root: String,
+    /// eBPF pin directory from daemon config (`[paths] bpf_pin_dir`).
+    bpf_pin_dir: String,
     ebpf: Mutex<Option<EbpfManager>>,
     event_reader_cancel: Option<tokio_util::sync::CancellationToken>,
     event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
@@ -41,8 +43,8 @@ pub(super) struct LinuxEnforcer {
 }
 
 impl LinuxEnforcer {
-    pub(super) fn new(root: &str) -> Result<Self> {
-        let mut ebpf = Self::load_ebpf(root)?;
+    pub(super) fn new(root: &str, bpf_pin_dir: &str) -> Result<Self> {
+        let mut ebpf = Self::load_ebpf(root, bpf_pin_dir)?;
         tracing::info!("eBPF programs loaded — kernel enforcement active");
 
         let ring_buf = ebpf
@@ -56,6 +58,7 @@ impl LinuxEnforcer {
 
         Ok(Self {
             root: root.to_string(),
+            bpf_pin_dir: bpf_pin_dir.to_string(),
             ebpf: Mutex::new(Some(ebpf)),
             event_reader_cancel: Some(event_reader_cancel),
             event_tx: Some(event_tx),
@@ -64,10 +67,10 @@ impl LinuxEnforcer {
         })
     }
 
-    fn load_ebpf(root: &str) -> Result<EbpfManager> {
+    fn load_ebpf(root: &str, bpf_pin_dir: &str) -> Result<EbpfManager> {
         for path in Self::ebpf_candidates(root) {
             if path.exists() {
-                return EbpfManager::load(&path);
+                return EbpfManager::load(&path, bpf_pin_dir);
             }
         }
 
@@ -294,7 +297,7 @@ impl EnforcerBackend for LinuxEnforcer {
         if ebpf_guard.is_some() {
             return Ok(());
         }
-        let ebpf = Self::load_ebpf(&self.root).map_err(to_enforcer_error)?;
+        let ebpf = Self::load_ebpf(&self.root, &self.bpf_pin_dir).map_err(to_enforcer_error)?;
         *ebpf_guard = Some(ebpf);
         Ok(())
     }
@@ -536,7 +539,10 @@ mod tests {
         }
 
         let root = tempfile::tempdir().expect("temp root");
-        let enforcer = match LinuxEnforcer::new(root.path().to_str().expect("utf-8 root")) {
+        let enforcer = match LinuxEnforcer::new(
+            root.path().to_str().expect("utf-8 root"),
+            "/sys/fs/bpf/rauha",
+        ) {
             Ok(enforcer) => enforcer,
             Err(e) => {
                 eprintln!(

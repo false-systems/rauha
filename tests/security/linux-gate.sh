@@ -22,10 +22,10 @@ cargo build --quiet --workspace --locked
 cargo xtask build-ebpf --release
 
 RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/rauha-security.XXXXXX")
-DAEMON_LOG="$ROOT/.sykli/rauhad.log"
+DAEMON_LOG="$ROOT/.gate/rauhad.log"
 DAEMON_PID_FILE="$RUN_ROOT/rauhad.pid"
 HOSTNAME_BEFORE=$(hostname)
-mkdir -p "$ROOT/.sykli"
+mkdir -p "$ROOT/.gate"
 DAEMON_PID=""
 DAEMON_LAUNCH_PID=""
 

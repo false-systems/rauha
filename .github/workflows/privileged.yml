@@ -29,30 +29,13 @@ jobs:
       - name: Install bpf-linker
         run: cargo binstall --no-confirm bpf-linker@0.11.0
 
-      # false-systems/sykli is currently public, so the install below needs
-      # no token. If it ever goes private again, set the SYKLI_READ_TOKEN
-      # repository secret (fine-grained PAT or GitHub App token with
-      # contents:read on that repository): the credential helper is then
-      # configured for this step only and the token never lands on disk.
-      - name: Install Sykli
-        env:
-          SYKLI_READ_TOKEN: ${{ secrets.SYKLI_READ_TOKEN }}
-        run: |
-          if [ -n "$SYKLI_READ_TOKEN" ]; then
-            git config --global credential.helper '!f() { printf "username=x-access-token\npassword=%s\n" "$SYKLI_READ_TOKEN"; }; f'
-          fi
-          CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/false-systems/sykli --rev 71d264367852c9f5df737f223be3b6efbf791ca8 --locked
-          if [ -n "$SYKLI_READ_TOKEN" ]; then
-            git config --global --unset credential.helper
-          fi
+      - name: Run the security gate
+        run: bash tests/security/linux-gate.sh
 
-      - name: Run locked security graph
-        run: bash tests/security/run.sh
-
-      - name: Upload execution receipt
+      - name: Upload gate artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rauha-security-receipt
-          path: .sykli/receipt.json
-          if-no-files-found: error
+          name: rauha-security-gate
+          path: .gate
+          if-no-files-found: warn
