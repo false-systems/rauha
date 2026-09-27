@@ -259,3 +259,11 @@ The oracle must not be modified as a side effect of modifying the system. It has
 - The workspace compiles and unit tests run anywhere (useful on macOS dev
   machines; use a Lima VM for anything needing the daemon). rauhad refuses to
   start on non-Linux (`UnsupportedPlatform`) — there is no second backend.
+
+## Languages
+
+Code in this repository is **Rust, or Elixir/Erlang**. Never add Python, Go
+or Node (JavaScript/TypeScript): not for tools, scripts, CI helpers, tests,
+dashboards or glue. A thin shell step in a CI workflow is fine; anything with
+logic is Rust. Existing Python or Node files are debt to be rewritten, not
+precedent to follow.
