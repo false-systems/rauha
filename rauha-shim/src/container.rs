@@ -8,38 +8,42 @@ use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-/// Resolve the crun binary. The daemon passes its configured
-/// `[executor] crun` value via `RAUHA_CRUN`: "auto" (default) searches PATH
-/// and known locations, or an absolute path is used directly. Never a
-/// hardcoded single path — see the never-hardcode convention.
-pub fn crun_path() -> anyhow::Result<PathBuf> {
-    if let Ok(configured) = std::env::var("RAUHA_CRUN") {
-        if configured != "auto" {
-            let path = PathBuf::from(&configured);
-            if !path.is_file() {
-                anyhow::bail!("configured OCI runtime is missing: {configured}");
+/// Resolve the crun binary, once per process. The daemon passes its
+/// configured `[executor] crun` value via `RAUHA_CRUN`: "auto" (default)
+/// searches PATH and known locations, or an absolute path is used directly.
+/// Never a hardcoded single path — see the never-hardcode convention.
+/// Cached: crun invocations are frequent (create, start, exec, delete) and
+/// the search walks PATH only once.
+pub fn crun_path() -> anyhow::Result<&'static PathBuf> {
+    static CRUN: std::sync::LazyLock<Result<PathBuf, String>> = std::sync::LazyLock::new(|| {
+        if let Ok(configured) = std::env::var("RAUHA_CRUN") {
+            if configured != "auto" {
+                let path = PathBuf::from(&configured);
+                if !path.is_file() {
+                    return Err(format!("configured OCI runtime is missing: {configured}"));
+                }
+                return Ok(path);
             }
-            return Ok(path);
         }
-    }
 
-    let mut candidates: Vec<PathBuf> = std::env::var("PATH")
-        .map(|p| {
-            std::env::split_paths(&p)
-                .map(|dir| dir.join("crun"))
-                .collect()
-        })
-        .unwrap_or_default();
-    candidates.push(PathBuf::from("/usr/local/bin/crun"));
-    candidates.push(PathBuf::from("/usr/bin/crun"));
-    candidates.push(PathBuf::from("/bin/crun"));
+        let mut candidates: Vec<PathBuf> = std::env::var("PATH")
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .map(|dir| dir.join("crun"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        candidates.push(PathBuf::from("/usr/local/bin/crun"));
+        candidates.push(PathBuf::from("/usr/bin/crun"));
+        candidates.push(PathBuf::from("/bin/crun"));
 
-    candidates.into_iter().find(|c| c.is_file()).ok_or_else(|| {
-        anyhow::anyhow!(
+        candidates.into_iter().find(|c| c.is_file()).ok_or_else(|| {
             "crun not found: install crun, or set executor.crun in rauha.toml \
                  (passed to the shim as RAUHA_CRUN)"
-        )
-    })
+                .to_string()
+        })
+    });
+    CRUN.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// An OCI init process supervised by the zone shim.
@@ -277,7 +281,11 @@ pub(crate) fn run_dir() -> PathBuf {
 }
 
 fn runtime_command(runtime_root: &Path) -> Command {
-    let mut command = Command::new(crun_path().unwrap_or_else(|_| PathBuf::from("crun")));
+    let mut command = Command::new(
+        crun_path()
+            .cloned()
+            .unwrap_or_else(|_| PathBuf::from("crun")),
+    );
     command
         .arg("--root")
         .arg(runtime_root)

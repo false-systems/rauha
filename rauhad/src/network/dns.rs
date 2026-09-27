@@ -6,16 +6,12 @@
 /// Addresses that only work on the host (systemd-resolved, macOS mDNSResponder).
 const LOCAL_STUBS: &[&str] = &["127.0.0.53", "127.0.0.1"];
 
-/// Fallback nameservers when no usable host nameservers are found. The
-/// daemon passes its configured `[network] dns_fallback`; this constant is
-/// only the default for direct callers.
-const FALLBACK_NAMESERVERS: &[&str] = &["1.1.1.1", "8.8.8.8"];
-
 /// Generate a resolv.conf suitable for use inside containers.
 ///
 /// Reads the host's /etc/resolv.conf. If all nameservers are localhost
-/// stubs (e.g. systemd-resolved's 127.0.0.53), falls back to the configured
-/// nameservers.
+/// stubs (e.g. systemd-resolved's 127.0.0.53), uses the configured
+/// fallback nameservers. An explicitly empty `dns_fallback` means "no
+/// fallback" — the operator chose to derive everything from the host.
 pub fn generate_resolv_conf_with_fallback(fallback: &[String]) -> String {
     generate_resolv_conf_from(
         std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
@@ -43,13 +39,9 @@ fn generate_resolv_conf_from(host_content: String, fallback: &[String]) -> Strin
         // Skip comments and empty lines.
     }
 
-    // If no usable nameservers found, use fallback.
+    // If no usable nameservers found, use the configured fallback.
     if nameservers.is_empty() {
-        nameservers = if fallback.is_empty() {
-            FALLBACK_NAMESERVERS.iter().map(|s| s.to_string()).collect()
-        } else {
-            fallback.to_vec()
-        };
+        nameservers = fallback.to_vec();
     }
 
     let mut output = String::new();
