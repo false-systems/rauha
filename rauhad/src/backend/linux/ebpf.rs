@@ -17,8 +17,6 @@ use rauha_ebpf_common::offsets::{
     OFFSET_DEFS,
 };
 
-const BPF_PIN_PATH: &str = "/sys/fs/bpf/rauha";
-
 /// LSM programs: (program_name_in_object, lsm_hook_name).
 /// The hook name is what Aya passes to the kernel BTF lookup.
 const LSM_PROGRAMS: &[(&str, &str)] = &[

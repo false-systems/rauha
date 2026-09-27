@@ -19,11 +19,11 @@ pub(crate) mod nftables;
 
 /// Clean up Linux network state (nftables table + bridge).
 /// Called during daemon shutdown.
-pub fn cleanup_network() {
+pub fn cleanup_network(bridge: &str) {
     if let Err(e) = nftables::cleanup_nat() {
         tracing::warn!(%e, "failed to clean up nftables table");
     }
-    if let Err(e) = network::destroy_bridge(&self.config.network.bridge) {
+    if let Err(e) = network::destroy_bridge(bridge) {
         tracing::warn!(%e, "failed to destroy network bridge");
     }
 }
@@ -1055,7 +1055,7 @@ impl IsolationBackend for LinuxBackend {
         lock_backend(&self.zone_degradations, "zone_degradations")?.remove(&zone.name);
 
         // Clean up shim socket.
-        let socket_path = Self::shim_socket_path(&zone.name);
+        let socket_path = self.shim_socket_path(&zone.name);
         let _ = std::fs::remove_file(&socket_path);
 
         tracing::info!(zone = zone.name, "zone destroyed");

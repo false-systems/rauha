@@ -26,6 +26,8 @@ type TraitZones = HashMap<String, (u32, ZoneType)>;
 
 pub(super) struct LinuxEnforcer {
     root: String,
+    /// eBPF pin directory from daemon config (`[paths] bpf_pin_dir`).
+    bpf_pin_dir: String,
     ebpf: Mutex<Option<EbpfManager>>,
     event_reader_cancel: Option<tokio_util::sync::CancellationToken>,
     event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
@@ -56,6 +58,7 @@ impl LinuxEnforcer {
 
         Ok(Self {
             root: root.to_string(),
+            bpf_pin_dir: bpf_pin_dir.to_string(),
             ebpf: Mutex::new(Some(ebpf)),
             event_reader_cancel: Some(event_reader_cancel),
             event_tx: Some(event_tx),
@@ -294,7 +297,7 @@ impl EnforcerBackend for LinuxEnforcer {
         if ebpf_guard.is_some() {
             return Ok(());
         }
-        let ebpf = Self::load_ebpf(&self.root).map_err(to_enforcer_error)?;
+        let ebpf = Self::load_ebpf(&self.root, &self.bpf_pin_dir).map_err(to_enforcer_error)?;
         *ebpf_guard = Some(ebpf);
         Ok(())
     }

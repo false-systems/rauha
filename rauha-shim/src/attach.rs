@@ -35,7 +35,6 @@ pub fn serve_attach_session(
     use std::os::fd::BorrowedFd;
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
 
     let socket_dir = crate::container::run_dir()
         .join("containers")
