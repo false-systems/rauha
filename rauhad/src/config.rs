@@ -268,6 +268,13 @@ impl DaemonConfig {
             ))
         })?;
         let _ = self.subnet_octets()?;
+        for ns in &self.network.dns_fallback {
+            ns.parse::<std::net::IpAddr>().map_err(|_| {
+                RauhaError::InvalidInput(format!(
+                    "network.dns_fallback entry {ns:?} is not an IP address"
+                ))
+            })?;
+        }
         if self.network.bridge.is_empty() {
             return Err(RauhaError::InvalidInput("network.bridge is empty".into()));
         }
@@ -314,6 +321,16 @@ pub fn parse_cidr(cidr: &str) -> Result<([u8; 4], u8)> {
         return Err(RauhaError::InvalidInput(format!(
             "subnet /{prefix} is larger than /16 — refusing: a zone network that big \
              exhausts the address space Rauha is allowed to manage"
+        )));
+    }
+    // The allocator reserves offset 0 (network address) and offset 1
+    // (gateway); /31 and /32 leave zero (or negative) room for zones and the
+    // gateway would fall outside the subnet. Reject at config time, not at
+    // the first zone create.
+    if prefix > 30 {
+        return Err(RauhaError::InvalidInput(format!(
+            "subnet /{prefix} is too small — /30 is the minimum that fits a gateway \
+             plus at least one zone (got {cidr})"
         )));
     }
     // Host bits must be zero (network address, not a host address).
@@ -392,6 +409,8 @@ mod tests {
         assert!(parse_cidr("10.89.0.0").is_err()); // no prefix
         assert!(parse_cidr("10.89.0.0/8").is_err()); // larger than /16
         assert!(parse_cidr("10.89.0.0/40").is_err()); // impossible prefix
+        assert!(parse_cidr("10.89.0.0/31").is_err()); // no room for gateway + zones
+        assert!(parse_cidr("10.89.0.0/32").is_err());
         assert!(parse_cidr("not-an-ip/16").is_err());
     }
 
@@ -407,6 +426,10 @@ mod tests {
 
         let mut c = DaemonConfig::default();
         c.limits.policy_max_bytes = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = DaemonConfig::default();
+        c.network.dns_fallback = vec!["not-an-ip".into()];
         assert!(c.validate().is_err());
     }
 }
