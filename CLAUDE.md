@@ -70,9 +70,9 @@ bash tests/integration/test-cgroup-lock.sh          # eBPF enforcement required
 # Authoritative privileged security gate (Linux, BPF-LSM kernel, passwordless sudo, crun, jq):
 # fmt + clippy + tests + eBPF build, then daemon, every integration test, the crash-recovery
 # probe (kill -9 rauhad mid-workload, restart, verify PID/cgroup/inode ownership survive),
-# the crun executor probe, and the oracle. This is the Sykli `full` task (sykli.json).
+# the crun executor probe, and the oracle.
 bash tests/security/linux-gate.sh
-bash tests/security/run.sh --gate      # same, via Sykli on this host or one running Lima VM (RAUHA_LIMA_INSTANCE)
+bash tests/security/run.sh             # same, on this host or one running Lima VM (RAUHA_LIMA_INSTANCE)
 
 # Oracle tests (require running rauhad, any platform)
 cd eval/oracle
@@ -213,6 +213,14 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 
 ## Code Conventions
 
+- **Never hardcode environment-varying values.** If a value could differ on
+  another host — path, address, subnet, DNS, binary location, capacity,
+  timeout, cap — it belongs in the daemon config schema (`rauha.toml`, env
+  overrides for CI), not as a constant in a source file. Only two kinds of
+  constants are exempt: security invariants (enrollment order, fail-closed
+  behavior), which are hardcoded on purpose and documented as invariants,
+  and named physical constants. Magic literals in code are bugs.
+
 - Error messages include what went wrong AND what to do about it. Many error variants have a `hint` field.
 - Linux-only code uses `#[cfg(target_os = "linux")]` with stub implementations for other platforms.
 - Policies are TOML. See `policies/standard.toml` for the canonical example.
@@ -236,7 +244,6 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 
 ## Work tooling in this repo
 
-- `sykli.json` / `sykli.lock` — the locked Sykli work graph; its single `full` task is the privileged security gate above. Changes to `tests/security/linux-gate.sh` usually go together with these two files.
 - `.toimija/` — Toimija session packets (the workset contract shown at session start). `.toimija/current.*`, `sessions/`, `runs/` are gitignored; `history.*` currently is not. Run `toimija verify` before committing; declare reads outside the packet's workset with `toimija intent "<why>" --scope <path>`.
 
 ## Oracle (`eval/oracle/`)
