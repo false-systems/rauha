@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 rauha-common = { path = "../rauha-common" }
 rauha-evidence = { path = "../rauha-evidence" }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }

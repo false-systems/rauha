@@ -19,7 +19,9 @@ is either shipped, probed on every release, or explicitly marked *planned*.
   (shipped for IPv4 via nftables; IPv6 default-off *planned*)
 - **Signed execution receipts** — a DSSE/in-toto statement binding image digest,
   policy hash, active hooks and self-test result, deny and drop counts, exit code
-  and time window. (*planned* — `obl_receipts`)
+  and time window. (shipped: `rauha.execution-receipt.v1` content + spec-compliant
+  DSSE envelope (`receipt_dsse_json`), verified offline by `rauha receipt`;
+  follow-up: cosign sigstore-bundle adapter, Rekor integration)
 - **Adversarial host-impact probes as a release gate** — hostile images, not
   friendly ones, decide whether a build ships. (shipped: `tests/security/`)
 - **Crash recovery never drops or un-enforces a running zone** — kill -9 the
