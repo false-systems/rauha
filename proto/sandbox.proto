@@ -67,6 +67,11 @@ message SandboxResult {
     // manifest admission, effective policy, inputs, outputs, enforcement
     // totals, observed drop count, and final outcome.
     string receipt_json = 15;
+    // The same receipt as a DSSE envelope wrapping an in-toto v1 statement
+    // (subject = image manifest digest, predicate = the execution receipt).
+    // Spec-compliant PAE signing — verifiable by cosign/Witness/in-toto
+    // tooling unchanged, and by `rauha receipt verify`.
+    string receipt_dsse_json = 16;
 }
 
 message SandboxEventSummary {

@@ -16,6 +16,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod dsse;
 pub mod receipt;
 
 pub mod event_name {

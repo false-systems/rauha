@@ -1871,6 +1871,7 @@ fn to_proto_result(
     admission: rauha_common::zone::PolicyAdmission,
     unavailable_controls: Vec<String>,
     receipt_json: String,
+    receipt_dsse_json: String,
 ) -> pb::sandbox::SandboxResult {
     pb::sandbox::SandboxResult {
         task_id: exec.task_id,
@@ -1910,6 +1911,7 @@ fn to_proto_result(
         admission: admission_str(admission).into(),
         unavailable_controls,
         receipt_json,
+        receipt_dsse_json,
     }
 }
 
@@ -2145,6 +2147,10 @@ impl SandboxService for SandboxServiceImpl {
             });
             receipt.verify().map_err(to_internal_status)?;
             let receipt_json = serde_json::to_string(&receipt).map_err(to_internal_status)?;
+            // The same receipt as a DSSE in-toto statement: spec-compliant
+            // PAE signing, verifiable by ecosystem tooling unchanged.
+            let dsse = self.receipt_signer.sign_dsse(receipt.payload.clone());
+            let receipt_dsse_json = serde_json::to_string(&dsse).map_err(to_internal_status)?;
             let run_event = match exec.status {
                 SandboxStatus::Succeeded => (
                     event_name::SANDBOX_RUN_SUCCEEDED,
@@ -2199,6 +2205,7 @@ impl SandboxService for SandboxServiceImpl {
                 admission,
                 unavailable_controls,
                 receipt_json,
+                receipt_dsse_json,
             )))
         }
         .instrument(span)
@@ -2273,6 +2280,7 @@ mod tests {
             rauha_common::zone::PolicyAdmission::Audit,
             vec!["ebpf:test".into()],
             "{}".into(),
+            String::new(),
         );
         assert_eq!(proto.status, "runtime_error");
         assert_eq!(proto.stderr, "boom");

@@ -105,6 +105,21 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
     receipt
         .verify()
         .map_err(|error| anyhow::anyhow!("daemon returned an unverifiable receipt: {error}"))?;
+    // The DSSE in-toto envelope of the same receipt must also verify —
+    // spec-compliant PAE, the form ecosystem tooling consumes. Surfaced in
+    // the JSON output so external verifiers get it without the daemon.
+    let receipt_dsse: rauha_evidence::dsse::DsseEnvelope = if result.receipt_dsse_json.is_empty() {
+        Default::default()
+    } else {
+        let envelope: rauha_evidence::dsse::DsseEnvelope =
+            serde_json::from_str(&result.receipt_dsse_json).map_err(|error| {
+                anyhow::anyhow!("daemon returned an invalid DSSE envelope: {error}")
+            })?;
+        envelope
+            .verify_public_hex(&receipt.public_key)
+            .map_err(|error| anyhow::anyhow!("DSSE envelope verification failed: {error}"))?;
+        envelope
+    };
 
     let view = output::SandboxRun {
         ok: result.status == "succeeded",
@@ -142,6 +157,7 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
             })
             .collect(),
         receipt,
+        receipt_dsse,
     };
 
     output::print(out, &view, || {

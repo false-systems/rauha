@@ -87,6 +87,24 @@ printf '%s\n' "$JSON" >"$RECEIPT_FILE"
 $RAUHA receipt "$RECEIPT_FILE" --public-key "${RAUHA_ROOT:?}/metadata/receipt.ed25519.pub" >/dev/null
 echo "   signed receipt verified (OK)"
 
+echo "6b. The DSSE in-toto envelope verifies and carries the manifest as subject..."
+DSSE_FILE=$(mktemp /tmp/rauha-receipt-dsse-XXXXXX.json)
+echo "$JSON" | jq .receipt_dsse >"$DSSE_FILE"
+if echo "$JSON" | jq -e '.receipt_dsse.payloadType == "application/vnd.in-toto+json"' >/dev/null \
+    && echo "$JSON" | jq -e '.receipt_dsse.payload | @base64d | fromjson | .predicateType == "https://rauha.dev/execution/v0"' >/dev/null \
+    && echo "$JSON" | jq -e --arg d "$DIGEST" '.receipt_dsse.payload | @base64d | fromjson | .subject[0].digest.sha256 == $d[7:]' >/dev/null; then
+    echo "   in-toto statement intact, subject = manifest digest (OK)"
+else
+    echo "   FAIL: DSSE envelope shape: $JSON"
+    exit 1
+fi
+if $RAUHA receipt "$DSSE_FILE" --public-key "${RAUHA_ROOT:?}/metadata/receipt.ed25519.pub" >/dev/null; then
+    echo "   DSSE signature verified offline (OK)"
+else
+    echo "   FAIL: DSSE verification"
+    exit 1
+fi
+
 echo "7. A named, pre-existing zone is reused and left intact..."
 $RAUHA zone create --name "$NAMED_ZONE" --policy "$AUDIT_POLICY"
 $RAUHA sandbox --image "$IMAGE" --name "$NAMED_ZONE" -- /bin/echo in-named-zone >/dev/null

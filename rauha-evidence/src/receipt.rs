@@ -57,6 +57,22 @@ pub struct SignedExecutionReceipt {
 pub struct ReceiptSigner(SigningKey);
 
 impl ReceiptSigner {
+    /// Crate-internal: the signing key (used by the DSSE layer).
+    pub(crate) fn signing_key(&self) -> &SigningKey {
+        &self.0
+    }
+
+    /// The public half of the receipt signing key.
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.0.verifying_key()
+    }
+
+    /// Crate-internal test constructor.
+    #[cfg(test)]
+    pub(crate) fn from_signing_key(key: SigningKey) -> Self {
+        Self(key)
+    }
+
     pub fn load_or_create(path: &Path) -> Result<Self, String> {
         match read_key(path) {
             Ok(key) => return Ok(Self(SigningKey::from_bytes(&key))),

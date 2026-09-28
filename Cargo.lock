@@ -2392,12 +2392,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
  "libc",
  "prost 0.13.5",
  "rauha-common",
  "rauha-evidence",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "toml",
@@ -2445,6 +2447,7 @@ dependencies = [
 name = "rauha-evidence"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "ed25519-dalek",
  "hex",
