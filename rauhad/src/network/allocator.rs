@@ -86,6 +86,13 @@ impl IpAllocator {
         }
     }
 
+    /// Whether an IP is allocatable in this subnet (offset > 1, within
+    /// the host range). Used at recovery to detect zones persisted under a
+    /// different `[network] subnet` configuration.
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        self.validated_offset(ip).is_some()
+    }
+
     /// Release an IP address back to the pool.
     pub fn release(&mut self, ip: Ipv4Addr) {
         if let Some(offset) = self.validated_offset(ip) {
@@ -133,6 +140,18 @@ impl IpAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_reflects_subnet_membership() {
+        let alloc = IpAllocator::new([10, 89, 0, 0], 24);
+        assert!(alloc.contains(Ipv4Addr::new(10, 89, 0, 5)));
+        assert!(alloc.contains(Ipv4Addr::new(10, 89, 0, 254)));
+        // Outside the subnet entirely — the recovery mismatch case.
+        assert!(!alloc.contains(Ipv4Addr::new(10, 90, 0, 5)));
+        // In-subnet but reserved: network address and gateway.
+        assert!(!alloc.contains(Ipv4Addr::new(10, 89, 0, 0)));
+        assert!(!alloc.contains(Ipv4Addr::new(10, 89, 0, 1)));
+    }
 
     #[test]
     fn allocate_returns_sequential_ips() {

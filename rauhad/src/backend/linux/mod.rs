@@ -376,6 +376,69 @@ impl LinuxBackend {
     }
 }
 
+/// Lifecycle-aware plan for the `filesystem:inode_ownership` check.
+///
+/// Live zones verify disk ↔ recorded ↔ kernel: the rootfs is on disk, so
+/// re-collecting it is meaningful. Zones with no live processes (container
+/// exited, rootfs possibly torn down by the executor) attest the *recorded*
+/// set against the kernel map instead — a torn-down rootfs must not turn a
+/// healthy run into a false degradation.
+///
+/// Extracted as a pure function so every lifecycle combination is testable
+/// without a backend.
+#[derive(Debug)]
+enum InodeCheckPlan {
+    /// Live zone, but no rootfs inodes discoverable on disk.
+    FailLive,
+    /// Live zone: userspace record and disk disagree.
+    Mismatch { recorded: usize, expected: usize },
+    /// Rootfs enumeration failed.
+    DiskError(String),
+    /// Attest this set against the kernel map; `note` explains which set
+    /// (live: disk-collected; idle: recorded).
+    Attest {
+        set: std::collections::BTreeSet<u64>,
+        note: &'static str,
+    },
+}
+
+fn inode_ownership_check_plan(
+    has_processes: bool,
+    disk: std::result::Result<&[u64], &str>,
+    recorded: &[u64],
+) -> InodeCheckPlan {
+    let recorded: std::collections::BTreeSet<u64> = recorded.iter().copied().collect();
+    match disk {
+        Err(e) => InodeCheckPlan::DiskError(e.to_string()),
+        Ok(disk) => {
+            let disk: std::collections::BTreeSet<u64> = disk.iter().copied().collect();
+            if has_processes {
+                if disk.is_empty() {
+                    return InodeCheckPlan::FailLive;
+                }
+                if disk != recorded {
+                    return InodeCheckPlan::Mismatch {
+                        recorded: recorded.len(),
+                        expected: disk.len(),
+                    };
+                }
+                InodeCheckPlan::Attest {
+                    set: disk,
+                    note: "",
+                }
+            } else {
+                // Idle zone: the executor may already have torn the rootfs
+                // down (overlay unmounted, merged emptied). Attest the
+                // recorded set — what was enforced during the run.
+                InodeCheckPlan::Attest {
+                    set: recorded,
+                    note: " (zone idle — attesting recorded set)",
+                }
+            }
+        }
+    }
+}
+
 fn unsupported_linux_controls(policy: &ZonePolicy, safe_writable_roots: &[String]) -> Vec<String> {
     let mut unsupported = Vec::new();
     if policy
@@ -701,7 +764,29 @@ impl IsolationBackend for LinuxBackend {
             self.cgroup.apply_resources(&zone.name, &policy.resources)?;
 
             if let Some(ref net_state) = zone.network_state {
-                lock_backend(&self.ip_allocator, "ip_allocator")?.mark_allocated(net_state.ip());
+                let ip = net_state.ip();
+                let in_subnet = lock_backend(&self.ip_allocator, "ip_allocator")?.contains(ip);
+                if !in_subnet {
+                    // The zone was persisted under a different [network]
+                    // subnet configuration. Silently skipping the
+                    // mark-allocation would leave the zone running with an
+                    // unreachable IP and no declaration — fail strict,
+                    // declare audit.
+                    let err = RauhaError::BackendError(format!(
+                        "zone IP {ip} is outside the configured subnet {} — \
+                         the [network] subnet changed after this zone was created",
+                        self.config.network.subnet
+                    ));
+                    match policy.admission {
+                        PolicyAdmission::Strict => return Err(err),
+                        PolicyAdmission::Audit => {
+                            self.record_degradation(&zone.name, "network:ip_out_of_subnet")?;
+                            tracing::warn!(%err, zone = zone.name, admission = "audit", "recovered zone keeps an out-of-subnet IP");
+                        }
+                    }
+                } else {
+                    lock_backend(&self.ip_allocator, "ip_allocator")?.mark_allocated(ip);
+                }
                 ip_marked = true;
             }
 
@@ -1584,41 +1669,37 @@ impl IsolationBackend for LinuxBackend {
         });
 
         let (inode_ok, inode_detail) = match self.get_zone_id(&zone.id)? {
-            Some(zone_id) => match collect_zone_rootfs_inodes(&self.root, &zone.name) {
-                Ok(expected)
-                    if expected.is_empty()
-                        && self.cgroup.zone_has_processes(&zone.name).unwrap_or(true) =>
-                {
-                    (
+            Some(zone_id) => {
+                let has_processes = self.cgroup.zone_has_processes(&zone.name).unwrap_or(true);
+                let disk =
+                    collect_zone_rootfs_inodes(&self.root, &zone.name).map_err(|e| e.to_string());
+                let recorded = lock_backend(&self.registered_inodes, "registered_inodes")?
+                    .get(&zone.name)
+                    .cloned()
+                    .unwrap_or_default();
+                match inode_ownership_check_plan(
+                    has_processes,
+                    disk.as_deref().map_err(|e| e.as_str()),
+                    &recorded,
+                ) {
+                    InodeCheckPlan::FailLive => (
                         false,
                         "live zone has no discoverable rootfs inode ownership".into(),
-                    )
-                }
-                Ok(expected) => {
-                    let mut recorded = lock_backend(&self.registered_inodes, "registered_inodes")?
-                        .get(&zone.name)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut expected_sorted = expected;
-                    recorded.sort_unstable();
-                    recorded.dedup();
-                    expected_sorted.sort_unstable();
-                    expected_sorted.dedup();
-                    if recorded != expected_sorted {
-                        (
-                            false,
-                            format!(
-                                "userspace inode ownership differs from rootfs: recorded {}, expected {}",
-                                recorded.len(),
-                                expected_sorted.len()
-                            ),
-                        )
-                    } else {
-                        match self.enforcer.inodes_match(&expected_sorted, zone_id) {
-                            Ok(true) => (
-                                true,
-                                format!("{} rootfs inodes registered", expected_sorted.len()),
-                            ),
+                    ),
+                    InodeCheckPlan::Mismatch { recorded, expected } => (
+                        false,
+                        format!(
+                            "userspace inode ownership differs from rootfs: recorded {recorded}, expected {expected}"
+                        ),
+                    ),
+                    InodeCheckPlan::DiskError(e) => {
+                        (false, format!("failed to enumerate zone rootfs: {e}"))
+                    }
+                    InodeCheckPlan::Attest { set, note } => {
+                        let list: Vec<u64> = set.into_iter().collect();
+                        let count = list.len();
+                        match self.enforcer.inodes_match(&list, zone_id) {
+                            Ok(true) => (true, format!("{count} rootfs inodes registered{note}")),
                             Ok(false) => (
                                 false,
                                 "kernel inode ownership map is incomplete or mismatched".into(),
@@ -1627,8 +1708,7 @@ impl IsolationBackend for LinuxBackend {
                         }
                     }
                 }
-                Err(e) => (false, format!("failed to enumerate zone rootfs: {e}")),
-            },
+            }
             None => (false, "zone has no userspace kernel identifier".into()),
         };
         checks.push(IsolationCheck {
@@ -1811,8 +1891,9 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_linux_policy, collect_zone_rootfs_inodes, lock_backend, oci_capabilities,
-        oci_devices, oci_mounts, oci_seccomp, unsupported_linux_controls,
+        admit_linux_policy, collect_zone_rootfs_inodes, inode_ownership_check_plan, lock_backend,
+        oci_capabilities, oci_devices, oci_mounts, oci_seccomp, unsupported_linux_controls,
+        InodeCheckPlan,
     };
     use rauha_common::zone::{PolicyAdmission, ZonePolicy};
     use std::os::unix::fs::MetadataExt;
@@ -1831,6 +1912,60 @@ mod tests {
 
         let err = lock_backend(&mutex, "test_state").expect_err("poisoned lock must fail closed");
         assert!(err.to_string().contains("test_state"));
+    }
+
+    #[test]
+    fn inode_check_plan_is_lifecycle_aware() {
+        use std::collections::BTreeSet;
+
+        let set = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
+        let inodes = [10u64, 20, 30];
+
+        // Live zone, healthy: disk == recorded → attest the disk set.
+        match inode_ownership_check_plan(true, Ok(&inodes), &inodes) {
+            InodeCheckPlan::Attest { set: s, note } => {
+                assert_eq!(s, set(&inodes));
+                assert_eq!(note, "");
+            }
+            other => panic!("expected Attest, got {other:?}"),
+        }
+
+        // Live zone, disk torn down (0 inodes) → hard fail: a running
+        // workload must have discoverable ownership.
+        assert!(matches!(
+            inode_ownership_check_plan(true, Ok(&[]), &inodes),
+            InodeCheckPlan::FailLive
+        ));
+
+        // Live zone, disk ≠ recorded → mismatch.
+        assert!(matches!(
+            inode_ownership_check_plan(true, Ok(&[1, 2]), &inodes),
+            InodeCheckPlan::Mismatch { .. }
+        ));
+
+        // Idle zone, rootfs torn down after container exit: attest the
+        // recorded set — the regression this plan fixes. Previously the
+        // re-collection returned 0 and a healthy run was declared degraded
+        // ("recorded 515, expected 0").
+        match inode_ownership_check_plan(false, Ok(&[]), &inodes) {
+            InodeCheckPlan::Attest { set: s, note } => {
+                assert_eq!(s, set(&inodes));
+                assert!(note.contains("idle"));
+            }
+            other => panic!("expected Attest, got {other:?}"),
+        }
+
+        // Idle zone, never had containers: vacuous pass (recorded empty).
+        match inode_ownership_check_plan(false, Ok(&[]), &[]) {
+            InodeCheckPlan::Attest { set: s, .. } => assert!(s.is_empty()),
+            other => panic!("expected Attest, got {other:?}"),
+        }
+
+        // Disk enumeration error surfaces as its own failure.
+        assert!(matches!(
+            inode_ownership_check_plan(true, Err("boom"), &inodes),
+            InodeCheckPlan::DiskError(_)
+        ));
     }
 
     #[test]
