@@ -701,7 +701,29 @@ impl IsolationBackend for LinuxBackend {
             self.cgroup.apply_resources(&zone.name, &policy.resources)?;
 
             if let Some(ref net_state) = zone.network_state {
-                lock_backend(&self.ip_allocator, "ip_allocator")?.mark_allocated(net_state.ip());
+                let ip = net_state.ip();
+                let in_subnet = lock_backend(&self.ip_allocator, "ip_allocator")?.contains(ip);
+                if !in_subnet {
+                    // The zone was persisted under a different [network]
+                    // subnet configuration. Silently skipping the
+                    // mark-allocation would leave the zone running with an
+                    // unreachable IP and no declaration — fail strict,
+                    // declare audit.
+                    let err = RauhaError::BackendError(format!(
+                        "zone IP {ip} is outside the configured subnet {} — \
+                         the [network] subnet changed after this zone was created",
+                        self.config.network.subnet
+                    ));
+                    match policy.admission {
+                        PolicyAdmission::Strict => return Err(err),
+                        PolicyAdmission::Audit => {
+                            self.record_degradation(&zone.name, "network:ip_out_of_subnet")?;
+                            tracing::warn!(%err, zone = zone.name, admission = "audit", "recovered zone keeps an out-of-subnet IP");
+                        }
+                    }
+                } else {
+                    lock_backend(&self.ip_allocator, "ip_allocator")?.mark_allocated(ip);
+                }
                 ip_marked = true;
             }
 
