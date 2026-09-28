@@ -33,63 +33,21 @@ pub async fn handle(action: ImageAction, out: OutputMode) -> anyhow::Result<()> 
                 println!("Pulling {reference}...");
             }
 
-            let mut stream = client
+            let stream = client
                 .pull(pb::image::PullRequest {
                     reference: reference.clone(),
                 })
                 .await?
                 .into_inner();
-
-            use tokio_stream::StreamExt;
-            if out == OutputMode::Human {
-                use std::io::Write;
-                let mut last_status = String::new();
-                while let Some(progress) = stream.next().await {
-                    match progress {
-                        Ok(p) => {
-                            if p.done {
-                                if !last_status.is_empty() {
-                                    print!("\r{}\r", " ".repeat(60));
-                                }
-                                println!("Pull complete: {reference}");
-                            } else if p.total > 0 {
-                                let pct = (p.current as f64 / p.total as f64 * 100.0) as u32;
-                                let size_mb = p.total as f64 / 1_048_576.0;
-                                let msg = format!("  {} {:.1}MB {pct}%", p.status, size_mb);
-                                print!("\r{msg:<60}");
-                                let _ = std::io::stdout().flush();
-                                last_status = msg;
-                            } else {
-                                if !last_status.is_empty() {
-                                    print!("\r{}\r", " ".repeat(60));
-                                    let _ = std::io::stdout().flush();
-                                }
-                                println!("  {}", p.status);
-                                last_status.clear();
-                            }
-                        }
-                        Err(e) => {
-                            println!();
-                            return Err(e.into());
-                        }
-                    }
-                }
-            } else {
-                // JSON: consume stream silently, emit result at end.
-                while let Some(progress) = stream.next().await {
-                    if let Err(e) = progress {
-                        return Err(e.into());
-                    }
-                }
-                output::print(
-                    out,
-                    &output::ImagePulled {
-                        ok: true,
-                        reference,
-                    },
-                    || {},
-                );
-            }
+            consume_pull_progress(stream, &reference, out).await?;
+            output::print(
+                out,
+                &output::ImagePulled {
+                    ok: true,
+                    reference,
+                },
+                || {},
+            );
         }
         ImageAction::List => {
             let resp = client
@@ -177,6 +135,58 @@ pub async fn handle(action: ImageAction, out: OutputMode) -> anyhow::Result<()> 
                     }
                 },
             );
+        }
+    }
+    Ok(())
+}
+
+/// Consume a pull progress stream: human mode prints a single-line progress
+/// display, JSON mode stays silent (the caller emits the structured result).
+/// Shared by `rauha image pull` and the sandbox pull-if-absent path.
+pub(super) async fn consume_pull_progress(
+    mut stream: tonic::Streaming<pb::image::PullProgress>,
+    reference: &str,
+    out: OutputMode,
+) -> anyhow::Result<()> {
+    use tokio_stream::StreamExt;
+
+    if out != OutputMode::Human {
+        while let Some(progress) = stream.next().await {
+            progress?;
+        }
+        return Ok(());
+    }
+
+    use std::io::Write;
+    let mut last_status = String::new();
+    while let Some(progress) = stream.next().await {
+        match progress {
+            Ok(p) => {
+                if p.done {
+                    if !last_status.is_empty() {
+                        print!("\r{}\r", " ".repeat(60));
+                    }
+                    println!("Pull complete: {reference}");
+                } else if p.total > 0 {
+                    let pct = (p.current as f64 / p.total as f64 * 100.0) as u32;
+                    let size_mb = p.total as f64 / 1_048_576.0;
+                    let msg = format!("  {} {:.1}MB {pct}%", p.status, size_mb);
+                    print!("\r{msg:<60}");
+                    let _ = std::io::stdout().flush();
+                    last_status = msg;
+                } else {
+                    if !last_status.is_empty() {
+                        print!("\r{}\r", " ".repeat(60));
+                        let _ = std::io::stdout().flush();
+                    }
+                    println!("  {}", p.status);
+                    last_status.clear();
+                }
+            }
+            Err(e) => {
+                println!();
+                return Err(e.into());
+            }
         }
     }
     Ok(())

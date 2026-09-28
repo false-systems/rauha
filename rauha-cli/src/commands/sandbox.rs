@@ -61,7 +61,14 @@ pub struct SandboxArgs {
 
 pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Result<()> {
     let channel = super::connect().await?;
-    let mut client = SandboxServiceClient::new(channel);
+    let mut client = SandboxServiceClient::new(channel.clone());
+
+    // Pull the image if it is not already in the local store. The daemon
+    // deliberately has no implicit pull (sandbox semantics are explicit),
+    // but the one-command product experience must not fail on a cold store —
+    // and when the pull fails, its real error must surface, not a confusing
+    // "image not pulled" from the container-create path.
+    pull_if_absent(channel, &args.image, out).await?;
 
     let request = pb::sandbox::RunSandboxRequest {
         image: args.image,
@@ -177,7 +184,39 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
     Ok(())
 }
 
-#[cfg(test)]
+/// Ensure the image is in the daemon's local store, pulling on demand.
+async fn pull_if_absent(
+    channel: tonic::transport::Channel,
+    reference: &str,
+    out: OutputMode,
+) -> anyhow::Result<()> {
+    use super::image::pb::image::image_service_client::ImageServiceClient;
+    use super::image::pb::image::{InspectImageRequest, PullRequest};
+
+    let mut images = ImageServiceClient::new(channel);
+    match images
+        .inspect(InspectImageRequest {
+            reference: reference.to_string(),
+        })
+        .await
+    {
+        Ok(_) => return Ok(()),
+        Err(status) if status.code() == tonic::Code::NotFound => {}
+        Err(status) => return Err(anyhow::anyhow!("{}", status.message())),
+    }
+
+    if out == OutputMode::Human {
+        println!("Pulling {reference}...");
+    }
+    let stream = images
+        .pull(PullRequest {
+            reference: reference.to_string(),
+        })
+        .await?
+        .into_inner();
+    super::image::consume_pull_progress(stream, reference, out).await
+}
+
 mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
