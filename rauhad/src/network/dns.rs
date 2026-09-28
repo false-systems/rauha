@@ -60,6 +60,13 @@ fn generate_resolv_conf_from(host_content: String, fallback: &[String]) -> Strin
 mod tests {
     use super::*;
 
+    /// The config default fallback (`[network] dns_fallback`).
+    const DEFAULT_FALLBACK: &[&str] = &["1.1.1.1", "8.8.8.8"];
+
+    fn fallback() -> Vec<String> {
+        DEFAULT_FALLBACK.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn preserves_real_nameservers() {
         let host = "\
@@ -81,7 +88,7 @@ nameserver 127.0.0.53
 options edns0 trust-ad
 search .
 ";
-        let result = generate_resolv_conf_from(host.into(), &[]);
+        let result = generate_resolv_conf_from(host.into(), &fallback());
         // Should NOT contain 127.0.0.53.
         assert!(!result.contains("127.0.0.53"));
         // Should have fallback nameservers.
@@ -106,15 +113,24 @@ nameserver 10.0.0.1
 
     #[test]
     fn empty_resolv_conf() {
-        let result = generate_resolv_conf_from(String::new(), &[]);
+        let result = generate_resolv_conf_from(String::new(), &fallback());
         assert!(result.contains("nameserver 1.1.1.1"));
         assert!(result.contains("nameserver 8.8.8.8"));
     }
 
     #[test]
+    fn explicit_empty_fallback_means_no_fallback() {
+        // An operator who sets dns_fallback = [] chose "derive from host,
+        // no fallback": an unusable host resolv.conf yields no nameservers,
+        // not silently-revived defaults.
+        let result = generate_resolv_conf_from(String::new(), &[]);
+        assert!(!result.contains("nameserver"));
+    }
+
+    #[test]
     fn localhost_127_0_0_1() {
         let host = "nameserver 127.0.0.1\n";
-        let result = generate_resolv_conf_from(host.into(), &[]);
+        let result = generate_resolv_conf_from(host.into(), &fallback());
         assert!(!result.contains("127.0.0.1"));
         assert!(result.contains("nameserver 1.1.1.1"));
     }
