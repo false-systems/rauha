@@ -541,28 +541,59 @@ fn oci_capabilities(policy: &ZonePolicy) -> Result<oci_spec::runtime::LinuxCapab
         .map_err(|e| RauhaError::BackendError(format!("failed to build OCI capabilities: {e}")))
 }
 
-fn oci_seccomp(policy: &ZonePolicy) -> Result<Option<oci_spec::runtime::LinuxSeccomp>> {
+fn oci_seccomp(
+    policy: &ZonePolicy,
+    listener_path: Option<&std::path::Path>,
+) -> Result<Option<oci_spec::runtime::LinuxSeccomp>> {
     use oci_spec::runtime::{LinuxSeccompAction, LinuxSeccompBuilder, LinuxSyscallBuilder};
 
-    if policy.syscalls.deny.is_empty() {
+    if policy.syscalls.deny.is_empty() && policy.syscalls.broker.is_empty() {
         return Ok(None);
     }
-    let denied = LinuxSyscallBuilder::default()
-        .names(policy.syscalls.deny.clone())
-        .action(LinuxSeccompAction::ScmpActErrno)
-        .errno_ret(libc::EPERM as u32)
-        .build()
-        .map_err(|error| {
-            RauhaError::BackendError(format!("failed to build OCI seccomp rule: {error}"))
-        })?;
-    LinuxSeccompBuilder::default()
+
+    let mut rules = Vec::new();
+    if !policy.syscalls.deny.is_empty() {
+        let denied = LinuxSyscallBuilder::default()
+            .names(policy.syscalls.deny.clone())
+            .action(LinuxSeccompAction::ScmpActErrno)
+            .errno_ret(libc::EPERM as u32)
+            .build()
+            .map_err(|error| {
+                RauhaError::BackendError(format!("failed to build OCI seccomp rule: {error}"))
+            })?;
+        rules.push(denied);
+    }
+
+    // Brokered syscalls suspend in the kernel and are judged by the zone
+    // shim over the seccomp listener socket (crun ships the notify fd to
+    // `listener_path` per the OCI runtime spec). The workload never
+    // exercises ambient authority for these calls: it either gets EPERM or
+    // an fd the broker opened on its behalf.
+    if !policy.syscalls.broker.is_empty() {
+        if listener_path.is_none() {
+            return Err(RauhaError::InvalidPolicy(
+                "brokered syscalls require a seccomp listener path".into(),
+            ));
+        }
+        let brokered = LinuxSyscallBuilder::default()
+            .names(policy.syscalls.broker.clone())
+            .action(LinuxSeccompAction::ScmpActNotify)
+            .build()
+            .map_err(|error| {
+                RauhaError::BackendError(format!("failed to build brokered seccomp rule: {error}"))
+            })?;
+        rules.push(brokered);
+    }
+
+    let mut builder = LinuxSeccompBuilder::default()
         .default_action(LinuxSeccompAction::ScmpActAllow)
-        .syscalls(vec![denied])
-        .build()
-        .map(Some)
-        .map_err(|error| {
-            RauhaError::BackendError(format!("failed to build OCI seccomp profile: {error}"))
-        })
+        .syscalls(rules);
+    if let Some(path) = listener_path {
+        builder = builder.listener_path(path.to_path_buf());
+    }
+    builder.build().map(Some).map_err(|error| {
+        RauhaError::BackendError(format!("failed to build OCI seccomp profile: {error}"))
+    })
 }
 
 fn oci_devices(policy: &ZonePolicy) -> Result<Vec<oci_spec::runtime::LinuxDevice>> {
@@ -1329,7 +1360,17 @@ impl IsolationBackend for LinuxBackend {
             .map_err(|e| {
                 RauhaError::BackendError(format!("failed to build OCI Linux spec: {e}"))
             })?;
-        if let Some(seccomp) = oci_seccomp(&policy)? {
+        // Brokered syscalls need the shim's seccomp listener socket; it
+        // lives next to the shim socket in the configured runtime dir.
+        let listener_path = if policy.syscalls.broker.is_empty() {
+            None
+        } else {
+            Some(
+                PathBuf::from(&self.config.paths.run_dir)
+                    .join(format!("broker-{container_id}.sock")),
+            )
+        };
+        if let Some(seccomp) = oci_seccomp(&policy, listener_path.as_deref())? {
             linux.set_seccomp(Some(seccomp));
         }
         let mounts = oci_mounts(
@@ -2007,7 +2048,30 @@ mod tests {
 
         assert!(unsupported_linux_controls(&policy, &safe).is_empty());
         assert_eq!(oci_devices(&policy).unwrap().len(), 1);
-        assert!(oci_seccomp(&policy).unwrap().is_some());
+        assert!(oci_seccomp(&policy, None).unwrap().is_some());
+
+        // Brokered syscalls emit SCMP_ACT_NOTIFY and require a listener.
+        policy.syscalls.broker = vec!["openat".into()];
+        assert!(
+            oci_seccomp(&policy, None).is_err(),
+            "broker without listener must be refused"
+        );
+        let seccomp = oci_seccomp(
+            &policy,
+            Some(std::path::Path::new("/run/rauha/broker-test.sock")),
+        )
+        .unwrap()
+        .unwrap();
+        let json = serde_json::to_value(&seccomp).unwrap();
+        assert_eq!(json["defaultAction"], "SCMP_ACT_ALLOW");
+        assert_eq!(json["listenerPath"], "/run/rauha/broker-test.sock");
+        let notify_rule = json["syscalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["action"] == "SCMP_ACT_NOTIFY")
+            .expect("brokered syscall rule with SCMP_ACT_NOTIFY");
+        assert_eq!(notify_rule["names"], serde_json::json!(["openat"]));
         let mounts =
             serde_json::to_value(oci_mounts(&policy, root.path(), &safe).unwrap()).unwrap();
         assert!(mounts

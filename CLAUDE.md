@@ -247,6 +247,11 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 - Error messages include what went wrong AND what to do about it. Many error variants have a `hint` field.
 - Linux-only code uses `#[cfg(target_os = "linux")]` with stub implementations for other platforms.
 - Policies are TOML. See `policies/standard.toml` for the canonical example.
+`[syscalls] broker = [...]` marks syscalls as brokered: they suspend in the
+kernel (seccomp `SCMP_ACT_NOTIFY`) and are judged by the zone shim, which
+either denies or opens on the workload's behalf (read-only, openat2
+`RESOLVE_IN_ROOT`) and injects the fd — the workload never exercises ambient
+authority for brokered calls. v0: openat-shaped, read-only-in-rootfs.
 - Tests go in `#[cfg(test)]` modules within source files, not in separate test files.
 
 ## Workspace Crates

@@ -256,6 +256,10 @@ pub struct DevicePolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyscallPolicy {
     pub deny: Vec<String>,
+    /// Syscalls brokered through the zone shim via seccomp-notify: the kernel
+    /// suspends the call, the shim judges it (deny, or open-and-inject an fd —
+    /// the workload never exercises ambient authority itself). Empty = off.
+    pub broker: Vec<String>,
 }
 
 /// Configuration for creating a new zone.
@@ -403,7 +407,8 @@ pub struct PolicyFileDevices {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyFileSyscalls {
-    pub deny: Vec<String>,
+    pub deny: Option<Vec<String>>,
+    pub broker: Option<Vec<String>>,
 }
 
 const LINUX_CAPABILITIES: &[&str] = &[
@@ -630,7 +635,8 @@ impl PolicyFile {
             .syscalls
             .as_ref()
             .map(|s| SyscallPolicy {
-                deny: s.deny.clone(),
+                deny: s.deny.clone().unwrap_or_default(),
+                broker: s.broker.clone().unwrap_or_default(),
             })
             .unwrap_or_default();
 
