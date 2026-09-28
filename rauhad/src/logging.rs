@@ -262,6 +262,18 @@ fn host_id() -> String {
 }
 
 fn host_name() -> String {
+    // gethostname(2) is the source of truth. The HOSTNAME env var is a
+    // shell-ism that sudo strips (env_reset) — reading it first logged
+    // "unknown" on every daemon started the documented way (as root).
+    let mut buf = [0u8; 256];
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0;
+    if ok {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let name = String::from_utf8_lossy(&buf[..end]).to_string();
+        if !name.is_empty() {
+            return name;
+        }
+    }
     std::env::var("HOSTNAME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -271,6 +283,15 @@ fn host_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_name_is_resolved_not_unknown() {
+        // gethostname(2) succeeds on any normal host (CI runners, dev boxes,
+        // VMs); "unknown" means the old env-only fallback fired — the bug
+        // where daemons started under sudo logged host.name=unknown forever.
+        assert_ne!(host_name(), "unknown");
+        assert!(!host_name().is_empty());
+    }
 
     #[test]
     fn empty_event_field_does_not_override_existing() {
