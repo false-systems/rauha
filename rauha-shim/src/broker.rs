@@ -23,7 +23,6 @@
 //! `seccomp_data` (80 bytes total on 64-bit), ioctl numbers computed from
 //! _IOWR('!', ...) and cross-checked on the target kernel.
 
-use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -240,7 +239,7 @@ enum Decision {
 /// Read a NUL-terminated path from the target's memory at `ptr`.
 fn read_path(pid: u32, ptr: u64) -> Option<String> {
     use std::os::unix::fs::FileExt;
-    let mut mem = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
+    let mem = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
     let mut buf = vec![0u8; MAX_PATH];
     let mut len = 0usize;
     loop {
