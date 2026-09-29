@@ -23,14 +23,37 @@ const BRIDGE_FAMILY: &str = "bridge";
 /// Called once during LinuxBackend::new(). The bridge name comes from
 /// daemon config (default `rauha0`).
 pub fn ensure_nat(subnet_cidr: &str, bridge: &str) -> Result<()> {
-    // nft -f applies the complete batch as one kernel transaction. A syntax or
-    // runtime failure therefore leaves the previous enforcement table intact.
-    run_nft_script(&base_ruleset(
+    // The inet table (NAT + L3 forward filtering) is required: without it
+    // zones have no masqueraded connectivity at all — fail closed, with a
+    // message that names what the kernel is missing. nft -f applies it as
+    // one kernel transaction, so a failure leaves the previous table
+    // intact.
+    run_nft_script(&inet_ruleset(
         subnet_cidr,
         bridge,
         table_exists(TABLE_FAMILY)?,
-        table_exists(BRIDGE_FAMILY)?,
-    ))?;
+    ))
+    .map_err(|error| {
+        RauhaError::BackendError(format!(
+            "cannot create the inet nftables table (NAT + forward filtering): {error} — \
+             the kernel needs nf_tables and nf_nat; this is a hard requirement"
+        ))
+    })?;
+
+    // The bridge table is the cross-zone L2 boundary. It runs in its own
+    // transaction: a kernel without nf_tables_bridge degrades explicitly
+    // instead of refusing the daemon — the existing per-zone admission
+    // model governs (strict zones refuse network policy without bridge
+    // filtering; audit zones record a network:nftables degradation, and
+    // `zone verify` reports it).
+    if let Err(error) = run_nft_script(&bridge_ruleset(table_exists(BRIDGE_FAMILY)?)) {
+        tracing::warn!(
+            %error,
+            "bridge nftables table unavailable (kernel without nf_tables_bridge?) — \
+             cross-zone L2 filtering degrades: strict zones will refuse network \
+             admission, audit zones record network:nftables"
+        );
+    }
 
     tracing::info!(
         subnet = subnet_cidr,
@@ -39,19 +62,12 @@ pub fn ensure_nat(subnet_cidr: &str, bridge: &str) -> Result<()> {
     Ok(())
 }
 
-/// Every bridge base chain is `policy drop`: a zone only has connectivity
-/// through the per-zone jump rules installed by `apply_zone_rules`, so a zone
-/// whose rules failed to apply, or whose rules are mid-replacement, is cut off
-/// rather than left open. The inet forward `iifname "rauha0"` accept is only
-/// reachable for frames that already passed a bridge input chain.
-fn base_ruleset(
-    subnet_cidr: &str,
-    bridge: &str,
-    replace_inet: bool,
-    replace_bridge: bool,
-) -> String {
+/// The inet half of the base ruleset: NAT masquerade plus the L3 forward
+/// filter (default drop) and the host-input drop. Applied as one kernel
+/// transaction. Required — see `ensure_nat`.
+fn inet_ruleset(subnet_cidr: &str, bridge: &str, replace: bool) -> String {
     format!(
-        "{delete_inet}{delete_bridge}add table inet rauha\n\
+        "{delete_inet}add table inet rauha\n\
          add chain inet rauha postrouting {{ type nat hook postrouting priority srcnat; }}\n\
          add rule inet rauha postrouting ip saddr {subnet_cidr} oifname != \"{bridge}\" masquerade\n\
          add chain inet rauha forward {{ type filter hook forward priority filter; policy drop; }}\n\
@@ -60,21 +76,25 @@ fn base_ruleset(
          add rule inet rauha forward oifname \"{bridge}\" accept\n\
          add chain inet rauha input {{ type filter hook input priority filter; policy accept; }}\n\
          add rule inet rauha input ct state established,related accept\n\
-         add rule inet rauha input iifname \"{bridge}\" drop\n\
-         add table bridge rauha\n\
+         add rule inet rauha input iifname \"{bridge}\" drop\n",
+        delete_inet = if replace { "delete table inet rauha\n" } else { "" },
+    )
+}
+
+/// The bridge half: every base chain is `policy drop`, so a zone only has
+/// connectivity through the per-zone jump rules installed by
+/// `apply_zone_rules` — a zone whose rules failed to apply, or whose rules
+/// are mid-replacement, is cut off rather than left open. The inet forward
+/// `iifname "rauha0"` accept is only reachable for frames that already
+/// passed a bridge input chain. Optional — a kernel without
+/// nf_tables_bridge degrades (see `ensure_nat`).
+fn bridge_ruleset(replace: bool) -> String {
+    format!(
+        "{delete_bridge}add table bridge rauha\n\
          add chain bridge rauha forward {{ type filter hook forward priority filter; policy drop; }}\n\
          add chain bridge rauha input {{ type filter hook input priority filter; policy drop; }}\n\
          add chain bridge rauha output {{ type filter hook output priority filter; policy drop; }}\n",
-        delete_inet = if replace_inet {
-            "delete table inet rauha\n"
-        } else {
-            ""
-        },
-        delete_bridge = if replace_bridge {
-            "delete table bridge rauha\n"
-        } else {
-            ""
-        },
+        delete_bridge = if replace { "delete table bridge rauha\n" } else { "" },
     )
 }
 
@@ -478,20 +498,35 @@ mod tests {
     }
 
     #[test]
-    fn base_ruleset_replaces_both_tables_and_blocks_host_input() {
-        let rules = base_ruleset("10.89.0.0/16", "rauha0", true, true);
-        assert!(rules.starts_with(
-            "delete table inet rauha\ndelete table bridge rauha\nadd table inet rauha"
-        ));
-        assert!(rules.contains("add chain bridge rauha forward"));
+    fn base_rulesets_split_by_family_and_fail_closed() {
+        // inet: NAT + forward + host-input drop, one atomic transaction.
+        let inet = inet_ruleset("10.89.0.0/16", "rauha0", true);
+        assert_eq!(inet.lines().next().unwrap(), "delete table inet rauha");
+        assert!(inet.contains("add table inet rauha"));
+        assert!(inet.contains("add rule inet rauha input iifname \"rauha0\" drop"));
+        assert!(inet.contains("ip saddr 10.89.0.0/16"));
+        assert!(
+            !inet.contains("bridge"),
+            "bridge rules live in their own transaction"
+        );
+        // bridge: every base chain fails closed, its own transaction.
+        let bridge = bridge_ruleset(true);
+        assert_eq!(bridge.lines().next().unwrap(), "delete table bridge rauha");
         for chain in ["forward", "input", "output"] {
             assert!(
-                rules.contains(&format!("add chain bridge rauha {chain} {{ type filter hook {chain} priority filter; policy drop; }}")),
+                bridge.contains(&format!(
+                    "add chain bridge rauha {chain} {{ type filter hook {chain} priority filter; policy drop; }}"
+                )),
                 "bridge {chain} chain must fail closed"
             );
         }
-        assert!(rules.contains("add rule inet rauha input iifname \"rauha0\" drop"));
-        assert!(rules.contains("ip saddr 10.89.0.0/16"));
+        assert!(
+            !bridge.contains("inet"),
+            "no inet rules in the bridge transaction"
+        );
+        // First boot creates without deleting.
+        assert!(inet_ruleset("10.0.0.0/16", "rauha0", false).starts_with("add table inet rauha"));
+        assert!(bridge_ruleset(false).starts_with("add table bridge rauha"));
     }
 
     #[test]

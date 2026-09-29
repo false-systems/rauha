@@ -635,6 +635,19 @@ fn oci_mounts(
                 "writable path is not a directory: {declared}"
             )));
         }
+        // The tmpfs starts empty: image content at this path is shadowed,
+        // not copied (an upper-copy bind is the planned upgrade). Say so
+        // when it hides something — silent data disappearance is a support
+        // ticket, not a feature.
+        let shadows_content = std::fs::read_dir(&current)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if shadows_content {
+            tracing::warn!(
+                path = %declared,
+                "writable path is shadowed by an empty tmpfs — image content at this path is hidden"
+            );
+        }
         mounts.push(
             MountBuilder::default()
                 .destination(declared)
