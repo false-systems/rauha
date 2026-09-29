@@ -249,9 +249,13 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 - Policies are TOML. See `policies/standard.toml` for the canonical example.
 `[syscalls] broker = [...]` marks syscalls as brokered: they suspend in the
 kernel (seccomp `SCMP_ACT_NOTIFY`) and are judged by the zone shim, which
-either denies or opens on the workload's behalf (read-only, openat2
-`RESOLVE_IN_ROOT`) and injects the fd — the workload never exercises ambient
-authority for brokered calls. v0: openat-shaped, read-only-in-rootfs.
+either denies or opens on the workload's behalf (read-only, openat2-confined:
+absolute paths `RESOLVE_IN_ROOT` against the container root, relative paths
+`RESOLVE_BENEATH` the workload's own dirfd/cwd) and injects the fd — the
+workload never exercises ambient authority for brokered calls. The judgment
+re-validates the notification id after pinning `/proc/<pid>/{mem,root}`
+(pid-reuse race from the kernel docs). v0: `openat` only — the backend
+rejects other names at policy-build time.
 - Tests go in `#[cfg(test)]` modules within source files, not in separate test files.
 
 ## Workspace Crates

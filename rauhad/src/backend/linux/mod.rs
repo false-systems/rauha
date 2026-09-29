@@ -569,11 +569,27 @@ fn oci_seccomp(
     // `listener_path` per the OCI runtime spec). The workload never
     // exercises ambient authority for these calls: it either gets EPERM or
     // an fd the broker opened on its behalf.
+    //
+    // The shim broker judges exactly these syscalls; emitting NOTIFY for
+    // anything else would suspend calls nobody can answer. Refuse here, at
+    // policy-build time, so the mismatch surfaces as a policy error — not
+    // as a zone that hangs on its first syscall.
+    const BROKERABLE_SYSCALLS: [&str; 1] = ["openat"];
     if !policy.syscalls.broker.is_empty() {
         if listener_path.is_none() {
             return Err(RauhaError::InvalidPolicy(
                 "brokered syscalls require a seccomp listener path".into(),
             ));
+        }
+        if let Some(name) = policy
+            .syscalls
+            .broker
+            .iter()
+            .find(|name| !BROKERABLE_SYSCALLS.contains(&name.as_str()))
+        {
+            return Err(RauhaError::InvalidPolicy(format!(
+                "brokered syscall not supported by the shim broker: {name} (supported: openat)"
+            )));
         }
         let brokered = LinuxSyscallBuilder::default()
             .names(policy.syscalls.broker.clone())
@@ -2056,6 +2072,16 @@ mod tests {
             oci_seccomp(&policy, None).is_err(),
             "broker without listener must be refused"
         );
+        // And only syscall names the shim broker can actually judge: a
+        // NOTIFY rule for anything else suspends calls nobody answers.
+        policy.syscalls.broker = vec!["openat2".into(), "openat".into()];
+        let err = oci_seccomp(
+            &policy,
+            Some(std::path::Path::new("/run/rauha/broker-test.sock")),
+        )
+        .expect_err("unsupported brokered syscall must be refused");
+        assert!(err.to_string().contains("openat2"));
+        policy.syscalls.broker = vec!["openat".into()];
         let seccomp = oci_seccomp(
             &policy,
             Some(std::path::Path::new("/run/rauha/broker-test.sock")),

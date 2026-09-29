@@ -259,6 +259,8 @@ pub struct SyscallPolicy {
     /// Syscalls brokered through the zone shim via seccomp-notify: the kernel
     /// suspends the call, the shim judges it (deny, or open-and-inject an fd —
     /// the workload never exercises ambient authority itself). Empty = off.
+    /// The backend refuses names the shim broker cannot judge (v0: `openat`,
+    /// read-only opens only).
     pub broker: Vec<String>,
 }
 
