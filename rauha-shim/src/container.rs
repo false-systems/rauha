@@ -186,23 +186,26 @@ pub fn start_with_crun(
         std::fs::create_dir_all(&runtime_root)?;
         std::fs::write(bundle.join("config.json"), spec_json)?;
 
+        let pid_file = bundle.join("init.pid");
+        let _ = std::fs::remove_file(&pid_file);
+        let log_dir = run_dir().join("containers").join(container_id);
+        std::fs::create_dir_all(&log_dir)?;
+
         // If the spec brokers syscalls (seccomp SCMP_ACT_NOTIFY with a
         // listener path), start the broker thread before crun starts the
         // container — crun's listener helper connects there at start.
+        // Every broker decision is appended to broker.log next to the
+        // container's stdout/stderr logs.
         if let Some(listener_path) = broker_listener_path(spec_json) {
+            let decision_log = log_dir.join("broker.log");
             std::thread::spawn(move || {
-                if let Err(error) = crate::broker::serve(&listener_path) {
+                if let Err(error) = crate::broker::serve(&listener_path, &decision_log) {
                     // The broker failing after judgments is survivable —
                     // brokered calls then hang or EPERM — but say so.
                     tracing::error!(%error, "seccomp broker exited with error");
                 }
             });
         }
-
-        let pid_file = bundle.join("init.pid");
-        let _ = std::fs::remove_file(&pid_file);
-        let log_dir = run_dir().join("containers").join(container_id);
-        std::fs::create_dir_all(&log_dir)?;
 
         let status = runtime_command(&runtime_root)
             .args(crun_create_args(&bundle, &pid_file, container_id))

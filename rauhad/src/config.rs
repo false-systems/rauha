@@ -34,6 +34,8 @@ pub struct DaemonConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub broker: BrokerConfig,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -219,6 +221,30 @@ fn default_safe_writable_roots() -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerConfig {
+    /// Task-pin cache capacity for the shim's seccomp broker, passed to
+    /// the shim as `RAUHA_BROKER_CACHE_MAX`. One entry per workload thread
+    /// that makes brokered calls; `0` disables caching (every judgment
+    /// takes the cold path). The bound keeps a zone from growing the
+    /// broker's memory by spawning threads.
+    #[serde(default = "default_broker_cache_max_tasks")]
+    pub cache_max_tasks: usize,
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self {
+            cache_max_tasks: default_broker_cache_max_tasks(),
+        }
+    }
+}
+
+fn default_broker_cache_max_tasks() -> usize {
+    512
+}
+
 impl DaemonConfig {
     /// Load configuration. Resolution order: `RAUHA_CONFIG`, then
     /// `{root}/rauha.toml`, then defaults. A missing file is not an error;
@@ -288,6 +314,14 @@ impl DaemonConfig {
             return Err(RauhaError::InvalidInput(
                 "evidence.sandbox_log_max_bytes and limits.policy_max_bytes must be > 0".into(),
             ));
+        }
+        if self.broker.cache_max_tasks > (1 << 20) {
+            return Err(RauhaError::InvalidInput(format!(
+                "broker.cache_max_tasks {} is unreasonable — one cache entry is held per \
+                 workload thread making brokered calls (max {})",
+                self.broker.cache_max_tasks,
+                1 << 20
+            )));
         }
         Ok(())
     }
@@ -363,6 +397,7 @@ mod tests {
         );
         assert_eq!(c.evidence.sandbox_log_max_bytes, 1024 * 1024);
         assert_eq!(c.limits.policy_max_bytes, 64 * 1024);
+        assert_eq!(c.broker.cache_max_tasks, 512);
     }
 
     #[test]
@@ -430,6 +465,10 @@ mod tests {
 
         let mut c = DaemonConfig::default();
         c.network.dns_fallback = vec!["not-an-ip".into()];
+        assert!(c.validate().is_err());
+
+        let mut c = DaemonConfig::default();
+        c.broker.cache_max_tasks = 2 << 21;
         assert!(c.validate().is_err());
     }
 }

@@ -236,6 +236,10 @@ impl LinuxBackend {
         Command::new(&shim_bin)
             .env("RAUHA_RUN_DIR", &self.config.paths.run_dir)
             .env("RAUHA_CRUN", &self.config.executor.crun)
+            .env(
+                "RAUHA_BROKER_CACHE_MAX",
+                self.config.broker.cache_max_tasks.to_string(),
+            )
             .arg("--zone-name")
             .arg(zone_name)
             .arg("--socket")
@@ -567,14 +571,17 @@ fn oci_seccomp(
     // Brokered syscalls suspend in the kernel and are judged by the zone
     // shim over the seccomp listener socket (crun ships the notify fd to
     // `listener_path` per the OCI runtime spec). The workload never
-    // exercises ambient authority for these calls: it either gets EPERM or
-    // an fd the broker opened on its behalf.
+    // exercises ambient authority for these calls: it either gets an
+    // honest errno or an fd the broker opened on its behalf.
     //
-    // The shim broker judges exactly these syscalls; emitting NOTIFY for
-    // anything else would suspend calls nobody can answer. Refuse here, at
-    // policy-build time, so the mismatch surfaces as a policy error — not
-    // as a zone that hangs on its first syscall.
-    const BROKERABLE_SYSCALLS: [&str; 1] = ["openat"];
+    // The shim broker judges exactly the names in BROKERABLE_SYSCALLS
+    // (shared with the shim's own tests, so the crates cannot drift);
+    // emitting NOTIFY for anything else would suspend calls nobody can
+    // answer. Refuse here, at policy-build time, so the mismatch surfaces
+    // as a policy error — not as a zone that hangs on its first syscall.
+    // A name listed as both denied and brokered is likewise refused: the
+    // deny rule wins by order and the broker half would silently never
+    // run — that is a policy contradiction, not a policy.
     if !policy.syscalls.broker.is_empty() {
         if listener_path.is_none() {
             return Err(RauhaError::InvalidPolicy(
@@ -585,10 +592,22 @@ fn oci_seccomp(
             .syscalls
             .broker
             .iter()
+            .find(|name| policy.syscalls.deny.iter().any(|deny| deny == *name))
+        {
+            return Err(RauhaError::InvalidPolicy(format!(
+                "syscall {name} is listed in both syscalls.deny and syscalls.broker — \
+                 remove it from one: deny would silently win and the broker never runs"
+            )));
+        }
+        if let Some(name) = policy
+            .syscalls
+            .broker
+            .iter()
             .find(|name| !BROKERABLE_SYSCALLS.contains(&name.as_str()))
         {
             return Err(RauhaError::InvalidPolicy(format!(
-                "brokered syscall not supported by the shim broker: {name} (supported: openat)"
+                "brokered syscall not supported by the shim broker: {name} (supported: {})",
+                BROKERABLE_SYSCALLS.join(", ")
             )));
         }
         let brokered = LinuxSyscallBuilder::default()
@@ -2072,16 +2091,30 @@ mod tests {
             oci_seccomp(&policy, None).is_err(),
             "broker without listener must be refused"
         );
-        // And only syscall names the shim broker can actually judge: a
-        // NOTIFY rule for anything else suspends calls nobody answers.
-        policy.syscalls.broker = vec!["openat2".into(), "openat".into()];
+        // Only syscall names the shim broker can actually judge: a NOTIFY
+        // rule for anything else suspends calls nobody answers.
+        policy.syscalls.broker = vec!["execve".into()];
         let err = oci_seccomp(
             &policy,
             Some(std::path::Path::new("/run/rauha/broker-test.sock")),
         )
         .expect_err("unsupported brokered syscall must be refused");
-        assert!(err.to_string().contains("openat2"));
+        assert!(err.to_string().contains("execve"));
+        // A syscall both denied and brokered is a contradiction: deny would
+        // silently win and the broker half never run.
+        policy.syscalls.deny = vec!["mount".into(), "openat".into()];
         policy.syscalls.broker = vec!["openat".into()];
+        let err = oci_seccomp(
+            &policy,
+            Some(std::path::Path::new("/run/rauha/broker-test.sock")),
+        )
+        .expect_err("denied and brokered must be refused");
+        assert!(err
+            .to_string()
+            .contains("both syscalls.deny and syscalls.broker"));
+        policy.syscalls.deny = vec!["mount".into()];
+        // Every admitted name is judged by the shim: openat AND openat2.
+        policy.syscalls.broker = vec!["openat2".into(), "openat".into()];
         let seccomp = oci_seccomp(
             &policy,
             Some(std::path::Path::new("/run/rauha/broker-test.sock")),
@@ -2097,7 +2130,10 @@ mod tests {
             .iter()
             .find(|r| r["action"] == "SCMP_ACT_NOTIFY")
             .expect("brokered syscall rule with SCMP_ACT_NOTIFY");
-        assert_eq!(notify_rule["names"], serde_json::json!(["openat"]));
+        assert_eq!(
+            notify_rule["names"],
+            serde_json::json!(["openat2", "openat"])
+        );
         let mounts =
             serde_json::to_value(oci_mounts(&policy, root.path(), &safe).unwrap()).unwrap();
         assert!(mounts

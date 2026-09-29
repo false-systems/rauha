@@ -259,10 +259,16 @@ pub struct SyscallPolicy {
     /// Syscalls brokered through the zone shim via seccomp-notify: the kernel
     /// suspends the call, the shim judges it (deny, or open-and-inject an fd —
     /// the workload never exercises ambient authority itself). Empty = off.
-    /// The backend refuses names the shim broker cannot judge (v0: `openat`,
-    /// read-only opens only).
+    /// Only names in [`BROKERABLE_SYSCALLS`] are admitted; the shim judges
+    /// exactly that set (read-only opens, honest errnos).
     pub broker: Vec<String>,
 }
+
+/// Syscall names the zone-shim seccomp broker can judge (read-only opens,
+/// satisfied by fd injection). The daemon refuses any other brokered name at
+/// policy-build time; the shim cross-checks the kernel numbers against this
+/// list in its tests so the two crates cannot drift.
+pub const BROKERABLE_SYSCALLS: &[&str] = &["openat", "openat2"];
 
 /// Configuration for creating a new zone.
 #[derive(Debug, Clone)]
