@@ -197,7 +197,7 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
 /// does not discard a valid legacy receipt — they are independent
 /// evidence about the same run.
 fn verify_receipts(
-    result: &pb::sandbox::RunSandboxResponse,
+    result: &pb::sandbox::SandboxResult,
 ) -> (
     Option<rauha_evidence::receipt::SignedExecutionReceipt>,
     Option<rauha_evidence::dsse::DsseEnvelope>,
@@ -236,7 +236,9 @@ fn verify_receipts(
                 None,
                 Some(format!("DSSE envelope verification failed: {error}")),
             ),
-            Ok(()) => (Some(receipt), Some(envelope), None),
+            // The statement is the envelope's payload — already covered by
+            // the legacy receipt verification above.
+            Ok(_statement) => (Some(receipt), Some(envelope), None),
         },
     }
 }
