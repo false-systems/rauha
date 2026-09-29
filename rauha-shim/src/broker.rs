@@ -62,15 +62,15 @@ use anyhow::{bail, Context, Result};
 const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc050_2100;
 // _IOWR('!', 1, struct seccomp_notif_resp) — 24 bytes
 const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc018_2101;
-// _IOWR('!', 2, __u64) — 8 bytes
-const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0xc008_2102;
+// _IOW('!', 2, __u64) — 8 bytes (NB: _IOW, not _IOWR — linux/seccomp.h)
+const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x4008_2102;
 // _IOW('!', 3, struct seccomp_notif_addfd) — 24 bytes
 const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x4018_2103;
 
 // Decode our own ioctl numbers at compile time: dir<<30 | size<<16 | type<<8 | nr.
 const _: () = assert!(0xc000_0000 | (80 << 16) | ((b'!' as u32) << 8) == 0xc050_2100);
 const _: () = assert!(0xc000_0000 | (24 << 16) | (b'!' as u32) << 8 | 1 == 0xc018_2101);
-const _: () = assert!(0xc000_0000 | (8 << 16) | (b'!' as u32) << 8 | 2 == 0xc008_2102);
+const _: () = assert!(0x4000_0000 | (8 << 16) | (b'!' as u32) << 8 | 2 == 0x4008_2102);
 const _: () = assert!(0x4000_0000 | (24 << 16) | (b'!' as u32) << 8 | 3 == 0x4018_2103);
 const _: () = assert!(std::mem::size_of::<SeccompNotif>() == 80);
 const _: () = assert!(std::mem::size_of::<SeccompNotifResp>() == 24);
@@ -336,9 +336,11 @@ fn judge(fd: libc::c_int, notif: &SeccompNotif) -> Decision {
             tracing::info!(
                 id = notif.id,
                 pid = notif.pid,
-                "broker: task gone — skipping"
+                "broker: task gone — denying"
             );
-            return Decision::Gone;
+            // Task died: deny. SEND then hits ENOENT, which respond()
+            // tolerates — the syscall is never left suspended.
+            return Decision::Deny;
         }
     };
 
@@ -365,9 +367,13 @@ fn judge(fd: libc::c_int, notif: &SeccompNotif) -> Decision {
     // 3. The race check: if the notification is no longer pending, the
     // task exited before now — the fds above may belong to a pid-reusing
     // impostor and must not be used. See the module docs.
-    if !id_valid(fd, notif.id) {
-        tracing::info!(id = notif.id, "broker: notification expired — skipping");
-        return Decision::Gone;
+    if let Err(e) = id_valid(fd, notif.id) {
+        tracing::info!(id = notif.id, errno = %e, "broker: notification expired — denying");
+        // The syscall must still be answered: an unanswered notification
+        // suspends the task forever — a zone deadlock, not a denial. For a
+        // truly dead notification SEND just returns ENOENT; for anything
+        // else the call is denied.
+        return Decision::Deny;
     }
 
     // 4. Safe to read the target's memory and resolve.
@@ -429,10 +435,13 @@ fn open_for_target(pidfd: &OwnedFd, root_fd: &OwnedFd, pid: u32, grant: Grant) -
     // Resolve relative paths against the task's own directory context —
     // never the container root, which would silently answer a different
     // question than the workload asked.
-    let (dir_fd, resolve, path) = match grant {
-        Grant::InRoot { path, no_follow } => {
-            (root_fd.as_raw_fd(), resolve_flags(true, no_follow), path)
-        }
+    //
+    // The base fd must outlive the openat2 below: the raw number handed
+    // to the syscall is only valid while its OwnedFd is alive, so the fd
+    // lives in `base` for the rest of the function. (A temporary scoped to
+    // the match arm would close the fd before the syscall — EBADF.)
+    let (base, resolve, path) = match grant {
+        Grant::InRoot { path, no_follow } => (None, resolve_flags(true, no_follow), path),
         Grant::Beneath {
             dirfd,
             path,
@@ -466,9 +475,12 @@ fn open_for_target(pidfd: &OwnedFd, root_fd: &OwnedFd, pid: u32, grant: Grant) -
                 }
                 unsafe { OwnedFd::from_raw_fd(borrowed as libc::c_int) }
             };
-            (base.as_raw_fd(), resolve_flags(false, no_follow), path)
+            (Some(base), resolve_flags(false, no_follow), path)
         }
     };
+    let dir_fd = base
+        .as_ref()
+        .map_or(root_fd.as_raw_fd(), |owned| owned.as_raw_fd());
 
     let path = match std::ffi::CString::new(path) {
         Ok(p) => p,
@@ -504,8 +516,6 @@ fn open_for_target(pidfd: &OwnedFd, root_fd: &OwnedFd, pid: u32, grant: Grant) -
 
 enum Decision {
     Deny,
-    /// The task exited before judgment; the response would be ENOENT.
-    Gone,
     InjectFd(std::fs::File),
 }
 
@@ -519,7 +529,7 @@ fn pidfd_open(pid: u32) -> Option<OwnedFd> {
 }
 
 /// SECCOMP_IOCTL_NOTIF_ID_VALID: is this notification still pending?
-fn id_valid(fd: libc::c_int, id: u64) -> bool {
+fn id_valid(fd: libc::c_int, id: u64) -> std::io::Result<()> {
     let mut id = id;
     let n = unsafe {
         libc::ioctl(
@@ -528,7 +538,11 @@ fn id_valid(fd: libc::c_int, id: u64) -> bool {
             &mut id as *mut u64 as *mut libc::c_void,
         )
     };
-    n == 0
+    if n == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Read a NUL-terminated path from the target's memory at `ptr`.
@@ -564,8 +578,6 @@ fn respond(fd: libc::c_int, id: u64, decision: Decision) -> Result<()> {
         Decision::Deny => {
             resp.error = libc::EPERM;
         }
-        // Task gone: skip the response; SEND would return ENOENT anyway.
-        Decision::Gone => return Ok(()),
         Decision::InjectFd(file) => {
             let addfd = SeccompNotifAddfd {
                 id,
