@@ -195,7 +195,6 @@ pub struct SandboxEnforcementEvent {
 /// Result of `rauha sandbox` — the agent-facing task contract.
 /// Field names are stable; agents and scripts can rely on them.
 #[derive(Serialize)]
-    #[derive(Serialize)]
 pub struct SandboxRun {
     pub ok: bool,
     pub task_id: String,

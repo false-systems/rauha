@@ -46,7 +46,10 @@ pub fn ensure_nat(subnet_cidr: &str, bridge: &str) -> Result<()> {
     // model governs (strict zones refuse network policy without bridge
     // filtering; audit zones record a network:nftables degradation, and
     // `zone verify` reports it).
-    if let Err(error) = run_nft_script(&bridge_ruleset(table_exists(BRIDGE_FAMILY)?)) {
+    // A failed table_exists query must not kill the optional path: assume
+    // the table is absent and let the script attempt speak for itself.
+    let bridge_exists = table_exists(BRIDGE_FAMILY).unwrap_or(false);
+    if let Err(error) = run_nft_script(&bridge_ruleset(bridge_exists)) {
         tracing::warn!(
             %error,
             "bridge nftables table unavailable (kernel without nf_tables_bridge?) — \
