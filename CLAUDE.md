@@ -220,7 +220,9 @@ daemon at spawn.
 [evidence]  sandbox_log_max_bytes = 1048576
 [limits]    policy_max_bytes = 65536
 [policy]    safe_writable_roots = ["/proc", "/sys", "/dev", "/run"]
-[broker]    cache_max_tasks = 512       # shim task-pin cache (RAUHA_BROKER_CACHE_MAX; 0 = cold)
+[broker]    cache_max_tasks = 512       # shim task-pin cache (RAUHA_BROKER_CACHE_MAX; 0 = cold; clamped to the fd budget)
+            judge_threads = 4           # parallel judges (RAUHA_BROKER_JUDGE_THREADS; 1 = serial)
+            handoff_timeout_ms = 30000  # bounded wait for crun's fd hand-off
 ```
 
 On startup, rauhad runs `reconcile()`: loads all zones from redb, calls `recover_zone()` on each to re-establish kernel state (BPF maps, cgroups, network), then `cleanup_orphans()` to remove stale kernel state. Stale BPF pins are removed before loading new programs — redb is the source of truth.

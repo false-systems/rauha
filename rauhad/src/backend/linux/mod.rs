@@ -240,6 +240,14 @@ impl LinuxBackend {
                 "RAUHA_BROKER_CACHE_MAX",
                 self.config.broker.cache_max_tasks.to_string(),
             )
+            .env(
+                "RAUHA_BROKER_JUDGE_THREADS",
+                self.config.broker.judge_threads.to_string(),
+            )
+            .env(
+                "RAUHA_BROKER_HANDOFF_TIMEOUT_MS",
+                self.config.broker.handoff_timeout_ms.to_string(),
+            )
             .arg("--zone-name")
             .arg(zone_name)
             .arg("--socket")

@@ -66,12 +66,22 @@
 //! restrictive umask, mode 0600, exactly one accepted connection whose
 //! peer uid must equal ours (`SO_PEERCRED`), exactly one `SCM_RIGHTS`
 //! descriptor with no truncation, close-on-exec on everything the broker
-//! holds (the shim forks and execs helpers).
+//! holds (the shim forks and execs helpers), and a bounded wait for the
+//! fd itself — a hand-off that never comes fails cleanly instead of
+//! parking the thread forever.
 //!
-//! The judgment loop is single-threaded on purpose. Notifications are
-//! received serially from one ioctl, and judging each takes a handful of
-//! syscalls — serial judgment is also a rate limiter: a hostile zone
-//! cannot widen its judgment surface by forging parallel brokered calls.
+//! ## Throughput: the judge pool
+//!
+//! The kernel hands each pending notification to exactly one concurrent
+//! `SECCOMP_IOCTL_NOTIF_RECV` — multiple judge threads on the same notify
+//! fd are kernel-sanctioned, each dequeuing distinct notifications. The
+//! broker runs `judge_threads` judges (from `rauha.toml` `[broker]`, `1`
+//! = the serial loop, also the fallback): per-thread pin caches (the
+//! configured capacity is split between them), one shared decision log
+//! behind a mutex that covers a single small write, never a judgment.
+//! Parallelism stays bounded by design — a hostile zone cannot widen its
+//! judgment surface by forging parallel brokered calls; it can only fill
+//! the pool it was given.
 //!
 //! Every decision is recorded as one JSON line in the container's
 //! `broker.log` (final outcome only, sequence-numbered) — the seed for
@@ -92,6 +102,7 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
@@ -102,12 +113,29 @@ mod pins;
 
 use abi::*;
 use classify::{Anchor, Denial, Grant};
-use decision::{Decision, DecisionLog, Judged};
+use decision::{Decision, DecisionLog};
 use pins::{PinCache, TaskPins};
 
+/// Default judge-thread count when the daemon passes no override
+/// (`RAUHA_BROKER_JUDGE_THREADS`, from `rauha.toml` `[broker]
+/// judge_threads`). `1` is the serial loop.
+const DEFAULT_JUDGE_THREADS: usize = 4;
 /// Default task-pin cache capacity when the daemon passes no override
 /// (`RAUHA_BROKER_CACHE_MAX`, from `rauha.toml` `[broker] cache_max_tasks`).
+/// Split across the judge pool; each entry costs three fds (pidfd, mem,
+/// root), which is why [`cache_cap_within`] clamps it to the fd budget.
 const DEFAULT_CACHE_MAX_TASKS: usize = 512;
+/// Default wait for crun's fd hand-off (`RAUHA_BROKER_HANDOFF_TIMEOUT_MS`,
+/// from `rauha.toml` `[broker] handoff_timeout_ms`).
+const DEFAULT_HANDOFF_TIMEOUT_MS: u64 = 30_000;
+/// fds reserved for the shim's other work (sockets, logs, containers)
+/// before the pin cache may claim the rest of RLIMIT_NOFILE.
+const FD_HEADROOM: u64 = 96;
+const MIN_JUDGE_THREADS: usize = 1;
+const MAX_JUDGE_THREADS: usize = 64;
+
+/// The shared decision log behind the judge pool.
+type SharedLog = Arc<Mutex<DecisionLog>>;
 
 /// Remove the listener socket however `serve` exits.
 struct SocketGuard<'a>(&'a Path);
@@ -119,12 +147,11 @@ impl Drop for SocketGuard<'_> {
 
 /// Serve the seccomp listener socket: accept one peer-verified connection
 /// (crun's listener helper), receive the notify fd, and judge
-/// notifications until the fd closes. Runs on its own thread; the
-/// container blocks while each decision is made, so the loop must stay
-/// fast and panic-free — a panic here would leave every brokered syscall
-/// suspended forever, which is a zone deadlock, not a degraded mode.
-/// Every decision is appended to `decision_log_path` (one JSON line per
-/// judged call).
+/// notifications until the fd closes. The container blocks while each
+/// decision is made, so every judge must stay fast and panic-free — a
+/// panic would leave brokered syscalls suspended forever, which is a zone
+/// deadlock, not a degraded mode. Every decision is appended to
+/// `decision_log_path` (one JSON line per judged call).
 pub fn serve(listener_path: &Path, decision_log_path: &Path) -> Result<()> {
     let _ = std::fs::remove_file(listener_path);
     // Bind under a restrictive umask so the socket is never briefly
@@ -156,21 +183,132 @@ pub fn serve(listener_path: &Path, decision_log_path: &Path) -> Result<()> {
         );
     }
     tracing::debug!(peer_pid = peer.pid, "broker: seccomp fd hand-off accepted");
+    // Bounded wait: a hand-off that never comes fails cleanly (container
+    // start fails closed) instead of parking this thread forever.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(handoff_timeout_ms())))
+        .context("set seccomp hand-off timeout")?;
     let notify_fd = recv_fd(&stream).context("receive seccomp notify fd")?;
     drop(stream);
 
-    let mut log = DecisionLog::open(decision_log_path);
-    let mut cache = PinCache::new(cache_max_tasks());
-    judge_loop(notify_fd, &mut cache, &mut log)
+    // Each cached task pin costs three real fds; a cache sized past the
+    // fd limit would turn into EMFILE denials under load. Raise the soft
+    // limit to the hard limit (root) and clamp the cache to the budget.
+    raise_nofile_soft_to_hard();
+    let cache_cap = cache_cap_within(
+        cache_max_tasks(),
+        nofile_limit().unwrap_or(DEFAULT_CACHE_MAX_TASKS as u64 * 3 + FD_HEADROOM),
+    );
+    let threads = judge_threads();
+
+    let log: SharedLog = Arc::new(Mutex::new(DecisionLog::open(decision_log_path)));
+    if threads == 1 {
+        let mut cache = PinCache::new(cache_cap);
+        let mut scratch = Scratch::default();
+        return judge_loop(notify_fd, &mut cache, &mut scratch, &log);
+    }
+
+    // Judge pool: the kernel hands each pending notification to exactly
+    // one concurrent RECV, so every thread dequeues distinct work. Pin
+    // capacity is split so the pool's total fd cost stays within budget.
+    let per_thread_cache = (cache_cap / threads).max(1);
+    let mut judges = Vec::with_capacity(threads);
+    for i in 0..threads {
+        let fd = notify_fd
+            .try_clone()
+            .with_context(|| "dup seccomp notify fd for judge pool")?;
+        let log = Arc::clone(&log);
+        let judge = std::thread::Builder::new()
+            .name(format!("broker-judge-{i}"))
+            .spawn(move || {
+                let mut cache = PinCache::new(per_thread_cache);
+                let mut scratch = Scratch::default();
+                if let Err(error) = judge_loop(fd, &mut cache, &mut scratch, &log) {
+                    tracing::info!(%error, "broker: judge thread ended");
+                }
+            })
+            .with_context(|| "spawn broker judge thread")?;
+        judges.push(judge);
+    }
+    for judge in judges {
+        let _ = judge.join();
+    }
+    Ok(())
+}
+
+/// Judge-thread count: the daemon passes `[broker] judge_threads` from
+/// rauha.toml as `RAUHA_BROKER_JUDGE_THREADS`. Clamped to a sane range —
+/// `1` is the serial loop, `MAX_JUDGE_THREADS` keeps a typo from
+/// forking an army.
+fn judge_threads() -> usize {
+    judge_threads_from(std::env::var("RAUHA_BROKER_JUDGE_THREADS").ok().as_deref())
+}
+
+fn judge_threads_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_JUDGE_THREADS)
+        .clamp(MIN_JUDGE_THREADS, MAX_JUDGE_THREADS)
 }
 
 /// Task-pin cache capacity: the daemon passes `[broker] cache_max_tasks`
 /// from rauha.toml as `RAUHA_BROKER_CACHE_MAX`. `0` disables caching.
 fn cache_max_tasks() -> usize {
-    std::env::var("RAUHA_BROKER_CACHE_MAX")
-        .ok()
+    cache_max_tasks_from(std::env::var("RAUHA_BROKER_CACHE_MAX").ok().as_deref())
+}
+
+fn cache_max_tasks_from(configured: Option<&str>) -> usize {
+    configured
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_CACHE_MAX_TASKS)
+}
+
+/// Wait for crun's fd hand-off: `[broker] handoff_timeout_ms` from
+/// rauha.toml as `RAUHA_BROKER_HANDOFF_TIMEOUT_MS`.
+fn handoff_timeout_ms() -> u64 {
+    std::env::var("RAUHA_BROKER_HANDOFF_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_HANDOFF_TIMEOUT_MS)
+}
+
+/// Current RLIMIT_NOFILE soft limit, or `None` if unqueryable.
+fn nofile_limit() -> Option<u64> {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    (rc == 0).then_some(limit.rlim_cur)
+}
+
+/// Raise RLIMIT_NOFILE soft limit to the hard limit. Each cached task pin
+/// costs three fds; a 1024-fd default soft limit would strangle the cache
+/// — and the rest of the shim. Best effort: a failure leaves the budget
+/// clamp ([`cache_cap_within`]) to do the guarding.
+fn raise_nofile_soft_to_hard() {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    if limit.rlim_cur < limit.rlim_max {
+        limit.rlim_cur = limit.rlim_max;
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        if rc == 0 {
+            tracing::debug!(
+                nofile = limit.rlim_cur,
+                "broker: raised RLIMIT_NOFILE for the pin cache"
+            );
+        }
+    }
+}
+
+/// Clamp a configured pin-cache capacity to the fd budget: three fds per
+/// entry ([`TaskPins`]) plus headroom for the shim's other work. Pure —
+/// unit-testable against arbitrary limits.
+fn cache_cap_within(configured: usize, nofile: u64) -> usize {
+    if configured == 0 {
+        return 0;
+    }
+    let budget = nofile.saturating_sub(FD_HEADROOM) / 3;
+    configured.min(budget as usize)
 }
 
 /// SO_PEERCRED of the connected peer: who is handing us an fd to judge with.
@@ -269,10 +407,15 @@ fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
 
 /// The judgment loop: receive one notification, decide, respond. Repeat
 /// until the kernel closes the fd (container exited). Nothing inside the
-/// loop is fatal except RECV terminal errors — a broker thread that dies
+/// loop is fatal except RECV terminal errors — a judge thread that dies
 /// mid-container leaves every later brokered syscall suspended forever,
 /// which is a zone deadlock, not a degraded mode.
-fn judge_loop(notify_fd: OwnedFd, cache: &mut PinCache, log: &mut DecisionLog) -> Result<()> {
+fn judge_loop(
+    notify_fd: OwnedFd,
+    cache: &mut PinCache,
+    scratch: &mut Scratch,
+    log: &SharedLog,
+) -> Result<()> {
     let fd = notify_fd.as_raw_fd();
     loop {
         let mut notif = SeccompNotif::default();
@@ -287,7 +430,11 @@ fn judge_loop(notify_fd: OwnedFd, cache: &mut PinCache, log: &mut DecisionLog) -
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::ENOTTY) => {
-                    bail!("seccomp notify not supported by this kernel")
+                    bail!(
+                        "seccomp listener fd does not speak SECCOMP_IOCTL_NOTIF_RECV \
+                         (kernel without seccomp-notify, or a hand-off that is not a \
+                         seccomp notify fd)"
+                    )
                 }
                 Some(libc::EINTR) => continue,
                 // The container exited and the listener has nothing left.
@@ -303,26 +450,93 @@ fn judge_loop(notify_fd: OwnedFd, cache: &mut PinCache, log: &mut DecisionLog) -
 
         // The judge path must never unwind: a panic would suspend every
         // brokered syscall of the zone forever. Fall back to EPERM instead.
-        let judged =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| judge(fd, &notif, cache)))
-                .unwrap_or_else(|panic| {
-                    let reason = panic
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".into());
-                    tracing::error!(id = notif.id, %reason, "broker: judge panicked — denying");
-                    Judged::panic(&reason)
-                });
+        let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            judge(fd, &notif, cache, scratch)
+        }))
+        .unwrap_or_else(|panic| {
+            let reason = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            tracing::error!(id = notif.id, %reason, "broker: judge panicked — denying");
+            Verdict::panic(&reason)
+        });
+        // The path bytes live in this thread's scratch buffer; the verdict
+        // carries only its length.
+        let path = &scratch.path[..verdict.path_len.min(scratch.path.len())];
         // respond() records the decision and never fails the loop: a
         // transient SEND error is survivable, a dead broker is not.
-        respond(fd, notif.id, judged, log);
+        respond(fd, notif.id, verdict, path, log);
     }
+}
+
+/// Reusable hot-path buffers, one per judge thread. A judgment makes no
+/// allocation unless it grants (the granted path is cloned into the
+/// open); denied paths and the decision log borrow from here.
+#[derive(Default)]
+struct Scratch {
+    /// Path bytes read from the target, reused across notifications.
+    path: Vec<u8>,
+}
+
+/// One judged call. The path bytes live in the judge thread's scratch
+/// buffer; the verdict carries their length — so a verdict is plain data
+/// and can cross a catch_unwind closure.
+struct Verdict {
+    syscall: &'static str,
+    tid: u32,
+    path_len: usize,
+    decision: Decision,
+}
+
+impl Verdict {
+    fn deny(
+        syscall: &'static str,
+        tid: u32,
+        path_len: usize,
+        errno: i32,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            syscall,
+            tid,
+            path_len,
+            decision: Decision::deny(errno, reason),
+        }
+    }
+
+    /// The judge panicked: deny without trusting any partial state.
+    fn panic(reason: &str) -> Self {
+        Self::deny(
+            "unknown",
+            0,
+            0,
+            libc::EPERM,
+            format!("judge panicked: {reason}"),
+        )
+    }
+}
+
+/// How reading a path argument from the target ended.
+enum PathRead {
+    /// NUL-terminated bytes in `Scratch::path`.
+    Found,
+    /// No NUL within `MAX_PATH` — the kernel's own answer is
+    /// ENAMETOOLONG, not EFAULT.
+    TooLong,
+    /// The target's memory could not be read at all.
+    Unreadable,
 }
 
 /// Judge one notification: pin the task, validate the notification is
 /// still live, then resolve the open on the workload's behalf.
-fn judge(fd: libc::c_int, notif: &SeccompNotif, cache: &mut PinCache) -> Judged {
+fn judge(
+    fd: libc::c_int,
+    notif: &SeccompNotif,
+    cache: &mut PinCache,
+    scratch: &mut Scratch,
+) -> Verdict {
     let tid = notif.pid;
     let Some(syscall) = brokered_syscall_name(notif.data.nr as i64) else {
         // Policy and shim disagree — the daemon only admits
@@ -331,16 +545,16 @@ fn judge(fd: libc::c_int, notif: &SeccompNotif, cache: &mut PinCache) -> Judged 
             nr = notif.data.nr,
             "broker: syscall not brokerable (policy/shim mismatch) — denying"
         );
-        return Judged::deny(
+        return Verdict::deny(
             "unknown",
             tid,
-            Vec::new(),
+            0,
             libc::EPERM,
             "not brokerable (policy/shim mismatch)",
         );
     };
     if notif.data.arch != NATIVE_ARCH {
-        return Judged::deny(syscall, tid, Vec::new(), libc::EPERM, "non-native arch");
+        return Verdict::deny(syscall, tid, 0, libc::EPERM, "non-native arch");
     }
 
     // 1-3 of the race protocol (see module docs), with the pin cache
@@ -351,7 +565,7 @@ fn judge(fd: libc::c_int, notif: &SeccompNotif, cache: &mut PinCache) -> Judged 
         Err(errno) => {
             let error = std::io::Error::from_raw_os_error(errno);
             tracing::info!(tid, "broker: denied (task pins: {error})");
-            return Judged::deny(syscall, tid, Vec::new(), errno, "task pins");
+            return Verdict::deny(syscall, tid, 0, errno, "task pins");
         }
     };
     if let Err(e) = id_valid(fd, notif.id) {
@@ -359,49 +573,48 @@ fn judge(fd: libc::c_int, notif: &SeccompNotif, cache: &mut PinCache) -> Judged 
         // The syscall must still be answered: an unanswered notification
         // suspends the task forever. For a truly dead notification SEND
         // just returns ENOENT.
-        return Judged::deny(
-            syscall,
-            tid,
-            Vec::new(),
-            libc::ESRCH,
-            "notification expired",
-        );
+        return Verdict::deny(syscall, tid, 0, libc::ESRCH, "notification expired");
     }
 
-    // 4. Safe to read the target's memory and classify.
+    // 4. Safe to read the target's memory and classify. `pins` borrows
+    // `cache`; the borrow ends before any early return below re-uses it.
     let dirfd = notif.data.args[0] as i64;
-    let path_bytes = match read_path(&pins.mem, notif.data.args[1]) {
-        Some(p) => p,
-        None => {
-            tracing::warn!(tid, "broker: unreadable path — denying");
-            return Judged::deny(syscall, tid, Vec::new(), libc::EFAULT, "unreadable path");
+    match read_path_into(&pins.mem, notif.data.args[1], &mut scratch.path) {
+        PathRead::TooLong => {
+            return Verdict::deny(syscall, tid, 0, libc::ENAMETOOLONG, "path too long")
         }
-    };
+        PathRead::Unreadable => {
+            tracing::warn!(tid, "broker: unreadable path — denying");
+            return Verdict::deny(syscall, tid, 0, libc::EFAULT, "unreadable path");
+        }
+        PathRead::Found => {}
+    }
+    let path_bytes = scratch.path.as_slice();
     let grant = match syscall {
-        "openat" => classify::classify_openat(dirfd, notif.data.args[2] as i32, &path_bytes),
+        "openat" => classify::classify_openat(dirfd, notif.data.args[2] as i32, path_bytes),
         "openat2" => {
             let how = match read_open_how(&pins.mem, notif.data.args[2]) {
                 Some(how) => how,
                 None => {
                     tracing::warn!(tid, "broker: unreadable open_how — denying");
-                    return Judged::deny(
+                    return Verdict::deny(
                         syscall,
                         tid,
-                        path_bytes,
+                        path_bytes.len(),
                         libc::EFAULT,
                         "unreadable open_how",
                     );
                 }
             };
-            classify::classify_openat2(dirfd, notif.data.args[3], &how, &path_bytes)
+            classify::classify_openat2(dirfd, notif.data.args[3], &how, path_bytes)
         }
         // Unreachable while the drift test holds (abi.rs pins the name
         // table to BROKERABLE_SYSCALLS) — deny rather than trust it.
         _ => {
-            return Judged::deny(
+            return Verdict::deny(
                 syscall,
                 tid,
-                path_bytes,
+                path_bytes.len(),
                 libc::EPERM,
                 "not brokerable (policy/shim mismatch)",
             );
@@ -411,7 +624,7 @@ fn judge(fd: libc::c_int, notif: &SeccompNotif, cache: &mut PinCache) -> Judged 
         Ok(grant) => open_for_target(&pins, tid, syscall, grant, path_bytes),
         Err(Denial { errno, reason }) => {
             tracing::info!(tid, reason, "broker: denied");
-            Judged::deny(syscall, tid, path_bytes, errno, reason)
+            Verdict::deny(syscall, tid, path_bytes.len(), errno, reason)
         }
     }
 }
@@ -422,8 +635,8 @@ fn open_for_target(
     tid: u32,
     syscall: &'static str,
     grant: Grant,
-    path: Vec<u8>,
-) -> Judged {
+    path: &[u8],
+) -> Verdict {
     // Resolve relative paths against the task's own directory context —
     // never the container root, which would silently answer a different
     // question than the workload asked.
@@ -432,8 +645,8 @@ fn open_for_target(
     // to the syscall is only valid while its OwnedFd is alive, so the fd
     // lives in `base` for the rest of the function. (A temporary scoped to
     // the match arm would close the fd before the syscall — EBADF.)
-    let (base, path) = match grant.anchored {
-        Anchor::TaskRoot => (None, grant.path),
+    let (base, path): (Option<OwnedFd>, &[u8]) = match grant.anchored {
+        Anchor::TaskRoot => (None, path),
         Anchor::TaskDir { dirfd } => {
             let base = if dirfd == libc::AT_FDCWD as i64 {
                 let cwd = format!("/proc/{tid}/cwd");
@@ -442,10 +655,10 @@ fn open_for_target(
                 if fd < 0 {
                     let e = std::io::Error::last_os_error();
                     tracing::info!(tid, "broker: denied (no cwd fd: {e})");
-                    return Judged::deny(
+                    return Verdict::deny(
                         syscall,
                         tid,
-                        path,
+                        path.len(),
                         e.raw_os_error().unwrap_or(libc::EPERM),
                         "no cwd fd",
                     );
@@ -466,10 +679,10 @@ fn open_for_target(
                 if borrowed < 0 {
                     let e = std::io::Error::last_os_error();
                     tracing::info!(tid, dirfd, "broker: denied (borrow dirfd: {e})");
-                    return Judged::deny(
+                    return Verdict::deny(
                         syscall,
                         tid,
-                        path,
+                        path.len(),
                         e.raw_os_error().unwrap_or(libc::EPERM),
                         "borrow dirfd",
                     );
@@ -477,22 +690,24 @@ fn open_for_target(
                 let borrowed = unsafe { OwnedFd::from_raw_fd(borrowed as libc::c_int) };
                 // Close-on-exec while we hold it: the shim execs helpers
                 // concurrently on other threads.
-                unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+                unsafe {
+                    libc::fcntl(borrowed.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                }
                 borrowed
             };
-            (Some(base), grant.path)
+            (Some(base), path)
         }
     };
     let dir_fd = base
         .as_ref()
         .map_or(pins.root.as_raw_fd(), |owned| owned.as_raw_fd());
 
-    // Build the C string up front and keep the bytes for the log — no
-    // move-and-recover gymnastics.
-    let cpath = match std::ffi::CString::new(path.clone()) {
+    // Build the C string up front; the borrowed path stays available for
+    // the decision record. Interior NUL was rejected at classification —
+    // `unwrap` would be honest, but a denial costs nothing.
+    let cpath = match std::ffi::CString::new(path) {
         Ok(p) => p,
-        // check_path already rejected interior NUL — unreachable.
-        Err(_) => return Judged::deny(syscall, tid, path, libc::EINVAL, "NUL in path"),
+        Err(_) => return Verdict::deny(syscall, tid, path.len(), libc::EINVAL, "NUL in path"),
     };
     // O_NOCTTY: a tty path must not become the shim's controlling
     // terminal. O_CLOEXEC: the broker's handle dies with the broker.
@@ -537,19 +752,19 @@ fn open_for_target(
             // Pass the real errno through: ENOENT stays ENOENT, EACCES
             // stays EACCES — the workload sees honest failures.
             tracing::info!(tid, syscall, "broker: open failed ({e}) — answering errno");
-            return Judged::deny(
+            return Verdict::deny(
                 syscall,
                 tid,
-                path,
+                path.len(),
                 e.raw_os_error().unwrap_or(libc::EPERM),
                 "open failed",
             );
         }
     };
-    Judged {
+    Verdict {
         syscall,
         tid,
-        path,
+        path_len: path.len(),
         decision,
     }
 }
@@ -571,26 +786,48 @@ fn id_valid(fd: libc::c_int, id: u64) -> std::io::Result<()> {
     }
 }
 
-/// Read a NUL-terminated path from the target's memory at `ptr`.
-/// Returns raw bytes: paths are not required to be valid UTF-8. Offset
-/// arithmetic is checked — a hostile register value near u64::MAX must
+/// Read a NUL-terminated path from the target's memory at `ptr` into a
+/// reusable buffer. Returns raw bytes: paths are not required to be valid
+/// UTF-8. Reads geometrically — 256 bytes first, doubling to `MAX_PATH` —
+/// so the common ~30-byte path costs one small pread, not a 4KB memset.
+/// Offset arithmetic is checked: a hostile register near u64::MAX must
 /// not wrap into a valid low address.
-pub(crate) fn read_path(mem: &std::fs::File, ptr: u64) -> Option<Vec<u8>> {
+fn read_path_into(mem: &std::fs::File, ptr: u64, buf: &mut Vec<u8>) -> PathRead {
     use std::os::unix::fs::FileExt;
-    let mut buf = vec![0u8; MAX_PATH];
-    let mut len = 0usize;
+    buf.clear();
+    let mut offset = 0u64;
     loop {
-        let offset = ptr.checked_add(len as u64)?;
-        let n = mem.read_at(&mut buf[len..], offset).ok()?;
-        if n == 0 {
-            return None;
-        }
-        len += n;
-        if let Some(pos) = buf[..len].iter().position(|&b| b == 0) {
-            return Some(buf[..pos].to_vec());
-        }
-        if len == MAX_PATH {
-            return None;
+        // Geometric growth from a 256-byte floor: short paths (the common
+        // case) cost one small pread; long ones double up to MAX_PATH.
+        let want = buf.len().max(256).min(MAX_PATH - buf.len()).max(1);
+        buf.resize(buf.len() + want, 0);
+        let start = buf.len() - want;
+        let at = match ptr.checked_add(offset) {
+            Some(at) => at,
+            None => return PathRead::Unreadable,
+        };
+        match mem.read_at(&mut buf[start..], at) {
+            Ok(0) => return PathRead::Unreadable,
+            Ok(n) => {
+                let read_end = start + n;
+                if let Some(pos) = buf[start..read_end].iter().position(|&b| b == 0) {
+                    buf.truncate(start + pos);
+                    return PathRead::Found;
+                }
+                // Keep exactly the bytes actually read; the next round
+                // grows past them.
+                buf.truncate(read_end);
+                offset = match offset.checked_add(n as u64) {
+                    Some(next) => next,
+                    None => return PathRead::Unreadable,
+                };
+                if buf.len() == MAX_PATH {
+                    // MAX_PATH bytes, no NUL: the kernel's answer is
+                    // ENAMETOOLONG — PATH_MAX counts the NUL.
+                    return PathRead::TooLong;
+                }
+            }
+            Err(_) => return PathRead::Unreadable,
         }
     }
 }
@@ -611,19 +848,19 @@ fn read_open_how(mem: &std::fs::File, ptr: u64) -> Option<OpenHow> {
 /// fatal: SEND failures (other than the benign ENOENT of an exited task)
 /// are logged and the loop continues — a dead broker thread would suspend
 /// every brokered syscall of the zone forever.
-fn respond(fd: libc::c_int, id: u64, judged: Judged, log: &mut DecisionLog) {
+fn respond(fd: libc::c_int, id: u64, verdict: Verdict, path: &[u8], log: &SharedLog) {
     let mut resp = SeccompNotifResp {
         id,
         val: 0,
         error: 0,
         flags: 0,
     };
-    let Judged {
+    let Verdict {
         syscall,
         tid,
-        path,
         decision,
-    } = judged;
+        ..
+    } = verdict;
     let mut record_errno = 0;
     let mut record_reason: Option<String> = None;
     match decision {
@@ -669,14 +906,17 @@ fn respond(fd: libc::c_int, id: u64, judged: Judged, log: &mut DecisionLog) {
             }
         }
     }
-    log.record(
-        id,
-        syscall,
-        tid,
-        &path,
-        record_errno,
-        record_reason.as_deref(),
-    );
+    // One lock-held write per decision; the lock never spans a judgment.
+    if let Ok(mut log) = log.lock() {
+        log.record(
+            id,
+            syscall,
+            tid,
+            path,
+            record_errno,
+            record_reason.as_deref(),
+        );
+    }
     let n = unsafe {
         libc::ioctl(
             fd,
@@ -770,5 +1010,106 @@ mod tests {
         assert_eq!(peer.uid, unsafe { libc::getuid() });
         assert_eq!(peer.pid, std::process::id() as libc::pid_t);
         drop(theirs);
+    }
+
+    #[test]
+    fn judge_thread_count_is_clamped_from_config() {
+        assert_eq!(judge_threads_from(None), DEFAULT_JUDGE_THREADS);
+        assert_eq!(judge_threads_from(Some("1")), 1);
+        assert_eq!(judge_threads_from(Some("8")), 8);
+        // Typos fall back to the default; absurd values clamp.
+        assert_eq!(
+            judge_threads_from(Some("not-a-number")),
+            DEFAULT_JUDGE_THREADS
+        );
+        assert_eq!(judge_threads_from(Some("0")), MIN_JUDGE_THREADS);
+        assert_eq!(judge_threads_from(Some("10000")), MAX_JUDGE_THREADS);
+    }
+
+    #[test]
+    fn cache_capacity_clamps_to_the_fd_budget() {
+        // Three fds per pin plus headroom; configured wins while small.
+        assert_eq!(cache_cap_within(0, 1024), 0);
+        assert_eq!(cache_cap_within(64, 1024), 64);
+        assert_eq!(cache_cap_within(512, 1024), (1024 - 96) / 3);
+        assert_eq!(cache_cap_within(512, u64::MAX), 512);
+        // A degenerate limit leaves at least the headroom-free minimum.
+        assert_eq!(cache_cap_within(512, 0), 0);
+    }
+
+    #[test]
+    fn nofile_limit_is_queryable_and_sane() {
+        let limit = nofile_limit().expect("RLIMIT_NOFILE is queryable");
+        assert!(limit >= 64, "a 64-fd process cannot run the shim");
+    }
+
+    #[test]
+    fn read_path_distinguishes_too_long_from_unreadable() {
+        // Our own /proc/self/mem: a NUL-terminated canary reads back; a
+        // no-NUL MAX_PATH region is TooLong (ENAMETOOLONG, not EFAULT); a
+        // wild pointer is Unreadable.
+        let mem = std::fs::OpenOptions::new()
+            .read(true)
+            .open(format!("/proc/{}/mem", std::process::id()))
+            .unwrap();
+
+        let canary = *b"rauha-broker\0";
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_path_into(&mem, canary.as_ptr() as u64, &mut buf),
+            PathRead::Found
+        ));
+        assert_eq!(buf, b"rauha-broker");
+
+        // 4096 non-NUL bytes on the heap: no NUL within MAX_PATH.
+        let long = vec![b'x'; MAX_PATH];
+        assert!(matches!(
+            read_path_into(&mem, long.as_ptr() as u64, &mut buf),
+            PathRead::TooLong
+        ));
+
+        // Page-aligned hole right above the stack guard: unmapped.
+        assert!(matches!(
+            read_path_into(&mem, 0x1, &mut buf),
+            PathRead::Unreadable
+        ));
+        // Pointer near the top of the address space must not wrap.
+        assert!(matches!(
+            read_path_into(&mem, u64::MAX - 4, &mut buf),
+            PathRead::Unreadable
+        ));
+        // Reuse: the same buffer serves consecutive reads.
+        assert!(matches!(
+            read_path_into(&mem, canary.as_ptr() as u64, &mut buf),
+            PathRead::Found
+        ));
+        assert_eq!(buf, b"rauha-broker");
+    }
+
+    #[test]
+    fn read_path_survives_page_boundary_partial_reads() {
+        // A path that straddles a page boundary needs more than one
+        // pread; the geometric loop must stitch it together.
+        let mem = std::fs::OpenOptions::new()
+            .read(true)
+            .open(format!("/proc/{}/mem", std::process::id()))
+            .unwrap();
+        // Build a canary that crosses a page boundary: allocate until we
+        // find a 4096-straddling span, all non-NUL, terminated after.
+        let page = 4096usize;
+        let mut arena = vec![0u8; page * 2];
+        let base = arena.as_ptr() as usize;
+        let boundary = (base + page - 1) & !(page - 1); // next page start
+        let start = boundary - 8; // 8 bytes before the boundary
+        let path_len = 40; // spans the boundary
+        arena[start - base..start - base + path_len].fill(b'a');
+        arena[start - base + path_len] = 0;
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_path_into(&mem, start as u64, &mut buf),
+            PathRead::Found
+        ));
+        assert_eq!(buf.len(), path_len);
+        assert!(buf.iter().all(|&b| b == b'a'));
     }
 }

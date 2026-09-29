@@ -17,7 +17,6 @@ use super::abi::{
 #[derive(Debug)]
 pub(crate) struct Grant {
     pub anchored: Anchor,
-    pub path: Vec<u8>,
     pub resolve: u64,
     pub cloexec: bool,
     pub nonblock: bool,
@@ -94,7 +93,6 @@ pub(crate) fn classify_openat(dirfd: i64, flags: i32, path: &[u8]) -> Result<Gra
         } else {
             Anchor::TaskDir { dirfd }
         },
-        path: path.to_vec(),
         resolve: resolve_flags(absolute, no_follow),
         cloexec: flags & libc::O_CLOEXEC != 0,
         nonblock: flags & libc::O_NONBLOCK != 0,
@@ -157,7 +155,6 @@ pub(crate) fn classify_openat2(
         }
         Ok(Grant {
             anchored: Anchor::TaskRoot,
-            path: path.to_vec(),
             // in_root or unset: the broker confines to the task's root
             // either way.
             resolve: RESOLVE_IN_ROOT | restrictions,
@@ -175,7 +172,6 @@ pub(crate) fn classify_openat2(
         };
         Ok(Grant {
             anchored: Anchor::TaskDir { dirfd },
-            path: path.to_vec(),
             resolve: containment | restrictions,
             cloexec: flags & libc::O_CLOEXEC != 0,
             nonblock: flags & libc::O_NONBLOCK != 0,
@@ -271,13 +267,9 @@ mod tests {
         match grant_openat(3, libc::O_RDONLY, b"/etc/hostname") {
             Grant {
                 anchored: Anchor::TaskRoot,
-                path,
                 resolve,
                 ..
-            } => {
-                assert_eq!(path, b"/etc/hostname");
-                assert_eq!(resolve, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS);
-            }
+            } => assert_eq!(resolve, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS),
             other => panic!("absolute path must resolve in-root: {other:?}"),
         }
     }
@@ -364,8 +356,7 @@ mod tests {
     #[test]
     fn path_may_be_non_utf8() {
         // Valid Linux path bytes that are not UTF-8 must classify, not deny.
-        let Grant { path, .. } = grant_openat(3, libc::O_RDONLY, b"/tmp/\xff\xfe");
-        assert_eq!(path, b"/tmp/\xff\xfe");
+        assert!(classify_openat(3, libc::O_RDONLY, b"/tmp/\xff\xfe").is_ok());
     }
 
     #[test]

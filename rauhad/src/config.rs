@@ -228,21 +228,43 @@ pub struct BrokerConfig {
     /// the shim as `RAUHA_BROKER_CACHE_MAX`. One entry per workload thread
     /// that makes brokered calls; `0` disables caching (every judgment
     /// takes the cold path). The bound keeps a zone from growing the
-    /// broker's memory by spawning threads.
+    /// broker's memory by spawning threads; the shim additionally clamps
+    /// it to the fd budget (three fds per pin).
     #[serde(default = "default_broker_cache_max_tasks")]
     pub cache_max_tasks: usize,
+    /// Judge threads in the shim's seccomp broker, passed as
+    /// `RAUHA_BROKER_JUDGE_THREADS`. The kernel hands each pending
+    /// notification to exactly one concurrent RECV, so this is the
+    /// broker's judgment parallelism; `1` is the serial loop.
+    #[serde(default = "default_broker_judge_threads")]
+    pub judge_threads: usize,
+    /// How long the broker waits for the runtime's seccomp fd hand-off
+    /// before failing cleanly, in milliseconds, passed as
+    /// `RAUHA_BROKER_HANDOFF_TIMEOUT_MS`.
+    #[serde(default = "default_broker_handoff_timeout_ms")]
+    pub handoff_timeout_ms: u64,
 }
 
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
             cache_max_tasks: default_broker_cache_max_tasks(),
+            judge_threads: default_broker_judge_threads(),
+            handoff_timeout_ms: default_broker_handoff_timeout_ms(),
         }
     }
 }
 
 fn default_broker_cache_max_tasks() -> usize {
     512
+}
+
+fn default_broker_judge_threads() -> usize {
+    4
+}
+
+fn default_broker_handoff_timeout_ms() -> u64 {
+    30_000
 }
 
 impl DaemonConfig {
@@ -323,6 +345,18 @@ impl DaemonConfig {
                 1 << 20
             )));
         }
+        if self.broker.judge_threads == 0 || self.broker.judge_threads > 64 {
+            return Err(RauhaError::InvalidInput(format!(
+                "broker.judge_threads must be between 1 (serial) and 64, got {}",
+                self.broker.judge_threads
+            )));
+        }
+        if !(1_000..=300_000).contains(&self.broker.handoff_timeout_ms) {
+            return Err(RauhaError::InvalidInput(format!(
+                "broker.handoff_timeout_ms must be between 1000 and 300000, got {}",
+                self.broker.handoff_timeout_ms
+            )));
+        }
         Ok(())
     }
 
@@ -398,6 +432,8 @@ mod tests {
         assert_eq!(c.evidence.sandbox_log_max_bytes, 1024 * 1024);
         assert_eq!(c.limits.policy_max_bytes, 64 * 1024);
         assert_eq!(c.broker.cache_max_tasks, 512);
+        assert_eq!(c.broker.judge_threads, 4);
+        assert_eq!(c.broker.handoff_timeout_ms, 30_000);
     }
 
     #[test]
@@ -469,6 +505,18 @@ mod tests {
 
         let mut c = DaemonConfig::default();
         c.broker.cache_max_tasks = 2 << 21;
+        assert!(c.validate().is_err());
+
+        let mut c = DaemonConfig::default();
+        c.broker.judge_threads = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = DaemonConfig::default();
+        c.broker.judge_threads = 65;
+        assert!(c.validate().is_err());
+
+        let mut c = DaemonConfig::default();
+        c.broker.handoff_timeout_ms = 10;
         assert!(c.validate().is_err());
     }
 }

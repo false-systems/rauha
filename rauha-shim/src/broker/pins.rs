@@ -201,12 +201,16 @@ mod tests {
     fn task_pins_for_our_own_process_read_memory() {
         // The mem fd of a live task can read that task's own memory: prove
         // the pins are usable end to end on this kernel. The NUL makes the
-        // read deterministic — read_path stops at it.
+        // read deterministic — read_path_into stops at it.
         let pins = TaskPins::open(std::process::id()).expect("pins for self");
         let canary = *b"rauha-broker\0";
         let ptr = canary.as_ptr() as u64;
-        let read = super::super::read_path(&pins.mem, ptr).expect("canary readable");
-        assert_eq!(read, b"rauha-broker");
+        let mut buf = Vec::new();
+        assert!(matches!(
+            super::super::read_path_into(&pins.mem, ptr, &mut buf),
+            super::super::PathRead::Found
+        ));
+        assert_eq!(buf, b"rauha-broker");
     }
 
     #[test]
