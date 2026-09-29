@@ -51,7 +51,16 @@ else
     exit 1
 fi
 
-echo "5. A write open is denied with an honest errno (task exit code is mirrored)..."
+echo "5. Directory opens are granted (O_DIRECTORY must not trip O_TMPFILE)..."
+if $RAUHA sandbox --name "$ZONE_NAME" --image "$IMAGE" --timeout 30 \
+    -- /bin/ls /usr >/dev/null 2>&1; then
+    echo "   directory open granted (OK)"
+else
+    echo "   FAIL: ls /usr failed — O_DIRECTORY opens must be grantable"
+    exit 1
+fi
+
+echo "6. A write open is denied with an honest errno (task exit code is mirrored)..."
 set +e
 $RAUHA sandbox --name "$ZONE_NAME" --image "$IMAGE" --timeout 30 \
     -- /bin/sh -c 'echo brokered > /tmp/broker-write-test' >/dev/null 2>&1
@@ -64,7 +73,7 @@ else
     exit 1
 fi
 
-echo "6. Decisions were recorded in the container's broker.log..."
+echo "7. Decisions were recorded in the container's broker.log..."
 LOGS=$(ls -t "$RUN_DIR"/containers/*/broker.log 2>/dev/null | head -3 || true)
 if [ -z "$LOGS" ]; then
     echo "   FAIL: no broker.log under $RUN_DIR/containers/"
