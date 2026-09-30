@@ -188,8 +188,20 @@ pub fn start_with_crun(
 
         let pid_file = bundle.join("init.pid");
         let _ = std::fs::remove_file(&pid_file);
+        // Container logs are workload output: root-only, like the rest of
+        // the container's runtime state. World-readable logs under
+        // /run/rauha would let any local user read a workload's activity
+        // (flagged in the #73 review). DirBuilder's mode applies to every
+        // directory it creates on the recursive path, so the whole chain
+        // down to containers/{id} is 0700.
         let log_dir = run_dir().join("containers").join(container_id);
-        std::fs::create_dir_all(&log_dir)?;
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(&log_dir)?;
+        }
 
         // If the spec brokers syscalls (seccomp SCMP_ACT_NOTIFY with a
         // listener path), start the broker thread before crun starts the
@@ -210,12 +222,8 @@ pub fn start_with_crun(
         let status = runtime_command(&runtime_root)
             .args(crun_create_args(&bundle, &pid_file, container_id))
             .stdin(Stdio::null())
-            .stdout(Stdio::from(std::fs::File::create(
-                log_dir.join("stdout.log"),
-            )?))
-            .stderr(Stdio::from(std::fs::File::create(
-                log_dir.join("stderr.log"),
-            )?))
+            .stdout(Stdio::from(open_container_log(&log_dir, "stdout")?))
+            .stderr(Stdio::from(open_container_log(&log_dir, "stderr")?))
             .status()?;
         if !status.success() {
             let error = std::fs::read_to_string(log_dir.join("stderr.log")).unwrap_or_default();
@@ -294,6 +302,18 @@ pub fn start_with_crun(
 #[cfg(target_os = "linux")]
 pub(crate) fn run_dir() -> PathBuf {
     PathBuf::from(std::env::var("RAUHA_RUN_DIR").unwrap_or_else(|_| "/run/rauha".into()))
+}
+
+/// Open a container log file (stdout/stderr) root-only: workload output
+/// is not for other local users' eyes.
+#[cfg(target_os = "linux")]
+fn open_container_log(log_dir: &Path, stream: &str) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(log_dir.join(format!("{stream}.log")))?)
 }
 
 /// Extract `linux.seccomp.listenerPath` from the OCI spec, if present.
@@ -521,6 +541,39 @@ mod tests {
                 .map(std::ffi::OsString::from)
             )
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_logs_and_their_directory_are_root_only() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        use super::open_container_log;
+        let base = std::env::temp_dir().join(format!("rauha-log-mode-{}", std::process::id()));
+        let log_dir = base.join("run").join("containers").join("c1");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&log_dir)
+            .unwrap();
+        let file = open_container_log(&log_dir, "stdout").unwrap();
+        drop(file);
+        let dir_mode = std::fs::metadata(&log_dir).unwrap().permissions().mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "container log dir must be root-only"
+        );
+        let file_mode = std::fs::metadata(log_dir.join("stdout.log"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            file_mode & 0o777,
+            0o600,
+            "container log file must be root-only"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[cfg(target_os = "linux")]

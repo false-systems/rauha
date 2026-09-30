@@ -159,7 +159,7 @@ User-facing side (CLI in `rauha-cli/src/commands/trace.rs` + formatting in `outp
 - `rauha top` — per-zone resource usage snapshot
 - `rauha events` — live stream of enforcement/lifecycle events (rides the `WatchEvents` gRPC stream)
 
-`rauhad/src/logs.rs` is separate from the evidence schema: it tails shim-written container log files (`/run/rauha/containers/{id}/stdout.log` and `stderr.log`) in one-shot or follow mode, backing the `rauha logs` command.
+`rauhad/src/logs.rs` is separate from the evidence schema: it tails shim-written container log files (`/run/rauha/containers/{id}/stdout.log` and `stderr.log`) in one-shot or follow mode, backing the `rauha logs` command. The runtime dir and every container log (stdout/stderr/broker.log) are root-only (0700 dirs, 0600 files): workload output and judgment records are not for other local users' eyes.
 
 ### Zone ID Compaction
 

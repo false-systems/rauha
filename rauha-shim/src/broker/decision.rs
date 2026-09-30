@@ -66,6 +66,9 @@ impl DecisionLog {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            // Root-only: the decision log records every path a workload
+            // opened — workload activity is not for other local users.
+            .mode(0o600)
             .custom_flags(libc::O_CLOEXEC)
             .open(path);
         match file {
@@ -199,5 +202,19 @@ mod tests {
         log.record(1, "openat", 1, b"/x", libc::EPERM, Some("not read-only"));
         assert!(log.disabled(), "first write failure must disable the log");
         log.record(2, "openat", 1, b"/x", libc::EPERM, Some("not read-only"));
+    }
+
+    #[test]
+    fn the_decision_log_is_root_only() {
+        // The log records every path a workload opened — mode 0600, not
+        // for other local users (flagged in the #73 review).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rauha-broker-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("broker.log");
+        let _log = DecisionLog::open(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "decision log must be root-only");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
