@@ -36,27 +36,37 @@ rauha sandbox --image python:3.12 --repo-path . -- pytest tests/
 
 ```json
 {
-  "task_id": "task_123",
-  "zone_id": "zone_456",
-  "command": ["pytest", "tests/"],
+  "task_id": "task-4348c0a8…",
+  "zone_id": "09c95680-6c4b-4f1e-8b8f-cfdd3e144ac7",
   "status": "succeeded",
   "exit_code": 0,
-  "duration_ms": 1842,
-  "stdout": "...",
+  "stdout": "…",
   "stderr": "",
-  "admission": "strict",
+  "duration_ms": 418,
+  "admission": "audit",
   "unavailable_controls": [],
   "events": [],
-  "enforcement_events": []
+  "enforcement_events": [
+    {
+      "hook": "seccomp_notify",
+      "action": "zone.syscall.brokered.granted",
+      "decision": "allow",
+      "object": "path:/etc/hostname"
+    }
+  ],
+  "receipt": { "sha256": "…", "…": "signed, verified by the CLI" }
 }
 ```
 
 The daemon allocates a zone for the task, starts the container, waits, captures
-stdout/stderr/exit code, collects lifecycle and enforcement events, and tears the
-zone down unless you pass `--keep-zone`. **Strict admission is the default**: if
-a control your policy asks for cannot be enforced on this host, the task is
-refused rather than run degraded. `--audit` lets a temporary zone run anyway,
-and the result says exactly which controls were missing.
+stdout/stderr/exit code, collects lifecycle and enforcement events, signs a
+receipt, and tears the zone down unless you pass `--keep-zone`. **Strict
+admission is the default**: if a control your policy asks for cannot be
+enforced on this host, the task is refused rather than run degraded. `--audit`
+lets a temporary zone run anyway, and the result says exactly which controls
+were missing. Every result carries two verifiable receipt forms — a legacy
+Ed25519 signature and a DSSE in-toto envelope — checkable offline with
+`rauha receipt`.
 
 Underneath, the same primitives are available directly:
 
@@ -68,6 +78,28 @@ rauha zone verify frontend --json  # is the boundary actually intact?
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for the full control surface.
+
+### Brokered authority (ships today)
+
+One line of policy flips a zone from ambient authority to capability-style
+handles:
+
+```toml
+[syscalls]
+broker = ["openat", "openat2"]
+```
+
+Brokered calls suspend in the kernel (`seccomp` `SCMP_ACT_NOTIFY`) and are
+judged by the zone shim: read-only, confined opens are satisfied by the
+**broker** opening the file — `openat2` with `RESOLVE_IN_ROOT`/`RESOLVE_BENEATH`,
+the caller's own resolve restrictions OR'd in, never weakened — and injecting
+the fd. The workload never opens anything itself; symlinks, `..`, and magic
+links cannot escape by construction. Denials answer honest errnos (`EPERM` for
+policy, the kernel's own errno otherwise), so tools fail the way they would on
+the host. Every decision is evidence: one JSON line in the container's
+root-only `broker.log`, streamed live on `rauha events` and carried in the
+sandbox result — `zone.syscall.brokered.granted` / `.denied`. See
+[`policies/broker.toml`](policies/broker.toml) for the canonical policy.
 
 ## Where this is going
 
@@ -98,6 +130,9 @@ the market survey and hardening roadmap are in
 
 - **The task is the unit, not the container.** You reason about what the work
   did, not about a pile of container IDs.
+- **Authority can be held without being exercised.** Brokered syscalls
+  suspend in the kernel and are judged by the boundary: the agent receives
+  granted handles, never ambient access. Capsicum's shape, on stock Linux.
 - **Nothing degrades silently.** A requested control is enforced, audited, or
   the task is refused. The result always says which.
 - **The boundary explains itself.** Logs, lifecycle, and kernel deny events
@@ -113,16 +148,62 @@ the market survey and hardening roadmap are in
 
 ## How it works
 
-`rauhad` is a platform-agnostic daemon behind one `IsolationBackend` trait; the
-`rauha` CLI and `containerd-shim-rauha-v2` are thin gRPC clients. `rauhad`
-spawns one `rauha-shim` per zone, which supervises `crun` for each
-container and keeps lifecycle, logs, exec IPC, and evidence together. Zones get
-their own network namespace, an IP on the `rauha0` bridge, and nftables rules
-that default to drop.
+Four moving parts, one boundary:
 
-Policy is TOML (`policies/standard.toml`): capabilities, resources, network mode
-and egress, filesystem rules, devices, syscalls, and cross-zone communication.
-Zone metadata lives in redb and is the source of truth on restart.
+```
+rauha (CLI) ──gRPC──▶ rauhad ──spawns──▶ rauha-shim (one per zone) ──▶ crun ──▶ workload
+                        │                     │
+                        │                     ├── broker.log, stdout/stderr  (root-only)
+                        │                     └── exec/attach IPC
+                        ├── redb: zones, containers — source of truth on restart
+                        └── evidence events ──▶ `rauha events`, sandbox results
+```
+
+**The daemon is platform-agnostic on purpose.** `rauhad` is one async
+daemon (tokio, gRPC on `[::1]:9876`) behind a single `IsolationBackend`
+trait; the `rauha` CLI and `containerd-shim-rauha-v2` are thin clients.
+Zone metadata lives in redb and is the source of truth on restart: on
+boot the daemon reconciles — reloads every zone, rebuilds kernel state
+(BPF maps, cgroups, network), then cleans up orphans.
+
+**One shim per zone, not per container.** The zone — not the container —
+is the isolation boundary; containers in a zone share namespaces, and
+the sync, fork-safe `rauha-shim` supervises all of them (crun builds
+each container; the shim holds pidfds, exec/attach IPC, logs, and the
+syscall broker). Deliberately synchronous where it forks: `fork()` in a
+multithreaded async runtime is UB, so the shim is not one.
+
+**Enrollment before execution — the security invariant.** crun builds
+the container (namespaces, mounts, capabilities) and *parks* init on its
+exec fifo — outside the zone cgroup. The shim reads the PID, pidfd-opens
+it, writes it into `/sys/fs/cgroup/rauha.slice/zone-{name}/cgroup.procs`,
+and only then runs `crun start`, which execs the image entrypoint — inside
+the boundary. No image code ever runs before it is enrolled; otherwise
+kernel enforcement would not apply to it. (Enrollment is never an OCI
+hook: crun runs those after pivot_root in the image's own rootfs.)
+
+**Three enforcement layers, each doing its own job.** nftables owns L3/L4
+— every bridge base chain defaults to drop, zones get connectivity only
+through their per-zone jump rules, and NAT masquerades the zone subnet.
+Syvä/eBPF-LSM owns the in-kernel, deny-before-it-happens decisions on
+file/exec/ptrace/signal/cgroup/capability. And for policy-marked syscalls,
+the **seccomp-notify broker** (above) owns capability-style judgment in
+userspace. Defense-in-depth, not redundancy: none replaces another.
+
+**Policy is admission-checked, never guessed.** Policies are TOML
+(`policies/standard.toml`): capabilities, resources, network mode and
+egress, filesystem rules, devices, syscalls, cross-zone communication.
+At zone creation every requested control is classified: enforced, audited
+(with the degradation recorded and surfaced in `zone verify` and the
+sandbox result), or the zone is refused outright. Nothing degrades
+silently.
+
+**Observability is evidence, not logging.** Lifecycle events, kernel deny
+events, and broker decisions all normalize into one stable schema
+(`rauha-evidence`) and reach one watch API. `rauha zone verify --json`
+runs the named boundary self-checks (cgroup, BPF membership, inode
+ownership, netns, veth, nftables) — the same names the security probes
+key on.
 
 Details, diagram, and crate map: [`docs/architecture.md`](docs/architecture.md).
 
@@ -134,6 +215,7 @@ Details, diagram, and crate map: [`docs/architecture.md`](docs/architecture.md).
 | --- | --- |
 | Runtime lifecycle, zone create/delete | Linux kernel enforcement (BPF-LSM) |
 | Sandbox/container execution | eBPF programs, BPF maps, ring-buffer events |
+| Seccomp-notify broker: judged, capability-style opens | file / exec / ptrace / signal / cgroup / capability deny decisions (socket is audit-only; nftables enforces network) |
 | Policy loading and validation | file / exec / ptrace / signal / cgroup / capability deny decisions (socket is audit-only; nftables enforces network) |
 | Image, rootfs, networking, metadata | per-hook counters and privileged self-tests |
 | Logs, audit, user-facing event surfaces | the in-kernel deny-before-it-happens decision |
@@ -150,8 +232,17 @@ path.** See [`docs/rauha-syva-boundary.md`](docs/rauha-syva-boundary.md).
 ## Limitations (honest)
 
 - **The run experience above is planned, not shipped.** What ships is
-  `rauha sandbox` and the zone primitives. Fork, compare, accept, brokered
-  credentials, and receipts are roadmap.
+  `rauha sandbox`, the zone primitives, and the brokered-opens policy.
+  Fork, compare, accept, and brokered credentials are roadmap; signed
+  sandbox receipts ship today (Ed25519 + DSSE in-toto, verified by the CLI
+  and offline by `rauha receipt`).
+- **Brokered opens are read-only, v1-shape** — `openat`/`openat2` only,
+  judged with kernel-faithful errnos. The brokerable set is a pinned
+  contract (`BROKERABLE_SYSCALLS`) shared by daemon and shim with a drift
+  test. One documented exposure remains: a sibling thread of the target
+  can `chroot`/`chdir` the shared filesystem between suspension and
+  judgment — the open stays confined to a subtree of the container rootfs,
+  which is the zone boundary.
 - **Three policy controls are unsupported on Linux today** and strict admission
   refuses them: `filesystem.writable_paths`, `devices.allowed`, `syscalls.deny`.
   The roadmap closes them with Landlock, cgroup device BPF, and seccomp.
@@ -188,6 +279,11 @@ there — there is no non-Linux backend.
   at `/sys/kernel/btf/vmlinux`. The Linux daemon
   **fails closed**: it requires root and a working BPF-LSM kernel and refuses to
   start without enforcement. There is no degraded Linux mode.
+- **nftables** — `nf_tables` + `nf_nat` are hard requirements (the daemon
+  refuses to start without them); `nf_tables_bridge` powers cross-zone L2
+  filtering and degrades explicitly when absent — strict zones refuse network
+  admission, audit zones record `network:nftables` and `zone verify` reports
+  it.
 
 Root directory: `/var/lib/rauha` (override with `RAUHA_ROOT`).
 
