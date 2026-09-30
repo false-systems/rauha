@@ -9,7 +9,7 @@ anything leaves. No Dockerfiles. No secret mounts. No cleanup.
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 [![release](https://img.shields.io/badge/release-v0.1.0-2ea44f.svg)](Cargo.toml)
 [![platform](https://img.shields.io/badge/platform-Linux-informational.svg)](#requirements)
-[![enforcement](https://img.shields.io/badge/enforcement-Syv%C3%A4%20(Linux%20BPF--LSM)-8a2be2.svg)](#rauha-and-syvä)
+[![enforcement](https://img.shields.io/badge/enforcement-BPF--LSM%20%2B%20seccomp--notify-8a2be2.svg)](#how-it-works)
 
 Today, letting a coding agent work on a real repository means assembling a
 Dockerfile, a bind-mounted checkout, a devcontainer, API keys, SSH agent
@@ -141,7 +141,8 @@ the market survey and hardening roadmap are in
   the same workload keeps its cgroup, kernel membership, and file ownership —
   probed on every Linux release.
 - **Same model on your laptop and your cluster.** Linux builds zones from
-  cgroups, namespaces, and an OCI rootfs, with Syvä enforcing in the kernel.
+  cgroups, namespaces, and an OCI rootfs, with Rauha's own eBPF-LSM programs
+  enforcing in the kernel.
 - **Neutral.** Claude, Codex, or your own agent — Rauha does not care which.
 
 ## How it works
@@ -183,7 +184,7 @@ hook: crun runs those after pivot_root in the image's own rootfs.)
 **Three enforcement layers, each doing its own job.** nftables owns L3/L4
 — every bridge base chain defaults to drop, zones get connectivity only
 through their per-zone jump rules, and NAT masquerades the zone subnet.
-Syvä/eBPF-LSM owns the in-kernel, deny-before-it-happens decisions on
+Rauha's eBPF-LSM layer owns the in-kernel, deny-before-it-happens decisions on
 file/exec/ptrace/signal/cgroup/capability. And for policy-marked syscalls,
 the **seccomp-notify broker** (above) owns capability-style judgment in
 userspace. Defense-in-depth, not redundancy: none replaces another.
@@ -205,27 +206,20 @@ key on.
 
 Details, diagram, and crate map: [`docs/architecture.md`](docs/architecture.md).
 
-## Rauha and Syvä
+## Enforcement architecture
 
-**Rauha creates the zones. Syvä makes the Linux kernel respect them.**
+**Rauha creates the zones. Rauha's eBPF makes the Linux kernel respect them.**
 
-| Rauha owns | Syvä owns |
-| --- | --- |
-| Runtime lifecycle, zone create/delete | Linux kernel enforcement (BPF-LSM) |
-| Sandbox/container execution | eBPF programs, BPF maps, ring-buffer events |
-| Seccomp-notify broker: judged, capability-style opens | file / exec / ptrace / signal / cgroup / capability deny decisions (socket is audit-only; nftables enforces network) |
-| Policy loading and validation | file / exec / ptrace / signal / cgroup / capability deny decisions (socket is audit-only; nftables enforces network) |
-| Image, rootfs, networking, metadata | per-hook counters and privileged self-tests |
-| Logs, audit, user-facing event surfaces | the in-kernel deny-before-it-happens decision |
-| Kubernetes / containerd integration | |
-
-Syvä is a separate product ([`github.com/false-systems/syva`](https://github.com/false-systems/syva)).
-`rauha-enforcer-api` defines the boundary as a backend-neutral trait with a
-`NoopEnforcer` and a conformance harness every backend must pass. Today's state,
-precisely: the in-repo Linux eBPF backend is what the daemon runs, an external
-Syvä backend is not yet wired in, and routing live enforcement entirely through
-the trait is in progress. **The seam is real, but not yet the sole enforcement
-path.** See [`docs/rauha-syva-boundary.md`](docs/rauha-syva-boundary.md).
+Kernel enforcement is Rauha's own today: seven BPF-LSM hooks
+(file/exec/ptrace/signal/cgroup-attach/capability; the socket hook is
+audit-only — nftables enforces network), BPF maps keyed by cgroup and inode,
+ring-buffer deny events, per-hook counters, and privileged self-tests at
+load. `rauha-enforcer-api` defines the same boundary as a backend-neutral
+trait with a `NoopEnforcer` and a conformance harness every backend must
+pass — the seam through which an external kernel-enforcement backend can
+take over without touching the runtime above it. Today the in-repo Linux
+eBPF backend is what the daemon runs; routing live enforcement entirely
+through the trait is in progress.
 
 ## Limitations (honest)
 
@@ -313,8 +307,8 @@ In order:
    behavioural diff, accept or discard.
 5. Close the unsupported Linux controls (Landlock, cgroup device BPF, seccomp)
    and adopt the new mount API for rootfs assembly.
-6. Signed execution receipts as an in-toto predicate; external Syvä backend
-   through `rauha-enforcer-api`.
+6. Signed execution receipts as an in-toto predicate; an external
+   kernel-enforcement backend through `rauha-enforcer-api`.
 7. Optional management layer: durable runs across machines, fork/compare,
    Kubernetes `agent-sandbox` integration.
 

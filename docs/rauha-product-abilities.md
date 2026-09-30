@@ -3,7 +3,7 @@
 Rauha is its own product: an **agent sandbox runtime** built on zones. This
 document states what Rauha owns as a product, and where its responsibilities
 end — the enforcement boundary, behind which a kernel enforcer (the in-repo
-eBPF backend today, [Syva](rauha-syva-boundary.md) tomorrow) makes the Linux
+eBPF backend today, an external backend tomorrow) makes the Linux
 kernel respect what Rauha declares.
 
 The one-line split: **Rauha creates and runs zones; an enforcer makes the
@@ -52,10 +52,10 @@ name-keyed contract for everything Rauha needs from an enforcer:
 | `capabilities` | what the backend can actually enforce |
 
 The boundary's vocabulary is deliberately neutral — it imports neither Rauha's
-user-facing policy types nor any eBPF/Syva types:
+user-facing policy types nor any eBPF/enforcer types:
 
 - **`ZoneRef { name, kernel_id }`** — a zone handle carrying both the stable
-  name (name-keyed backends like Syva use it) and the compact kernel id
+  name (name-keyed external backends use it) and the compact kernel id
   (the in-repo eBPF backend uses it as a BPF map key).
 - **`ZoneEnforcement { caps_mask, allow_ptrace, allow_host_net, kind }`** — the
   zone-wide policy in enforcement terms. Rauha produces it via
@@ -73,9 +73,10 @@ user-facing policy types nor any eBPF/Syva types:
 - **`LinuxEnforcer`** (`rauhad/src/backend/linux`) — the in-repo eBPF backend.
   It loads the LSM programs and programs the BPF maps. It implements the full
   boundary contract.
-- **Syva** — the external enforcement product. A future `SyvaEnforcer` will
-  implement the same trait by calling `syva.core.v1` over a Unix socket. See
-  [rauha-syva-boundary.md](rauha-syva-boundary.md).
+- **External enforcement backend** — a future enforcer will implement the
+  same trait over a Unix socket, taking over kernel enforcement without
+  touching the runtime above it. See
+  [kernel-enforcement-boundary.md](kernel-enforcement-boundary.md).
 
 ## Current state and the migration ahead
 
@@ -86,12 +87,12 @@ One seam remains between "contract complete" and "contract load-bearing":
   **inherent, id-keyed** methods and keeps its own zone name↔id map, rather than
   consuming the `EnforcerBackend` trait via `dyn`. This is because
   `IsolationBackend` is synchronous while `EnforcerBackend` is async (chosen for
-  the network-backed Syva future); a synchronous call into the async trait would
+  the network-backed external future); a synchronous call into the async trait would
   block a tokio runtime. The unification — moving the name↔id map into the
   enforcer and having `LinuxBackend` consume the trait — is the next step and
   needs Linux validation.
 
 Until that lands, "Rauha never touches a BPF map" holds at the code level
 (`LinuxBackend` only calls `LinuxEnforcer`, never `aya`/maps directly), and the
-trait fully describes the boundary — so swapping in Syva is implementing one
+trait fully describes the boundary — so swapping backends is implementing one
 trait, not re-plumbing Rauha.

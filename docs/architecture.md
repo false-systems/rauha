@@ -23,15 +23,15 @@ flowchart TB
         cgroups["cgroups v2"]
         ns["namespaces + netns"]
         rootfs["OCI rootfs + rauha-shim"]
-        syva["Syvä / BPF-LSM — 6 enforcing hooks\nfile · exec · ptrace · signal · cgroup · capability\n+ socket (audit-only; nftables enforces network)"]
+        ebpf["Rauha eBPF / BPF-LSM — 6 enforcing hooks\nfile · exec · ptrace · signal · cgroup · capability\n+ socket (audit-only; nftables enforces network)"]
         maps["BPF maps\nzone membership · policy · inode ownership"]
         ring["BPF ring buffer\nenforcement events"]
 
-        cgroups --> syva
-        ns --> syva
+        cgroups --> ebpf
+        ns --> ebpf
         rootfs --> maps
-        maps --> syva
-        syva --> ring
+        maps --> ebpf
+        ebpf --> ring
     end
 
     backend --> linux
