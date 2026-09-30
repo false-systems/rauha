@@ -1325,7 +1325,7 @@ pub fn broker_decision_event(
     } else {
         event_name::ZONE_SYSCALL_BROKERED_DENIED
     };
-    FalseEventBuilder::new(event_name)
+    let mut event = FalseEventBuilder::new(event_name)
         .zone(zone.to_string(), None)
         .actor(format!("tid:{}", decision.tid), Vec::new())
         .resource(format!("path:{}", decision.path))
@@ -1349,7 +1349,15 @@ pub fn broker_decision_event(
         .unwrap_or_else(|e| {
             tracing::error!(%e, "failed to normalize broker decision");
             pipeline_shed_event("normalization_failed", BACKEND_SECCOMP_BROKER)
-        })
+        });
+    // The event's timestamp is the judgment time from the record — not
+    // ingestion time. Evidence that claims "when" must say when it
+    // happened, not when we happened to read about it. (Fallback: the
+    // builder's now() if the millis cannot convert.)
+    if let Some(judged_at) = chrono::DateTime::from_timestamp_millis(decision.ts_ms as i64) {
+        event.ts = judged_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    }
+    event
 }
 
 #[cfg(test)]
@@ -1395,6 +1403,12 @@ mod tests {
         assert_eq!(event.fields.get("pid"), Some(&FieldValue::U64(1234)));
         assert_eq!(event.backend, BACKEND_SECCOMP_BROKER);
         assert!(!event.what_failed.is_empty(), "narrative is filled");
+        // The timestamp is the judgment time from the record, not ingestion
+        // time — evidence must say when it happened.
+        let expected = chrono::DateTime::from_timestamp_millis(1_790_691_636_813_i64)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert_eq!(event.ts, expected);
     }
 
     #[test]

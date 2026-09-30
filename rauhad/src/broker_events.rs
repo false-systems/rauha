@@ -76,6 +76,28 @@ fn broker_log_path(run_dir: &str, container_id: &Uuid) -> PathBuf {
 /// brokers syscalls at all. No-op otherwise — nothing to follow, nothing
 /// to log. The task resolves the zone once, then polls the file until the
 /// container is gone from the registry.
+/// Containers that already have a live tailer. StartContainer can be
+/// retried (the containerd shim retries RPCs); without the guard, a
+/// retry would double every decision on the event stream. Idempotent by
+/// UUID: a new container never collides with an old one.
+#[cfg(target_os = "linux")]
+static TAILED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<Uuid>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn claim_tailer(container_id: &Uuid) -> bool {
+    let set = TAILED.get_or_init(Default::default);
+    let mut guard = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.insert(*container_id)
+}
+
+#[cfg(target_os = "linux")]
+fn release_tailer(container_id: &Uuid) {
+    let set = TAILED.get_or_init(Default::default);
+    let mut guard = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.remove(container_id);
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) async fn spawn_broker_tailer(
     registry: std::sync::Arc<crate::zone::registry::ZoneRegistry>,
@@ -88,20 +110,30 @@ pub(crate) async fn spawn_broker_tailer(
     /// The tailer checks container existence every 25 polls (~5s) and
     /// exits once the container is gone; between checks it only reads.
     const CONTAINER_CHECK_INTERVAL: u32 = 25;
-    use std::io::{Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom};
 
     use rauha_evidence::broker_decision_event;
 
+    if !claim_tailer(&container_id) {
+        // A tailer is already live for this container — a retried
+        // StartContainer must not duplicate the stream.
+        tracing::debug!(container = %container_id, "broker decision tailer already running");
+        return;
+    }
     let Ok(container) = registry.get_container(&container_id) else {
+        release_tailer(&container_id);
         return;
     };
     let Some(zone_name) = registry.zone_name_for_container(&container.zone_id).await else {
+        release_tailer(&container_id);
         return;
     };
     let Ok(zone) = registry.get_zone(&zone_name).await else {
+        release_tailer(&container_id);
         return;
     };
     if zone.policy.syscalls.broker.is_empty() {
+        release_tailer(&container_id);
         return;
     }
     // Identity label: the compact kernel zone id matches how eBPF
@@ -133,23 +165,29 @@ pub(crate) async fn spawn_broker_tailer(
                     .seek(SeekFrom::Start(*offset))
                     .and_then(|_| file.read_to_string(&mut chunk))
                     .is_ok();
-                if read_ok && !chunk.is_empty() {
-                    *offset += chunk.len() as u64;
-                    for line in chunk.lines().filter(|l| !l.is_empty()) {
-                        match serde_json::from_str::<BrokerDecision>(line) {
-                            Ok(decision) => {
-                                let event = broker_decision_event(
-                                    &decision,
-                                    &zone_label,
-                                    kernel_zone_id.unwrap_or(0),
-                                );
-                                // No receivers is fine — WatchEvents
-                                // subscribers come and go; the file keeps
-                                // the record regardless.
-                                let _ = event_tx.send(event);
+                // Consume only complete, newline-terminated lines: a
+                // tailer must not assume the writer's write granularity.
+                // If a torn line is ever observed, its bytes stay
+                // unconsumed and the next poll re-reads them whole.
+                if read_ok {
+                    if let Some(consumed) = chunk.rfind('\n').map(|i| i + 1) {
+                        for line in chunk[..consumed].lines().filter(|l| !l.is_empty()) {
+                            match serde_json::from_str::<BrokerDecision>(line) {
+                                Ok(decision) => {
+                                    let event = broker_decision_event(
+                                        &decision,
+                                        &zone_label,
+                                        kernel_zone_id.unwrap_or(0),
+                                    );
+                                    // No receivers is fine — WatchEvents
+                                    // subscribers come and go; the file keeps
+                                    // the record regardless.
+                                    let _ = event_tx.send(event);
+                                }
+                                Err(_) => malformed += 1,
                             }
-                            Err(_) => malformed += 1,
                         }
+                        *offset += consumed as u64;
                     }
                 }
             }
@@ -162,6 +200,7 @@ pub(crate) async fn spawn_broker_tailer(
                 && registry.get_container(&container_id).is_err()
             {
                 tracing::debug!(container = %container_id, "broker decision tailer stopped");
+                release_tailer(&container_id);
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(TAIL_POLL_MS)).await;
@@ -196,6 +235,21 @@ mod tests {
         assert_eq!(decisions[0].seq, 1);
         assert_eq!(decisions[1].path, "/b");
         assert!(!decisions[1].granted());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tailer_claim_is_idempotent_until_released() {
+        // A retried StartContainer must not double the event stream.
+        let id = Uuid::new_v4();
+        assert!(claim_tailer(&id), "first claim wins");
+        assert!(
+            !claim_tailer(&id),
+            "second claim for the same container is refused"
+        );
+        release_tailer(&id);
+        assert!(claim_tailer(&id), "release re-arms the claim");
+        release_tailer(&id);
     }
 
     #[test]
