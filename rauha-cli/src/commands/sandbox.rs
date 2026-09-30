@@ -276,9 +276,128 @@ async fn pull_if_absent(
     super::image::consume_pull_progress(stream, reference, out).await
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
+
+    /// Fixture helpers for `verify_receipts`: a signed receipt and its DSSE
+    /// envelope, built exactly the way the daemon builds them — the same
+    /// signer API, the same serialization.
+    mod receipts {
+        use rauha_evidence::receipt::{
+            EnforcementTotals, ExecutionReceiptPayload, ImageAdmission, ReceiptSigner,
+            EXECUTION_RECEIPT_SCHEMA,
+        };
+
+        pub struct Fixture {
+            pub receipt_json: String,
+            pub dsse_json: String,
+        }
+
+        pub fn signed(key_path: &std::path::Path) -> Fixture {
+            let signer = ReceiptSigner::load_or_create(key_path).unwrap();
+            let payload = ExecutionReceiptPayload {
+                schema: EXECUTION_RECEIPT_SCHEMA.into(),
+                task_id: "task-cli-test".into(),
+                zone_id: "zone-cli-test".into(),
+                image: ImageAdmission {
+                    reference: "example/image@sha256:abc".into(),
+                    manifest_digest: "sha256:abc".into(),
+                    digest_verified: true,
+                },
+                policy_sha256: "sha256:policy".into(),
+                inputs_sha256: "sha256:inputs".into(),
+                outputs_sha256: "sha256:outputs".into(),
+                status: "succeeded".into(),
+                exit_code: Some(0),
+                started_at: None,
+                finished_at: None,
+                enforcement: EnforcementTotals::default(),
+                unavailable_controls: Vec::new(),
+            };
+            let receipt = signer.sign(payload.clone());
+            let dsse = signer.sign_dsse(payload);
+            Fixture {
+                receipt_json: serde_json::to_string(&receipt).unwrap(),
+                dsse_json: serde_json::to_string(&dsse).unwrap(),
+            }
+        }
+    }
+
+    fn result_with(receipt_json: &str, dsse_json: &str) -> pb::sandbox::SandboxResult {
+        pb::sandbox::SandboxResult {
+            receipt_json: receipt_json.into(),
+            receipt_dsse_json: dsse_json.into(),
+            ..Default::default()
+        }
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rauha-cli-receipt-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn empty_receipt_reports_problem_and_discards_nothing_else() {
+        let (receipt, dsse, problem) = verify_receipts(&result_with("", ""));
+        assert!(receipt.is_none());
+        assert!(dsse.is_none());
+        let problem = problem.expect("a problem must be reported");
+        assert!(problem.contains("invalid receipt"), "got: {problem}");
+    }
+
+    #[test]
+    fn garbage_receipt_json_reports_problem() {
+        let (receipt, _, problem) = verify_receipts(&result_with("{not json", ""));
+        assert!(receipt.is_none());
+        assert!(problem.is_some());
+    }
+
+    #[test]
+    fn valid_receipt_without_dsse_passes() {
+        let fixture = receipts::signed(&tmp("legacy"));
+        let (receipt, dsse, problem) = verify_receipts(&result_with(&fixture.receipt_json, ""));
+        assert!(receipt.is_some(), "legacy form alone must verify");
+        assert!(dsse.is_none());
+        assert!(problem.is_none());
+    }
+
+    #[test]
+    fn matching_dsse_passes_both_forms() {
+        let fixture = receipts::signed(&tmp("both"));
+        let (receipt, dsse, problem) =
+            verify_receipts(&result_with(&fixture.receipt_json, &fixture.dsse_json));
+        assert!(receipt.is_some());
+        assert!(dsse.is_some());
+        assert!(problem.is_none());
+    }
+
+    #[test]
+    fn invalid_dsse_keeps_the_valid_legacy_receipt() {
+        // A bad envelope must not discard independent evidence: the legacy
+        // receipt still verifies, the problem says which form failed.
+        let fixture = receipts::signed(&tmp("baddsse"));
+        let (receipt, dsse, problem) =
+            verify_receipts(&result_with(&fixture.receipt_json, "not an envelope"));
+        assert!(receipt.is_some(), "valid legacy receipt must survive");
+        assert!(dsse.is_none());
+        let problem = problem.expect("DSSE failure must be reported");
+        assert!(problem.contains("DSSE"), "got: {problem}");
+    }
+
+    #[test]
+    fn dsse_signed_by_wrong_key_is_reported_but_legacy_survives() {
+        // Envelope from a different key: verification fails, the legacy
+        // receipt is untouched.
+        let good = receipts::signed(&tmp("right-key"));
+        let wrong = receipts::signed(&tmp("wrong-key"));
+        let (receipt, dsse, problem) =
+            verify_receipts(&result_with(&good.receipt_json, &wrong.dsse_json));
+        assert!(receipt.is_some());
+        assert!(dsse.is_none());
+        let problem = problem.expect("mismatched envelope must fail");
+        assert!(problem.contains("verification failed"), "got: {problem}");
+    }
 
     #[derive(Parser)]
     #[command(no_binary_name = true)]

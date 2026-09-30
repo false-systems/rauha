@@ -721,41 +721,77 @@ fn oci_mounts(
                 "writable path is not a directory: {declared}"
             )));
         }
-        // The tmpfs starts empty: image content at this path is shadowed,
-        // not copied (an upper-copy bind is the planned upgrade). Say so
-        // when it hides something — silent data disappearance is a support
-        // ticket, not a feature.
+        // Upper-copy: a writable path that has image content starts from
+        // that content. The image dir is copied into this container's own
+        // writable area and bind-mounted over the destination — the image
+        // layer is never written to, and nothing is silently shadowed.
+        //
+        // An empty image dir keeps the size-capped tmpfs (64 MiB): the
+        // copy-up bind has no size cap, and capping it is quota machinery
+        // on the roadmap — declared writable paths are the write valve of
+        // an otherwise read-only rootfs, so the difference is stated here
+        // rather than hidden.
         let shadows_content = std::fs::read_dir(&current)
             .map(|mut entries| entries.next().is_some())
             .unwrap_or(false);
         if shadows_content {
-            tracing::warn!(
-                path = %declared,
-                "writable path is shadowed by an empty tmpfs — image content at this path is hidden"
+            let copy_dir = writable_copy_dir(rootfs, relative);
+            if let Err(error) = rauha_oci::snapshotter::copy_dir_recursive(&current, &copy_dir) {
+                return Err(RauhaError::RootfsError {
+                    message: format!(
+                        "failed to copy image content of writable path {declared} into {}: {error}",
+                        copy_dir.display()
+                    ),
+                });
+            }
+            mounts.push(
+                MountBuilder::default()
+                    .destination(declared)
+                    .typ("bind")
+                    .source(copy_dir)
+                    .options(vec!["rw".into()])
+                    .build()
+                    .map_err(|error| {
+                        RauhaError::BackendError(format!(
+                            "failed to build OCI mount {declared}: {error}"
+                        ))
+                    })?,
+            );
+        } else {
+            mounts.push(
+                MountBuilder::default()
+                    .destination(declared)
+                    .typ("tmpfs")
+                    .source("tmpfs")
+                    .options(vec![
+                        "rw".into(),
+                        "nosuid".into(),
+                        "nodev".into(),
+                        "noexec".into(),
+                        format!("mode={:o}", metadata.mode() & 0o7777),
+                        "size=65536k".into(),
+                    ])
+                    .build()
+                    .map_err(|error| {
+                        RauhaError::BackendError(format!(
+                            "failed to build OCI mount {declared}: {error}"
+                        ))
+                    })?,
             );
         }
-        mounts.push(
-            MountBuilder::default()
-                .destination(declared)
-                .typ("tmpfs")
-                .source("tmpfs")
-                .options(vec![
-                    "rw".into(),
-                    "nosuid".into(),
-                    "nodev".into(),
-                    "noexec".into(),
-                    format!("mode={:o}", metadata.mode() & 0o7777),
-                    "size=65536k".into(),
-                ])
-                .build()
-                .map_err(|error| {
-                    RauhaError::BackendError(format!(
-                        "failed to build OCI mount {declared}: {error}"
-                    ))
-                })?,
-        );
     }
     Ok(mounts)
+}
+
+/// Where a writable path's copy-up content lives: beside the container's
+/// rootfs, under `writable/`, named by the flattened relative path (one
+/// dir per declared path, per container — writes never touch the image).
+fn writable_copy_dir(rootfs: &Path, relative: &str) -> PathBuf {
+    rootfs
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("writable")
+        .join(relative.replace('/', "_"))
 }
 
 fn collect_zone_rootfs_inodes(root: &str, zone_name: &str) -> Result<Vec<u64>> {
@@ -2174,6 +2210,76 @@ mod tests {
             .unwrap()
             .iter()
             .any(|mount| mount["destination"] == "/tmp"));
+    }
+
+    #[test]
+    fn writable_paths_with_image_content_get_a_copy_up_bind() {
+        let root = tempfile::tempdir().unwrap();
+        let safe = crate::config::DaemonConfig::default()
+            .policy
+            .safe_writable_roots;
+        // Container-like layout: rootfs inside its own dir, so the copy-up
+        // area lands beside it — not in the shared system temp parent.
+        let container = root.path().join("container");
+        let rootfs = container.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("tmp")).unwrap();
+        std::fs::write(rootfs.join("tmp/seed.txt"), b"seed").unwrap();
+        let mut policy = ZonePolicy::default();
+        policy.filesystem.writable_paths = vec!["/tmp".into()];
+
+        let mounts = oci_mounts(&policy, &rootfs, &safe).unwrap();
+        let bind = mounts
+            .iter()
+            .find(|m| m.destination() == std::path::Path::new("/tmp"))
+            .expect("writable path mounted");
+        assert_eq!(
+            bind.typ().as_deref(),
+            Some("bind"),
+            "content-bearing path binds"
+        );
+        let source = bind.source().clone().expect("bind source");
+        // The copy exists beside the rootfs, under writable/, and carries
+        // the image content — nothing is shadowed.
+        assert!(
+            source.ends_with("writable/tmp"),
+            "source: {}",
+            source.display()
+        );
+        let copied = std::fs::read_to_string(source.join("seed.txt")).unwrap();
+        assert_eq!(copied, "seed");
+        // The image layer itself is untouched.
+        assert_eq!(std::fs::read(rootfs.join("tmp/seed.txt")).unwrap(), b"seed");
+    }
+
+    #[test]
+    fn empty_writable_paths_keep_the_size_capped_tmpfs() {
+        let root = tempfile::tempdir().unwrap();
+        let safe = crate::config::DaemonConfig::default()
+            .policy
+            .safe_writable_roots;
+        let container = root.path().join("container");
+        let rootfs = container.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("tmp")).unwrap();
+        let mut policy = ZonePolicy::default();
+        policy.filesystem.writable_paths = vec!["/tmp".into()];
+
+        let mounts = oci_mounts(&policy, &rootfs, &safe).unwrap();
+        let tmpfs = mounts
+            .iter()
+            .find(|m| m.destination() == std::path::Path::new("/tmp"))
+            .expect("writable path mounted");
+        assert_eq!(tmpfs.typ().as_deref(), Some("tmpfs"));
+        assert!(
+            tmpfs
+                .options()
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|opt| opt.starts_with("size=")),
+            "the empty-dir valve stays size-capped"
+        );
+        // No copy-up area is created for an empty dir.
+        assert!(!container.join("writable").exists());
     }
 
     #[test]
