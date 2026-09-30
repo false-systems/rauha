@@ -1,4 +1,5 @@
 mod backend;
+mod broker_events;
 mod config;
 mod logging;
 mod logs;
