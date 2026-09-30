@@ -228,8 +228,20 @@ impl LinuxBackend {
             message: format!("failed to create zone dir: {e}"),
         })?;
 
-        // Ensure the runtime dir exists.
-        std::fs::create_dir_all(&self.config.paths.run_dir).ok();
+        // Ensure the runtime dir exists — root-only: sockets, shim state,
+        // and container logs (workload output) live here. Created at 0700,
+        // and pre-existing dirs from older installs are tightened too.
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            let _ = std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(&self.config.paths.run_dir);
+            let _ = std::fs::set_permissions(
+                &self.config.paths.run_dir,
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
 
         let shim_bin = find_shim_binary()?;
 
