@@ -12,7 +12,7 @@ The product hierarchy is load-bearing:
 2. Zone-based runtime foundation.
 3. Kubernetes/containerd and existing-workload deployment paths.
 
-Do not present Rauha as primarily an eBPF project or a Kubernetes runtime. Rauha creates the zones. Syva makes the Linux kernel respect them. Current Linux eBPF code may still live in this repository, but architecturally it belongs behind the Syva enforcement boundary.
+Do not present Rauha as primarily an eBPF project or a Kubernetes runtime. Rauha creates the zones; its eBPF-LSM layer makes the kernel respect them. Current Linux eBPF code may still live in this repository, but architecturally it belongs behind the kernel-enforcement boundary (docs/kernel-enforcement-boundary.md).
 
 Product direction (see `docs/positioning-and-roadmap.md`): the zone is the boundary, the **run** is the product — `rauha run -- <agent cmd>` with fork/compare/accept is planned, `rauha sandbox` is what ships. README claims must be shipped or explicitly marked planned. `docs/architecture.md` holds the diagram, crate map, and full control surface.
 
@@ -64,6 +64,7 @@ bash tests/integration/test-zone-networking.sh
 bash tests/integration/test-exec.sh
 bash tests/integration/test-logs.sh
 bash tests/integration/test-sandbox.sh         # agent sandbox task end-to-end
+bash tests/integration/test-broker.sh         # seccomp broker: grant/deny/evidence, both surfaces
 bash tests/integration/test-host-boundaries.sh # adversarial host-impact probes
 bash tests/integration/test-cgroup-lock.sh          # eBPF enforcement required
 
@@ -146,7 +147,7 @@ Every deny decision from the 7 LSM hooks is emitted to a BPF ring buffer (`ENFOR
 
 ### Evidence & Observability Surface (`rauha-evidence`, `rauhad/src/logs.rs`)
 
-Ownership reading: **Syva enforces; Rauha observes.** The `rauha-evidence` crate is the normalization layer — it consumes raw enforcement records (from the eBPF backend / Syva) plus Rauha lifecycle events and projects them into one stable schema. It does **not** enforce policy. Event names are stable string constants in `rauha_evidence::event_name` (e.g. `zone.file.denied`, `zone.exec.denied`, `zone.escape.cgroup_attach`, `zone.created`, `container.exited`, `image.pulled`, `policy.loaded`, plus pipeline-health events `ringbuf.drop` / `pipeline.shed`). Output goes through pluggable sinks (file / JSON).
+Ownership reading: **the kernel-enforcement layer enforces; Rauha observes.** The `rauha-evidence` crate is the normalization layer — it consumes raw enforcement records (from the eBPF backend, and the shim's broker decisions) plus Rauha lifecycle events and projects them into one stable schema. It does **not** enforce policy. Event names are stable string constants in `rauha_evidence::event_name` (e.g. `zone.file.denied`, `zone.exec.denied`, `zone.escape.cgroup_attach`, `zone.created`, `container.exited`, `image.pulled`, `policy.loaded`, plus pipeline-health events `ringbuf.drop` / `pipeline.shed`). Output goes through pluggable sinks (file / JSON).
 
 Rauha is the telemetry source, not the collector. The daemon emits structured
 JSON to stdout/stderr and may export through OTLP; cloud tags, pod/namespace
@@ -175,9 +176,9 @@ Bridges containerd's Task ttrpc API to rauhad's gRPC: `kubelet → containerd �
 - Connects to rauhad at `RAUHA_ADDR` or defaults to `http://[::1]:9876`
 - Use `runtimeClassName: rauha` in pod specs
 
-### rauha-enforce (removed — superseded by Syvä)
+### rauha-enforce (removed — superseded by the kernel-enforcement extraction)
 
-The legacy `rauha-enforce/` crate and its daemonset YAML (`deploy/`) were removed. The standalone enforcement product lives in **Syvä**, a separate repo (`github.com/false-systems/syva`, local at `~/projects/syva`): control plane (`syva-cp`), three adapters (`syva-adapter-{file,k8s,api}`), local and cp operating modes, and its own oracle+harness eval framework. All new enforcement work goes there.
+The legacy `rauha-enforce/` crate and its daemonset YAML (`deploy/`) were removed. Standalone enforcement lives behind the kernel-enforcement boundary (docs/kernel-enforcement-boundary.md): today the in-repo Linux eBPF backend is what the daemon runs; externalizing it is the plan, and `rauha-enforcer-api` is the seam.
 
 ### Policy Admission: enforced, audited, or refused (`rauhad/src/backend/linux/mod.rs`)
 
@@ -285,7 +286,7 @@ policy-build time, and the shim's tests fail if the two crates drift.
 | `rauha-cli` | CLI binary — connects to rauhad via gRPC |
 | `rauha-shim` | Per-zone sync supervisor (Linux only) — crun create/enroll/start per container, pidfd lifetime, exec/attach |
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
-| `rauha-evidence` | Evidence-grade observability schema, projections, and sinks. Normalizes Syva/backend enforcement records + Rauha lifecycle events into one schema. Does not enforce. Consumed only by `rauhad`. |
+| `rauha-evidence` | Evidence-grade observability schema, projections, and sinks. Normalizes backend enforcement records + Rauha lifecycle events + broker decisions into one schema. Does not enforce. Consumed only by `rauhad`. |
 | `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd Task ttrpc API to rauhad gRPC for Kubernetes |
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, not in workspace, separate build) |
 | `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF programs and userspace |
@@ -293,7 +294,7 @@ policy-build time, and the shim's tests fail if the two crates drift.
 
 ## Work tooling in this repo
 
-- `.toimija/` — Toimija session packets (the workset contract shown at session start). `.toimija/current.*`, `sessions/`, `runs/` are gitignored; `history.*` currently is not. Run `toimija verify` before committing; declare reads outside the packet's workset with `toimija intent "<why>" --scope <path>`.
+- `.toimija/` — Toimija session packets (the workset contract shown at session start). `current.*`, `sessions/`, `runs/`, `history.*` are gitignored. Run `toimija verify` before committing; declare reads outside the packet's workset with `toimija intent "<why>" --scope <path>`.
 
 ## Oracle (`eval/oracle/`)
 

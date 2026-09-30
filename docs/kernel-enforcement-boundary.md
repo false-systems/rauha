@@ -1,9 +1,9 @@
-# Rauha and Syva Boundary
+# Kernel-Enforcement Boundary
 
-Rauha creates the zones. Syva makes the Linux kernel respect them.
+Rauha creates the zones. The kernel-enforcement layer makes the Linux kernel respect them.
 
-This boundary keeps Rauha from becoming "the eBPF project" and keeps Syva from
-becoming a runtime.
+This boundary keeps Rauha from becoming "the eBPF project" and keeps the
+enforcement layer from becoming a runtime.
 
 ## Rauha Owns
 
@@ -19,7 +19,7 @@ becoming a runtime.
 - Kubernetes/containerd integration
 - user-facing enforcement event surfaces
 
-## Syva Owns
+## The Enforcement Layer Owns
 
 - Linux kernel enforcement
 - eBPF LSM programs
@@ -44,7 +44,7 @@ The Rauha repository still contains Linux eBPF code:
 - `rauhad/src/backend/linux/maps.rs`
 - `rauhad/src/backend/linux/events.rs`
 
-That code is still useful, but architecturally it should sit behind a Syva
+That code is still useful, but architecturally it should sit behind the
 enforcement boundary.
 
 ## Enforcement Seam
@@ -85,11 +85,12 @@ trait EnforcerBackend {
 ```
 
 The trait is **name-keyed** because the zone name is the stable handle both the
-in-repo eBPF backend (which also keeps a compact `u32` map key) and Syva
+in-repo eBPF backend (which also keeps a compact `u32` map key) and an
+external backend
 (`register_zone` returns its own `u32`) share. `ZoneRef { name, kernel_id }`
 carries both so each backend uses whichever it needs. This shape mirrors
-`syva.core.v1` (`RegisterZone`/`AttachContainer`/`RegisterHostPath`/`AllowComm`/
-`WatchEvents`), so a `SyvaEnforcer` is a direct implementation.
+a small control API (`RegisterZone`/`AttachContainer`/`RegisterHostPath`/`AllowComm`/
+`WatchEvents`), so an external enforcer is a direct implementation.
 
 `verify` is a drift/parity self-check: it answers whether the backend's loaded
 state for a zone matches Rauha's intended `EnforcementPolicy`. BPF verifier or
@@ -110,9 +111,9 @@ The important rules are:
 
 - Rauha owns user-facing runtime lifecycle.
 - Rauha owns user-facing policy.
-- Syva owns Linux kernel enforcement.
-- Rauha translates Rauha policy into Syva/kernel-facing policy.
-- Rauha exposes Syva events through Rauha APIs and sandbox results.
+- The enforcement layer owns Linux kernel enforcement.
+- Rauha translates Rauha policy into kernel-facing policy.
+- Rauha exposes enforcement events through Rauha APIs and sandbox results.
 - Linux is the only platform with enforcement; there is no macOS backend
   anymore (removed — a future VM tier would run the same Linux stack inside a
   VM).
@@ -120,5 +121,5 @@ The important rules are:
   capabilities. A backend without kernel enforcement must reject LSM-required
   rules instead of silently accepting them.
 
-Do not delete the current eBPF crates until an external Syva integration exists
+Do not delete the current eBPF crates until an external enforcement integration exists
 and tests prove the replacement path.

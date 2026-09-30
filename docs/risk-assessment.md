@@ -60,7 +60,7 @@ the pf rules, the vsock relay, or the guest agent on a schedule either).
 - Platform gating is clean: 17 `cfg(target_os = "macos")` / 19
   `cfg(target_os = "linux")` attributes in rauhad, one `IsolationBackend` seam.
 - The legacy `rauha-enforce` crate has since been **removed entirely**
-  (superseded by Syvä) — no dead weight left behind.
+  (superseded by the external enforcement track) — no dead weight left behind.
 - The positioning doc already frames macOS as the "proof point" for a future
   microVM tier, not a co-equal product platform.
 
@@ -115,18 +115,18 @@ The remaining risk is operational, not correctness:
 
 | Residual risk | Detail |
 |---|---|
-| **pahole required on production hosts** | `resolve_kernel_offsets_map()` shells out to pahole at *daemon start* (`offsets.rs:64-72`). No dwarves ⇒ no eBPF ⇒ (on Linux) no daemon. An ops dependency where a pure-Rust parser would do — and Syva already wrote one: `syva-core/src/btf.rs` is a minimal native BTF parser ("replaces pahole subprocess calls"). Port it into `rauha-ebpf-common` and the dependency disappears. |
+| **pahole required on production hosts** | `resolve_kernel_offsets_map()` shells out to pahole at *daemon start* (`offsets.rs:64-72`). No dwarves ⇒ no eBPF ⇒ (on Linux) no daemon. An ops dependency where a pure-Rust parser would do: a minimal native BTF parser (the external enforcement track already wrote one) ported into `rauha-ebpf-common` would remove it. |
 | **Per-kernel builds** | Offsets are baked at build time against the build host's kernel. Distribute a binary to a different kernel and it fails closed ⇒ you must run `xtask build-ebpf` on (or for) each target kernel. Fine for the current deployment model; friction for packaging. |
 | **`BPRM_FILE` heuristic** | `field_names: &["file", "executable"]` resolves first-match (`offsets.rs:74-80`). Kernel-version-dependent semantics folded into a preference list — correct today, subtle forever. |
 | **Doc drift** | CLAUDE.md still describes the old hardcoded-defaults scheme with "sensible defaults for Linux 6.1+." The code moved; the doc didn't. Someone trusting CLAUDE.md will mis-assess this risk — as the original critique did. |
 
 ### Recommendation
 
-1. Port Syva's `btf.rs` (native BTF parse, no pahole) into `rauha-ebpf-common`,
+1. Port the native BTF parser (no pahole) into `rauha-ebpf-common`,
    keep pahole as fallback. One less production dependency, same guarantees.
 2. Update CLAUDE.md's eBPF section to the generated-offsets + sidecar scheme.
-3. Keep the Syva extraction on track: kernel-coupled enforcement code belongs
-   behind that boundary, where Syva's conformance harness can churn with
+3. Keep the enforcement extraction on track: kernel-coupled enforcement code
+   belongs behind that boundary, where its conformance harness can churn with
    kernels without dragging Rauha releases.
 
 ---
@@ -254,7 +254,7 @@ the same way a schema change does.
 | # | Critique | Verdict | One-line evidence |
 |---|---|---|---|
 | 1 | Breadth vs. depth, macOS second platform | **Confirmed, sharpened** | Zero macOS jobs in CI; macOS backend never compiled anywhere but dev laptops; shim (security-critical) has 3 unit tests |
-| 2 | Hardcoded kernel offsets | **Softened — outdated** | Offsets now generated from BTF at build + sidecar-bound + load-validated + runtime self-tested; residual risk is pahole-on-hosts and per-kernel builds (Syva's native BTF parser is the in-house fix) |
+| 2 | Hardcoded kernel offsets | **Softened — outdated** | Offsets now generated from BTF at build + sidecar-bound + load-validated + runtime self-tested; residual risk is pahole-on-hosts and per-kernel builds (a native BTF parser is the in-house fix) |
 | 3 | Planned (`rauha run`) vs. shipped | **Partially confirmed** | Run Protocol explicitly "nothing implemented yet"; but signed Ed25519 receipts *are* shipped and every doc claim is tagged shipped/planned — the gap is sequencing risk, not honesty risk |
 | 4 | redb + postcard fragility | **Confirmed, sharpened** | No schema version; containers hard-fail (one bad entry poisons all listings) while zones silently skip into ghost-unmanageable state; redb semver-open |
 

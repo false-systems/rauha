@@ -110,7 +110,7 @@ BEHAVIOUR DIFF
 + attempted connect db-prod.internal:5432
 ```
 
-The behaviour diff does not depend on the agent's own narration or application instrumentation. A boundary-external witness observes process, file and network activity; Ruuma normalizes sufficiently observed executions and compares their causally meaningful structure.
+The behaviour diff does not depend on the agent's own narration or application instrumentation. A boundary-external witness observes process, file and network activity; a comparison engine normalizes sufficiently observed executions and compares their causally meaningful structure.
 
 This is the first visible magic, not the whole product. It occupies the `observe → compare` portion of the larger Run lifecycle.
 
@@ -158,23 +158,23 @@ The organizational buying trigger is:
 
 ## The product model
 
-The durable product object is the **Run**, not the container, VM or Cell.
+The durable product object is the **Run**, not the container, VM or sandbox.
 
 | Word | Meaning |
 | --- | --- |
 | **Work** | The requested task and its declared inputs, authority and checks. |
 | **Run** | One durable, supervised attempt at that work. It owns the journal, workspace lineage, grants and result. |
-| **Cell** | A disposable execution environment used by a run. A resumed run may receive another cell. |
-| **Zone** | The isolation primitive inside a cell: filesystem, processes, network, resources and policy. Internal terminology. |
-| **Capability** | A Run-scoped handle to one permitted operation provided by a trusted service outside the Cell. |
+| **Sandbox** | A disposable execution environment used by a run. A resumed run may receive another sandbox. |
+| **Zone** | The isolation primitive inside a sandbox: filesystem, processes, network, resources and policy. Internal terminology. |
+| **Capability** | A Run-scoped handle to one permitted operation provided by a trusted service outside the sandbox. |
 | **Journal** | The append-only record of lifecycle, ownership, grants, effect intents, effect results, checkpoints and decisions. Internally implemented with WAL semantics. |
 | **Behavioural class** | A deliberately accepted semantic class of sufficiently observed behaviour for comparable Runs. |
 | **Receipt** | The durable account of changes, authority, effects, checks and observation quality. |
 | **Computer** | The simple marketing metaphor for what the agent receives. |
 
-A Run may wait, delegate, move to another machine, survive multiple Cells and be reconstructed from its journal. A Cell cannot.
+A Run may wait, delegate, move to another machine, survive multiple sandboxes and be reconstructed from its journal. A sandbox cannot.
 
-> **Rauha manages the Run. The Cell is where it executes.**
+> **Rauha manages the Run. The sandbox is where it executes.**
 
 ## The Run lifecycle
 
@@ -202,13 +202,13 @@ prepare → run → supervise → recover → review → accept
 
 `waiting` and `delegated` are important product states. They exist because Rauha owns the work rather than merely launching a process. A Run can pause for an approval, a dependency, a child agent or an external result without keeping one container alive forever.
 
-If the agent, Cell or machine fails, the supervisor reconstructs the Run from the journal and a known workspace checkpoint. Observers and proxies may restart automatically. The agent resumes only from a known checkpoint; Rauha never invents exactly-once execution for arbitrary code.
+If the agent, sandbox or machine fails, the supervisor reconstructs the Run from the journal and a known workspace checkpoint. Observers and proxies may restart automatically. The agent resumes only from a known checkpoint; Rauha never invents exactly-once execution for arbitrary code.
 
 ## Portable Runs, replaceable Cells
 
-The Cell is a backend, not the public abstraction.
+The sandbox is a backend, not the public abstraction.
 
-| Cell backend | Possible use |
+| Sandbox backend | Possible use |
 | --- | --- |
 | Local process with OS boundaries | Fast local development where the host supports sufficient enforcement |
 | Docker or another OCI runtime | Existing development and CI environments |
@@ -229,7 +229,7 @@ laptop Run
                     → connected receipts
 ```
 
-The invariant is the Run Protocol: manifest, journal events, workspace lineage, grants, effect states, evidence references and Receipt. Cell implementations remain replaceable.
+The invariant is the Run Protocol: manifest, journal events, workspace lineage, grants, effect states, evidence references and Receipt. Sandbox implementations remain replaceable.
 
 > **Containers are interchangeable machinery. The Run is the product.**
 
@@ -240,15 +240,15 @@ flowchart TD
     U["Developer or CI"] --> CLI["rauha run -- agent task"]
     CLI --> S["Run supervisor and journal"]
     S --> G["Local guardian"]
-    G --> C["Disposable cell"]
+    G --> C["Disposable sandbox"]
     C --> H["Run-bound capability handle"]
-    H --> B["Broker outside the cell"]
+    H --> B["Broker outside the sandbox"]
     B --> E["External service"]
     B --> S
     C --> W["Boundary-external witness"]
     W --> S
     S --> R["Receipt and review"]
-    V["Vartio optional control plane"] -. "adopts logical supervision" .-> S
+    V["Optional management layer"] -. "adopts logical supervision" .-> S
 ```
 
 There are two supervision roles:
@@ -256,13 +256,13 @@ There are two supervision roles:
 | Role | Responsibility |
 | --- | --- |
 | **Run supervisor** | Reduces the journal into lifecycle state and decides waiting, resumption, delegation and review. Rust locally or Elixir/OTP remotely. |
-| **Local guardian** | Always remains beside the Cell, owns physical enforcement and capability channels, and freezes the Cell if the active supervisor lease disappears. |
+| **Local guardian** | Always remains beside the sandbox, owns physical enforcement and capability channels, and freezes the sandbox if the active supervisor lease disappears. |
 
-Vartio adopts logical supervision. It never replaces the local process responsible for enforcing the boundary.
+The management layer adopts logical supervision. It never replaces the local process responsible for enforcing the boundary.
 
-The supervisor role is always present. In local mode it is a small in-process or local Rust supervisor for one Run. Vartio replaces that implementation with durable, distributed OTP supervision that can survive sessions and machines.
+The supervisor role is always present. In local mode it is a small in-process or local Rust supervisor for one Run. The management layer replaces that implementation with durable, distributed OTP supervision that can survive sessions and machines.
 
-> **Local Rauha gives the work a supervisor. Vartio makes that supervisor effectively immortal.**
+> **Local Rauha gives the work a supervisor. The management layer makes that supervisor effectively immortal.**
 
 Only one logical supervisor may authorize effects. Every adoption receives a monotonically increasing ownership epoch; capability brokers reject commands carrying an older epoch.
 
@@ -290,7 +290,7 @@ Each capability is:
 - Bound to one Run and ownership epoch.
 - Limited to an exact resource, operation and lifetime.
 - Reached through a protected local channel rather than a transferable bearer secret.
-- Implemented by a broker outside the Cell.
+- Implemented by a broker outside the sandbox.
 - Revocable when the Run pauses or ends.
 - Journaled before and after every side effect.
 
@@ -314,7 +314,7 @@ Local capability integrations should be useful and freely available. The paid pr
 
 ## Journal and observation
 
-> **The journal is the truth. The supervisor is the live view. The Cell is a materialization. The Receipt is the verdict.**
+> **The journal is the truth. The supervisor is the live view. The sandbox is a materialization. The Receipt is the verdict.**
 
 The journal is the durable truth about what Rauha itself controlled:
 
@@ -335,7 +335,7 @@ This preserves the False Systems principle:
 
 > **Uncertainty is data.**
 
-The WAL is internal machinery, not the developer-facing product. Live OTP messages, process notifications and observer events may make the interface fast, but the journal head and active ownership epoch decide what is authoritative. A Cell may be destroyed and reconstructed; the Run and its journal remain.
+The WAL is internal machinery, not the developer-facing product. Live OTP messages, process notifications and observer events may make the interface fast, but the journal head and active ownership epoch decide what is authoritative. A sandbox may be destroyed and reconstructed; the Run and its journal remain.
 
 The relevant lesson from [Cursor's Git at any scale](https://cursor.com/blog/git-at-any-scale) is architectural rather than product-facing: preserve one durable source of truth, treat faster distributed views as reconstructible, and publish state changes through an authoritative head. Rauha applies that lesson to work rather than files.
 
@@ -348,7 +348,7 @@ The convenience, isolation and runtime-monitoring layers are crowded. Rauha cann
 | Alternative | What it already provides | Rauha's intended distinction |
 | --- | --- | --- |
 | **Docker Sandboxes** | Per-agent microVMs, isolated workspace modes, host-side credential proxying, network governance and audit records | A durable Run object, operation-shaped authority, staged effects, lifecycle supervision and one task receipt |
-| **Chainguard** | Hardened containers, libraries, VMs, Actions and agent skills; internally, fresh microVMs with a trusted supervisor, proxied credentials, egress policy and a network flight recorder | Use these as trusted inputs or Cell machinery while Rauha owns workspace acceptance, durable Run state, effects, behaviour and Receipt |
+| **Chainguard** | Hardened containers, libraries, VMs, Actions and agent skills; internally, fresh microVMs with a trusted supervisor, proxied credentials, egress policy and a network flight recorder | Use these as trusted inputs or sandbox machinery while Rauha owns workspace acceptance, durable Run state, effects, behaviour and Receipt |
 | **Claude Code and Codex sandboxes** | Agent-specific filesystem and network boundaries that reduce approval prompts | A vendor-neutral Run, boundary-external observation, mediated effects and a receipt independent of the agent's own narrative |
 | **Worktree and container-use tools** | Separate code workspaces and parallel branches | Authority, effect journaling, runtime observation and staged external actions |
 | **Cloud sandboxes** | Remote computers, persistence and execution APIs | A local-first workflow with the same Run identity and acceptance model from laptop to remote execution |
@@ -363,7 +363,7 @@ Chainguard makes the boundary particularly clear:
 
 Rauha should support Chainguard images, signed attestations, SBOMs and provenance as first-class Run inputs and record their exact digests in the Receipt. It should not build a competing image or skill catalogue.
 
-The strategic test is simple: if Docker, Chainguard or another vendor supplies a better Cell, Rauha should become better rather than obsolete.
+The strategic test is simple: if Docker, Chainguard or another vendor supplies a better sandbox, Rauha should become better rather than obsolete.
 
 The durable distinction is:
 
@@ -378,7 +378,7 @@ If Rauha becomes only a microVM sandbox, credential proxy or behaviour monitor, 
 The developer product. No account or Rauha-hosted cloud service is required; the chosen agent and granted capabilities may still require network access.
 
 - `rauha run`
-- Disposable Cell
+- Disposable sandbox
 - Local guardian and Run supervisor
 - Durable Run journal
 - Local capability brokers
@@ -406,7 +406,7 @@ rauha run -- claude -p "fix the failing test"
 
 - Pull-request Receipts
 - Code diff beside Behaviour Diff
-- Provenance across model, prompt, tools, authority and Cell inputs
+- Provenance across model, prompt, tools, authority and sandbox inputs
 - Checks, effects and denials connected to the exact Run
 - Explicit acceptance of comparable behavioural classes
 
@@ -417,14 +417,14 @@ The same work model extended to deployment and production operations:
 - A deployment is requested through an operation-shaped capability.
 - Existing CI, GitHub, Argo, Kubernetes and cloud tools remain the executors.
 - Temporary authority is granted only to the requested operation.
-- Vartio supervises remote and long-running operation state.
-- Kide interprets source-specific requests and results conservatively.
-- Ruuma compares sufficiently observed production behaviour.
+- The management layer supervises remote and long-running operation state.
+- A conservative interpreter maps source-specific requests and results.
+- The comparison engine judges sufficiently observed production behaviour.
 - Connected Receipts preserve lineage from code work through production effect.
 
 Deployment is an expansion surface, not part of the first release and not an attempt to replace Kubernetes or deployment tooling.
 
-## Vartio: the remote supervision engine
+## The management layer: remote supervision
 
 The optional team and production control plane, implemented around Elixir/OTP. It adopts logical supervision and adds:
 
@@ -438,7 +438,7 @@ The optional team and production control plane, implemented around Elixir/OTP. I
 - Organizational evidence and history
 - Production coordination
 
-The external developer experience may remain under the Rauha brand while Vartio operates as the remote engine and enterprise expansion.
+The external developer experience may remain under the Rauha brand while the management layer operates as the remote engine and enterprise expansion.
 
 A possible connected history is:
 
@@ -447,8 +447,8 @@ local coding Run
     → requests draft pull request
         → CI Run validates the change
             → deployment Run requests production authority
-                → Vartio supervises the operation
-                    → Ruuma compares the observed result
+                → the management layer supervises the operation
+                    → the comparison engine judges the observed result
                         → connected Receipts preserve the lineage
 ```
 
@@ -468,7 +468,7 @@ It includes:
 - One supported coding agent.
 - One or two supported project ecosystems.
 - A copy-on-write workspace constructed from Git-tracked files by default.
-- A disposable Cell and durable Run directory.
+- A disposable sandbox and durable Run directory.
 - A durable journal from day one.
 - Brokered model access.
 - A GitHub read capability.
@@ -493,22 +493,21 @@ Developers see Rauha. The implementation may reuse:
 
 | Component | Role |
 | --- | --- |
-| **Rauha** | Run and Cell runtime, local guardian and developer surface |
-| **Syvä** | Linux enforcement and fail-closed decisions |
-| **False Agent** | Boundary-external runtime observation with explicit evidence quality |
-| **Kide** | Conservative semantic interpretation for receipt lines |
-| **Ruuma** | Semantic, integrity-qualified comparison against deliberately accepted behavioural classes |
-| **Gateway** | Vartio attachment, adoption and journal streaming |
-| **Luotsi / OTP** | Distributed logical Run supervision |
-| **Ahti** | Organizational evidence and history |
-| **Vartio** | Team, remote and production coordination |
+| **Rauha runtime** | Run and sandbox runtime, local guardian and developer surface |
+| **Kernel enforcement** | Linux enforcement and fail-closed decisions (eBPF-LSM) |
+| **Witness** | Boundary-external runtime observation with explicit evidence quality |
+| **Interpreter** | Conservative semantic interpretation for receipt lines |
+| **Comparison engine** | Semantic, integrity-qualified comparison against deliberately accepted behavioural classes |
+| **Gateway** | Management-layer attachment, adoption and journal streaming |
+| **OTP supervision** | Distributed logical Run supervision |
+| **Evidence store** | Organizational evidence and history |
+| **Management layer** | Team, remote and production coordination |
 
-The fate of false-exec, Kisko, Sauma, Sykli, Teko and Toimija belongs in a separate architecture decision record. Existing projects should not be assigned new product roles merely to keep them alive.
 
 ## Platform truth
 
-- **macOS:** a Cell uses a Linux VM built with Virtualization.framework and requires no host-root privilege. The initial image supports only selected agents and toolchains.
-- **Linux:** namespaces, cgroups and Syvä may provide the Cell boundary. Selected host tools may be exposed read-only, and the exact method is recorded. Supported distributions and BPF-LSM requirements belong in a tested compatibility matrix, not a broad product promise.
+- **macOS:** a sandbox uses a Linux VM built with Virtualization.framework and requires no host-root privilege. The initial image supports only selected agents and toolchains.
+- **Linux:** namespaces, cgroups and eBPF-LSM may provide the sandbox boundary. Selected host tools may be exposed read-only, and the exact method is recorded. Supported distributions and BPF-LSM requirements belong in a tested compatibility matrix, not a broad product promise.
 - A `Dockerfile` or `devcontainer.json` is not required. Rauha may later use existing project configuration as a hint.
 - Known host credential paths are excluded by policy and every exclusion is reported. Rauha never claims to discover every possible secret by filename.
 
@@ -532,7 +531,7 @@ Category line:
 
 The larger company vision:
 
-> **Docker made applications portable across computers. Rauha makes agentic work portable across agents, environments and stages. Vartio keeps that work supervised across machines and production.**
+> **Docker made applications portable across computers. Rauha makes agentic work portable across agents, environments and stages. the management layer keeps that work supervised across machines and production.**
 
 The central product judgment:
 
@@ -542,10 +541,10 @@ The central product judgment:
 
 Product laws:
 
-1. The public object is the Run, not the Cell, container or WAL.
+1. The public object is the Run, not the sandbox, container or WAL.
 2. Existing agent CLIs remain usable; no agent SDK or prompt change is required for the basic Run.
-3. The Cell backend is replaceable.
-4. Raw credentials remain outside the Cell whenever an operation-shaped capability is available.
+3. The sandbox backend is replaceable.
+4. Raw credentials remain outside the sandbox whenever an operation-shaped capability is available.
 5. No external effect occurs without a durable intent.
 6. Requested security controls fail closed.
 7. Observation limits, loss and uncertainty are part of the result.
@@ -575,7 +574,7 @@ The Godzilla test is architectural: if a large vendor produces a better sandbox 
 - How pending external effects are approved independently from applying code changes.
 - The macOS witness trust boundary and which observations are independently verifiable from outside the guest.
 - The Run Protocol: canonical journal events, ownership epochs, checkpoints, forks and reconstruction.
-- The minimum Cell-backend contract and the first two implementations that prove portability.
+- The minimum sandbox-backend contract and the first two implementations that prove portability.
 - The conservative comparison key for the first Behaviour Diff: work type, repository state, environment, authority, tools and provenance.
 - Which existing tools are absorbed, renamed, retained independently or retired.
 
@@ -585,12 +584,12 @@ The architecture can be built. The product thesis still requires evidence.
 
 1. A developer reaches a useful first result faster than with today's Docker, credential and cleanup plumbing.
 2. Developers allow meaningful tasks to run unattended rather than continuing to babysit them.
-3. The Run survives a realistic agent or Cell failure without losing its durable history or repeating unsafe effects.
+3. The Run survives a realistic agent or sandbox failure without losing its durable history or repeating unsafe effects.
 4. Capability handles are usable enough that developers do not bypass them by mounting raw credentials.
 5. The Receipt makes a real accept, discard or restrict decision easier.
 6. Behaviour Diff stays short and meaningful enough to review; it does not become another noisy security report.
-7. One Run contract works across at least two materially different Cell backends.
-8. A remote Vartio supervisor can adopt a Run without weakening local enforcement or duplicating effects.
+7. One Run contract works across at least two materially different sandbox backends.
+8. A remote supervisor can adopt a Run without weakening local enforcement or duplicating effects.
 9. The same lineage remains useful when work expands from coding to CI and later deployment.
 
 The product fails if it becomes a complicated way to start a container, an interesting report developers ignore, or a security layer that makes the agent materially harder to use.

@@ -118,7 +118,7 @@ The product sentence is:
 > what it did differently; retain the complete evidence when deeper inspection
 > is needed.
 
-## Run continuity: the Cell is a cache
+## Run continuity: the sandbox is a cache
 
 Cursor's Continuity design treats an ordinary Git repository on local NVMe as
 a materialized cache and an object-storage write-ahead log as durable truth.
@@ -128,11 +128,11 @@ updates; gossip accelerates healthy replicas but never decides correctness.
 
 Rauha adopts the invariant, not Cursor's storage implementation:
 
-> A Cell is replaceable materialization. A Run is durable truth.
+> A sandbox is replaceable materialization. A Run is durable truth.
 
 ```text
 Run        = journal + head + artifacts + workspace lineage
-Cell       = materialize(Run checkpoint)
+Sandbox    = materialize(Run checkpoint)
 Supervisor = reduce(journal after checkpoint)
 Receipt    = seal(immutable Run head)
 Fork       = new Run referencing parent head + checkpoint
@@ -187,13 +187,14 @@ the original evidence chunks remain available for every receipt that references
 them.
 
 Tier zero needs no distributed system: immutable files, a single-writer lock,
-and atomic durable head replacement provide the same semantics locally. Vartio
-may later place immutable objects in durable storage and update the head with
-CAS. The protocol stays the same; only the storage implementation changes.
+and atomic durable head replacement provide the same semantics locally. A
+durable-storage tier may later place immutable objects in remote storage and
+update the head with CAS. The protocol stays the same; only the storage
+implementation changes.
 
 The architectural promise is:
 
-> A Rauha Run is reconstructible from durable truth; every Cell, supervisor
+> A Rauha Run is reconstructible from durable truth; every sandbox, supervisor
 > process, and live event stream is replaceable.
 
 Credible "stronger than Docker defaults" milestone: user namespaces + seccomp +
@@ -267,7 +268,7 @@ reuse.
 | Trusted static helper in `startContainer` | cannot work: runs after privilege drop |
 | **`crun create` → pidfd → `cgroup.procs` → `crun start`** (current) | enrollment while init is parked; crun setup judged outside the zone; one `cgroup.procs` write, fail closed |
 | `createRuntime` hook, host binary, reads state JSON `pid` | spec-blessed (nvidia pattern); equivalent to the current flow if a hook is ever required |
-| `--cgroup-manager=cgroupfs` + `"cgroupsPath": "/rauha.slice/zone-X"` | crun passes the zone cgroup dirfd to `clone3(CLONE_INTO_CGROUP)`: zero window and `crun exec` enrolls too — but crun's privileged setup then runs *inside* the zone cgroup, so Syva would need a `bprm_check_security`-keyed phase gate (audit before the workload's first exec, deny after) in `capable`/`file_open` |
+| `--cgroup-manager=cgroupfs` + `"cgroupsPath": "/rauha.slice/zone-X"` | crun passes the zone cgroup dirfd to `clone3(CLONE_INTO_CGROUP)`: zero window and `crun exec` enrolls too — but crun's privileged setup then runs *inside* the zone cgroup, so the enforcement layer would need a `bprm_check_security`-keyed phase gate (audit before the workload's first exec, deny after) in `capable`/`file_open` |
 | Post-hoc `/proc/pid/cgroup` (or `PIDFD_GET_INFO` cgroupid, 6.13+) | not enforcement; keep as the invariant check |
 
 The `cgroupsPath` variant is the upgrade if exec-path enrollment or a zero-write
@@ -312,7 +313,7 @@ user-namespace, Landlock, or pidfd code. These close those gaps, cheapest first.
    with the sync shim as listener (`run.oci.seccomp.receiver`) for FD brokering
    and `zone.syscall.denied` evidence.
    [seccomp_unotify](https://www.mankier.com/2/seccomp_unotify)
-5. **User namespaces + idmapped overlay** (5.19+): one userns per zone; Syva
+5. **User namespaces + idmapped overlay** (5.19+): one userns per zone; the enforcement layer
    attaches `userns_create` (6.1, BPF-attachable) to deny nested userns for zone
    tasks unless policy allows. Kubernetes 1.36 made `hostUsers: false` GA.
    [userns GA](https://kubernetes.io/blog/2026/04/23/kubernetes-v1-36-userns-ga/)
@@ -323,7 +324,7 @@ user-namespace, Landlock, or pidfd code. These close those gaps, cheapest first.
 7. **Devices** via `BPF_PROG_TYPE_CGROUP_DEVICE` per zone cgroup (the only v2
    device controller) → closes `devices.allowed`. `cgroup/connect4|6` for L4
    egress as defense-in-depth beside nftables.
-8. **Syva additions**: `bpf_path_d_path` (6.12) so `zone.file.denied` carries a
+8. **Enforcement-layer additions**: `bpf_path_d_path` (6.12) so `zone.file.denied` carries a
    path; `uring_allowed` hook (6.15); BPF token (6.9) so the enforcer needs no
    `CAP_BPF`; assert `lsm_list_modules()` (6.8) contains `bpf` and `landlock`.
    [BPF token](https://lwn.net/Articles/959350/),

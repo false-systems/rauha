@@ -3,7 +3,7 @@
 Status: draft contract, 2026-08-27. Nothing here is implemented yet. The
 purpose of this document is to fix the vocabulary and the invariants before
 the tier-0 Rust supervisor, the OTP manager, and the tools that consume runs
-(Ruuma, Kide, Ahti, Vartio) are built against them.
+are built against them.
 
 It builds on the *Run continuity* and *behaviour diff* sections of
 [`positioning-and-roadmap.md`](positioning-and-roadmap.md) and uses their
@@ -18,24 +18,24 @@ same journals.
 | **Run** | The durable unit of agentic work: journal + head + artifacts + workspace lineage. The only truth. |
 | **RunHead** | A CAS-controlled pointer to an immutable manifest of the Run's current state (see §5). |
 | **Journal** | Append-only, hash-chained record of everything that happened to the Run (§3). |
-| **Cell** | A replaceable materialization of a Run checkpoint: the zone, its workspace, its capability handles. A Cell may be destroyed and rebuilt at any time. |
-| **Custodian** | The small trusted process beside the Cell (today: `rauhad` + `rauha-shim`). Owns the process/VM, capability handles, enforcement, freezing, and the fencing epoch. Present at every tier. |
-| **Supervisor** | Owns the Run's lifecycle: reduces the journal into state, decides pause/resume/delegation, coordinates retries and humans. Rust in tier 0; OTP/Vartio remotely. |
+| **Sandbox** | A replaceable materialization of a Run checkpoint: the zone, its workspace, its capability handles. A Sandbox may be destroyed and rebuilt at any time. |
+| **Custodian** | The small trusted process beside the Sandbox (today: `rauhad` + `rauha-shim`). Owns the process/VM, capability handles, enforcement, freezing, and the fencing epoch. Present at every tier. |
+| **Supervisor** | Owns the Run's lifecycle: reduces the journal into state, decides pause/resume/delegation, coordinates retries and humans. Rust in tier 0; OTP remotely. |
 | **Capability** | A brokered service outside the boundary (git, credentials/egress, services, proof gates, human, remote). The agent holds a handle, never the underlying secret. |
 | **Effect** | An externally visible action performed through a capability (§6). |
-| **Checkpoint** | A sealed journal prefix plus workspace snapshot from which a Cell can be materialized (§7). |
+| **Checkpoint** | A sealed journal prefix plus workspace snapshot from which a Sandbox can be materialized (§7). |
 | **Receipt** | A signed seal of an immutable RunHead (`rauha.execution-receipt.v1` today; extended by this protocol). |
 | **Epoch** | Monotonic ownership counter per Run, allocated by the custodian, carried by every effect (§5). |
 
-One sentence: **the Run is truth, the Cell is cache, the supervisor is a
+One sentence: **the Run is truth, the Sandbox is cache, the supervisor is a
 view, the custodian is the guard.**
 
 Mapping to [`product-thesis.md`](product-thesis.md), which is the canonical
 product vocabulary: the thesis's *local guardian* is this document's
-**Custodian**; its *boundary-external witness* (False Agent) is §8's
+**Custodian**; its *boundary-external witness* is §8's
 **witness**; its effect outcomes `committed | failed | unknown` are the
 journal's `succeeded | failed | uncertain` (§6); its *Zone* is the isolation
-primitive inside a Cell and stays internal. Where the two disagree, the
+primitive inside a Sandbox and stays internal. Where the two disagree, the
 thesis wins on product meaning and this document wins on wire format.
 
 ## 2. Lifecycle
@@ -47,14 +47,14 @@ preparing → running → waiting → delegated → proving → review → accep
 
 | State | Meaning | Entered by |
 |---|---|---|
-| `preparing` | Run created; Cell being materialized; capabilities not yet granted. | `run.created` |
-| `running` | Agent executing inside the Cell with granted capabilities. | `cell.ready`, `run.resumed` |
+| `preparing` | Run created; Sandbox being materialized; capabilities not yet granted. | `run.created` |
+| `running` | Agent executing inside the Sandbox with granted capabilities. | `sandbox.ready`, `run.resumed` |
 | `waiting` | Agent stopped on purpose: awaiting human input, an approval, a delegated child, or a lease renewal. | `run.waiting`, `run.frozen` |
-| `frozen` | Custodian stopped the Cell (lease expired, disconnection, operator). Capabilities closed. Distinct from `waiting` because the agent did not choose it. | `run.frozen` |
+| `frozen` | Custodian stopped the Sandbox (lease expired, disconnection, operator). Capabilities closed. Distinct from `waiting` because the agent did not choose it. | `run.frozen` |
 | `delegated` | Control handed to one or more child Runs; parent resumes when they finish. | `run.delegated` |
-| `proving` | Declared proof gates executing (tests, Kelpo, Sykli). | `proof.started` |
+| `proving` | Declared proof gates executing (tests, check runners). | `proof.started` |
 | `review` | Result awaiting a decision: code diff, behaviour diff, receipt. | `proof.finished` |
-| `accepted` / `discarded` | Terminal. Workspace applied or dropped; Cell destroyed. | `run.accepted`, `run.discarded` |
+| `accepted` / `discarded` | Terminal. Workspace applied or dropped; Sandbox destroyed. | `run.accepted`, `run.discarded` |
 
 - **RP-1** Every state transition is a journal event; the reducer never
   changes state without one.
@@ -98,7 +98,7 @@ preparing → running → waiting → delegated → proving → review → accep
 | `run.created` | supervisor | manifest hash, parent (if fork), agent, task |
 | `supervisor.claimed` | custodian | `epoch`, supervisor id, lease seconds |
 | `supervisor.released` | custodian | `epoch`, reason |
-| `cell.materialized` / `cell.ready` / `cell.destroyed` | custodian | checkpoint id, zone id |
+| `sandbox.materialized` / `sandbox.ready` / `sandbox.destroyed` | custodian | checkpoint id, zone id |
 | `capability.granted` / `capability.revoked` | custodian | capability, grant id, scope |
 | `effect.requested` … `effect.uncertain` | capability broker | see §6 |
 | `run.waiting` / `run.resumed` / `run.frozen` | supervisor / custodian | reason, checkpoint id |
@@ -134,7 +134,7 @@ requested capabilities, parent run and checkpoint if forked.
 - **RP-8** The manifest is immutable; the first journal line's `prev` is its
   hash, so a manifest edit invalidates the whole chain.
 - **RP-9** The Run directory is the complete contract between tiers: a
-  tier-0 CLI, the OTP manager, Ruuma, and Ahti read the same files. No tier
+  tier-0 CLI, the OTP manager, and the comparison and evidence tools read the same files. No tier
   may depend on state that is not in the directory.
 
 ## 5. Ownership: custodian, supervisor, epoch, lease
@@ -150,7 +150,7 @@ partition and holds the only real handles.
   cannot renew is gone from the custodian's point of view; no coordination is
   needed during the partition.
 - **RP-12** On lease expiry the custodian (a) revokes every capability grant
-  (`capability.revoked`), (b) freezes the Cell — `cgroup.freeze` on Linux, VM
+  (`capability.revoked`), (b) freezes the Sandbox — `cgroup.freeze` on Linux, VM
   pause in a future VM tier — (c) appends `run.frozen{reason: lease_expired}`. Order
   matters: no effect may slip out between (a) and (b).
 - **RP-13** Every capability broker rejects an effect whose `epoch` is lower
@@ -199,7 +199,7 @@ requested → authorized → executing → succeeded | failed | uncertain
 ## 7. Checkpoints and Cells
 
 - **RP-21** A checkpoint seals a journal prefix hash and a workspace snapshot
-  (`checkpoint.sealed`). The Cell can be destroyed after any checkpoint and
+  (`checkpoint.sealed`). The Sandbox can be destroyed after any checkpoint and
   rebuilt from it; TCP connections and half-executed instructions are not
   portable state and are never part of a checkpoint.
 - **RP-22** Checkpoints bound replay cost; they never rewrite history. Every
@@ -211,11 +211,11 @@ requested → authorized → executing → succeeded | failed | uncertain
 ## 8. Witness and completeness
 
 - **RP-24** A result may be called *complete* only if `witness.attached` was
-  journaled before the first `execve` of the agent in the Cell and every
+  journaled before the first `execve` of the agent in the Sandbox and every
   declared loss counter (`ringbuf.drop`, `pipeline.shed`, witness gaps) is
   zero at `proof.finished`. Otherwise the result carries
   `evidence_complete: false` and the reasons.
-- **RP-25** Witness observations are facts about the Cell recorded by the
+- **RP-25** Witness observations are facts about the Sandbox recorded by the
   custodian (process, file, network, capability activity, allowed and
   denied); the agent's own account is never an input to them.
 
@@ -228,7 +228,7 @@ requested → authorized → executing → succeeded | failed | uncertain
   no epoch. Grants are issued fresh to the child.
 - **RP-28** A fork inherits no unresolved effects: an `uncertain` effect in
   the parent cannot be completed, reconciled, or claimed by the child.
-- **RP-29** Two Runs with the same fork point are *comparable*; Ruuma's
+- **RP-29** Two Runs with the same fork point are *comparable*; comparison
   behaviour classes and `rauha compare` are defined over that relation.
 
 ## 10. Receipts
@@ -273,7 +273,7 @@ requested → authorized → executing → succeeded | failed | uncertain
    custodian's on ingestion?
 2. Grant scoping vocabulary for capabilities (per-host allowlists for egress,
    per-ref for git) — shared with Tutka's authority map?
-3. Whether `delegated` children live in the parent's Cell or their own; the
+3. Whether `delegated` children live in the parent's Sandbox or their own; the
    protocol allows both, the first implementation should pick one.
 4. Compaction (`journal.compacted`) semantics for very long runs without
    breaking RP-6 for old receipts.
