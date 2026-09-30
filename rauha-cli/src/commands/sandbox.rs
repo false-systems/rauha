@@ -99,27 +99,16 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         "timed_out" => 137,
         _ => 1,
     });
-    let receipt: rauha_evidence::receipt::SignedExecutionReceipt =
-        serde_json::from_str(&result.receipt_json)
-            .map_err(|error| anyhow::anyhow!("daemon returned an invalid receipt: {error}"))?;
-    receipt
-        .verify()
-        .map_err(|error| anyhow::anyhow!("daemon returned an unverifiable receipt: {error}"))?;
-    // The DSSE in-toto envelope of the same receipt must also verify —
-    // spec-compliant PAE, the form ecosystem tooling consumes. Surfaced in
-    // the JSON output so external verifiers get it without the daemon.
-    let receipt_dsse: rauha_evidence::dsse::DsseEnvelope = if result.receipt_dsse_json.is_empty() {
-        Default::default()
-    } else {
-        let envelope: rauha_evidence::dsse::DsseEnvelope =
-            serde_json::from_str(&result.receipt_dsse_json).map_err(|error| {
-                anyhow::anyhow!("daemon returned an invalid DSSE envelope: {error}")
-            })?;
-        envelope
-            .verify_public_hex(&receipt.public_key)
-            .map_err(|error| anyhow::anyhow!("DSSE envelope verification failed: {error}"))?;
-        envelope
-    };
+    // Receipts are evidence *about* the run — the run itself is the product.
+    // A missing, unparseable, or unverifiable receipt (e.g. a daemon that
+    // predates the receipt proto fields) must not discard the task's
+    // stdout/stderr/exit code: the result prints, the receipt problem is
+    // reported separately on stderr, and the CLI keeps mirroring the
+    // task's exit code.
+    let (receipt, receipt_dsse, receipt_problem) = verify_receipts(&result);
+    if let Some(problem) = &receipt_problem {
+        eprintln!("warning: receipt not verified — {problem}");
+    }
 
     let view = output::SandboxRun {
         ok: result.status == "succeeded",
@@ -182,7 +171,10 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
             view.admission,
             view.duration_ms as f64 / 1000.0,
             enforcement,
-            view.receipt.sha256(),
+            view.receipt
+                .as_ref()
+                .map(|r| r.sha256())
+                .unwrap_or_else(|| "unverified".into()),
         );
         if !view.unavailable_controls.is_empty() {
             eprintln!(
@@ -198,6 +190,57 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         std::process::exit(exit_code);
     }
     Ok(())
+}
+
+/// Verify both receipt forms best-effort. Returns the receipts that
+/// verified and the first problem found (if any). A bad DSSE envelope
+/// does not discard a valid legacy receipt — they are independent
+/// evidence about the same run.
+fn verify_receipts(
+    result: &pb::sandbox::SandboxResult,
+) -> (
+    Option<rauha_evidence::receipt::SignedExecutionReceipt>,
+    Option<rauha_evidence::dsse::DsseEnvelope>,
+    Option<String>,
+) {
+    let receipt: rauha_evidence::receipt::SignedExecutionReceipt =
+        match serde_json::from_str(&result.receipt_json) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return (
+                    None,
+                    None,
+                    Some(format!("daemon returned an invalid receipt: {error}")),
+                )
+            }
+        };
+    if let Err(error) = receipt.verify() {
+        return (
+            None,
+            None,
+            Some(format!("daemon returned an unverifiable receipt: {error}")),
+        );
+    }
+    if result.receipt_dsse_json.is_empty() {
+        return (Some(receipt), None, None);
+    }
+    match serde_json::from_str::<rauha_evidence::dsse::DsseEnvelope>(&result.receipt_dsse_json) {
+        Err(error) => (
+            Some(receipt),
+            None,
+            Some(format!("daemon returned an invalid DSSE envelope: {error}")),
+        ),
+        Ok(envelope) => match envelope.verify_public_hex(&receipt.public_key) {
+            Err(error) => (
+                Some(receipt),
+                None,
+                Some(format!("DSSE envelope verification failed: {error}")),
+            ),
+            // The statement is the envelope's payload — already covered by
+            // the legacy receipt verification above.
+            Ok(_statement) => (Some(receipt), Some(envelope), None),
+        },
+    }
 }
 
 /// Ensure the image is in the daemon's local store, pulling on demand.

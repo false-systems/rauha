@@ -208,11 +208,13 @@ pub struct SandboxRun {
     pub unavailable_controls: Vec<String>,
     pub events: Vec<SandboxEvent>,
     pub enforcement_events: Vec<SandboxEnforcementEvent>,
-    pub receipt: rauha_evidence::receipt::SignedExecutionReceipt,
+    /// `None` when the daemon predates the receipt fields or verification
+    /// failed — the run is still reported; the problem goes to stderr.
+    pub receipt: Option<rauha_evidence::receipt::SignedExecutionReceipt>,
     /// DSSE in-toto envelope of the same receipt (spec-compliant PAE);
-    /// verifiable by ecosystem tooling unchanged. Empty when the daemon
-    /// predates the field.
-    pub receipt_dsse: rauha_evidence::dsse::DsseEnvelope,
+    /// verifiable by ecosystem tooling unchanged. `None` when absent or
+    /// unverified.
+    pub receipt_dsse: Option<rauha_evidence::dsse::DsseEnvelope>,
 }
 
 #[derive(Serialize)]

@@ -181,7 +181,7 @@ The legacy `rauha-enforce/` crate and its daemonset YAML (`deploy/`) were remove
 
 ### Policy Admission: enforced, audited, or refused (`rauhad/src/backend/linux/mod.rs`)
 
-`ZonePolicy.admission` is `strict` (default) or `audit` (`policies/audit.toml`). At zone creation `admit_linux_policy()` classifies every requested control; `unsupported_linux_controls()` currently lists `filesystem.writable_paths` (unless a safe path), `devices.allowed`, `syscalls.deny`, plus any LSM hook the kernel skipped (`lsm.<hook>`). Strict admission **refuses** the zone with the control names in the error; audit admits it, records the names in `zone_degradations`, and they surface as `policy:<control>` checks in `zone verify` and as `unavailable_controls` in the sandbox result. The Linux daemon itself fails closed at startup (root + BPF-LSM required, no degraded mode) — `audit` only relaxes per-zone policy controls, never enforcement presence.
+`ZonePolicy.admission` is `strict` (default) or `audit` (`policies/audit.toml`). At zone creation `admit_linux_policy()` classifies every requested control; `unsupported_linux_controls()` currently lists `filesystem.writable_paths` (unless a safe path), `devices.allowed`, `syscalls.deny`, plus any LSM hook the kernel skipped (`lsm.<hook>`). Strict admission **refuses** the zone with the control names in the error; audit admits it, records the names in `zone_degradations`, and they surface as `policy:<control>` checks in `zone verify` and as `unavailable_controls` in the sandbox result. The Linux daemon itself fails closed at startup (root + BPF-LSM required, no degraded mode) — `audit` only relaxes per-zone policy controls, never enforcement presence. A granted writable path mounts a fresh **empty** tmpfs over the image directory (mode preserved, 64 MiB): image content at the path is shadowed, not copied — the daemon logs a warning when the shadow hides something, and an upper-copy bind is the planned upgrade.
 
 `verify_isolation()` (`rauha zone verify --json`) emits named checks — `policy:admitted`, `cgroup`, `ebpf:health`, `bpf_membership`, `filesystem:inode_ownership`, `netns`, `network:veth`, `network:nftables` — each with `passed` and `detail`. The security probes (`tests/security/*.sh`) key on these names; adding a control means adding a check here, not just a code path.
 
@@ -302,6 +302,7 @@ The oracle must not be modified as a side effect of modifying the system. It has
 ### Linux (the only supported platform)
 
 - Linux 6.1+ with `CONFIG_BPF_LSM=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`
+- nftables: `nf_tables` + `nf_nat` are hard requirements (daemon fails closed without them); `nf_tables_bridge` powers cross-zone L2 filtering — without it the daemon starts and degrades explicitly (strict zones refuse network admission, audit zones record `network:nftables`)
 - Boot parameter: `lsm=lockdown,capability,bpf`
 - BTF at `/sys/kernel/btf/vmlinux`
 - `crun` at `/usr/bin/crun` (container construction is delegated to it); `jq` for the security probes

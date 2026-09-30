@@ -5,3 +5,4 @@ target/
 .toimija/current.*
 .toimija/sessions/
 .toimija/runs/
+.toimija/history.*
