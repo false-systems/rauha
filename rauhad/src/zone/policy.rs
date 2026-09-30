@@ -183,6 +183,7 @@ allowed = ["/dev/null", "/dev/zero", "/dev/urandom"]
 
 [syscalls]
 deny = ["mount", "umount2"]
+broker = ["openat"]
 "#;
 
         let (zone_type, policy) = parse_policy(toml, "/var/lib/rauha").unwrap();
@@ -191,6 +192,7 @@ deny = ["mount", "umount2"]
         assert_eq!(policy.resources.memory_limit, 4 * 1024 * 1024 * 1024);
         assert_eq!(policy.network.allowed_zones, vec!["frontend"]);
         assert_eq!(policy.syscalls.deny, vec!["mount", "umount2"]);
+        assert_eq!(policy.syscalls.broker, vec!["openat"]);
     }
 
     #[test]

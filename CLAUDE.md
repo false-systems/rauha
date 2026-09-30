@@ -220,6 +220,9 @@ daemon at spawn.
 [evidence]  sandbox_log_max_bytes = 1048576
 [limits]    policy_max_bytes = 65536
 [policy]    safe_writable_roots = ["/proc", "/sys", "/dev", "/run"]
+[broker]    cache_max_tasks = 512       # shim task-pin cache (RAUHA_BROKER_CACHE_MAX; 0 = cold; clamped to the fd budget)
+            judge_threads = 4           # parallel judges (RAUHA_BROKER_JUDGE_THREADS; 1 = serial)
+            handoff_timeout_ms = 30000  # bounded wait for crun's fd hand-off
 ```
 
 On startup, rauhad runs `reconcile()`: loads all zones from redb, calls `recover_zone()` on each to re-establish kernel state (BPF maps, cgroups, network), then `cleanup_orphans()` to remove stale kernel state. Stale BPF pins are removed before loading new programs — redb is the source of truth.
@@ -246,7 +249,26 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 
 - Error messages include what went wrong AND what to do about it. Many error variants have a `hint` field.
 - Linux-only code uses `#[cfg(target_os = "linux")]` with stub implementations for other platforms.
-- Policies are TOML. See `policies/standard.toml` for the canonical example.
+- Policies are TOML. See `policies/standard.toml` for the canonical example and
+`policies/broker.toml` for the brokered-opens policy.
+`[syscalls] broker = [...]` marks syscalls as brokered: they suspend in the
+kernel (seccomp `SCMP_ACT_NOTIFY`) and are judged by the zone shim, which
+either denies with an honest errno (`EPERM` for policy denials, the kernel's
+own errno — ENOENT, EXDEV, E2BIG… — for argument shapes) or opens on the
+workload's behalf (read-only, openat2-confined: absolute paths
+`RESOLVE_IN_ROOT` against the container root, relative paths
+`RESOLVE_BENEATH` the workload's own dirfd/cwd; the caller's own
+`RESOLVE_*` restrictions are OR'd in, never weakened) and injects the fd —
+the workload never exercises ambient authority for brokered calls. The
+judgment re-validates the notification id after pinning
+`/proc/<pid>/{mem,root}` (pid-reuse race from the kernel docs); the pins
+are cached per task id (`[broker] cache_max_tasks`, 0 = cold) behind a
+pidfd that pins the task struct, evicted when the task exits. Every
+decision is one JSON line in the container's `broker.log`
+(`/run/rauha/containers/<id>/`) — the seed for evidence projection. The
+admitted names live in `rauha_common::zone::BROKERABLE_SYSCALLS` (v1:
+`openat`, `openat2`); a name both denied and brokered is refused at
+policy-build time, and the shim's tests fail if the two crates drift.
 - Tests go in `#[cfg(test)]` modules within source files, not in separate test files.
 
 ## Workspace Crates

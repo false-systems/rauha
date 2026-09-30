@@ -191,6 +191,22 @@ pub fn start_with_crun(
         let log_dir = run_dir().join("containers").join(container_id);
         std::fs::create_dir_all(&log_dir)?;
 
+        // If the spec brokers syscalls (seccomp SCMP_ACT_NOTIFY with a
+        // listener path), start the broker thread before crun starts the
+        // container — crun's listener helper connects there at start.
+        // Every broker decision is appended to broker.log next to the
+        // container's stdout/stderr logs.
+        if let Some(listener_path) = broker_listener_path(spec_json) {
+            let decision_log = log_dir.join("broker.log");
+            std::thread::spawn(move || {
+                if let Err(error) = crate::broker::serve(&listener_path, &decision_log) {
+                    // The broker failing after judgments is survivable —
+                    // brokered calls then hang or EPERM — but say so.
+                    tracing::error!(%error, "seccomp broker exited with error");
+                }
+            });
+        }
+
         let status = runtime_command(&runtime_root)
             .args(crun_create_args(&bundle, &pid_file, container_id))
             .stdin(Stdio::null())
@@ -278,6 +294,14 @@ pub fn start_with_crun(
 #[cfg(target_os = "linux")]
 pub(crate) fn run_dir() -> PathBuf {
     PathBuf::from(std::env::var("RAUHA_RUN_DIR").unwrap_or_else(|_| "/run/rauha".into()))
+}
+
+/// Extract `linux.seccomp.listenerPath` from the OCI spec, if present.
+#[cfg(target_os = "linux")]
+fn broker_listener_path(spec_json: &str) -> Option<std::path::PathBuf> {
+    let spec: serde_json::Value = serde_json::from_str(spec_json).ok()?;
+    let path = spec.pointer("/linux/seccomp/listenerPath")?.as_str()?;
+    Some(std::path::PathBuf::from(path))
 }
 
 fn runtime_command(runtime_root: &Path) -> Command {

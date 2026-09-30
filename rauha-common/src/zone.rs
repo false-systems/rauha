@@ -256,7 +256,19 @@ pub struct DevicePolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyscallPolicy {
     pub deny: Vec<String>,
+    /// Syscalls brokered through the zone shim via seccomp-notify: the kernel
+    /// suspends the call, the shim judges it (deny, or open-and-inject an fd —
+    /// the workload never exercises ambient authority itself). Empty = off.
+    /// Only names in [`BROKERABLE_SYSCALLS`] are admitted; the shim judges
+    /// exactly that set (read-only opens, honest errnos).
+    pub broker: Vec<String>,
 }
+
+/// Syscall names the zone-shim seccomp broker can judge (read-only opens,
+/// satisfied by fd injection). The daemon refuses any other brokered name at
+/// policy-build time; the shim cross-checks the kernel numbers against this
+/// list in its tests so the two crates cannot drift.
+pub const BROKERABLE_SYSCALLS: &[&str] = &["openat", "openat2"];
 
 /// Configuration for creating a new zone.
 #[derive(Debug, Clone)]
@@ -403,7 +415,8 @@ pub struct PolicyFileDevices {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyFileSyscalls {
-    pub deny: Vec<String>,
+    pub deny: Option<Vec<String>>,
+    pub broker: Option<Vec<String>>,
 }
 
 const LINUX_CAPABILITIES: &[&str] = &[
@@ -630,7 +643,8 @@ impl PolicyFile {
             .syscalls
             .as_ref()
             .map(|s| SyscallPolicy {
-                deny: s.deny.clone(),
+                deny: s.deny.clone().unwrap_or_default(),
+                broker: s.broker.clone().unwrap_or_default(),
             })
             .unwrap_or_default();
 

@@ -1,0 +1,43 @@
+# Brokered-opens policy: every openat/openat2 in the zone suspends in the
+# kernel and is judged by the zone shim's seccomp broker. Read-only opens
+# inside the container are granted by fd injection (the workload never
+# exercises ambient authority for the call); everything else is answered
+# with an honest errno. Decisions are recorded per container in
+# /run/rauha/containers/<id>/broker.log.
+#
+# Admission is audit: the writable-paths control has no in-kernel backing
+# yet (see docs/positioning-and-roadmap.md), and this policy is exercised
+# on hosts whose kernels may skip BPF-LSM hooks.
+
+[zone]
+name = "broker"
+type = "non-global"
+
+[admission]
+mode = "audit"
+
+[capabilities]
+allowed = []
+
+[resources]
+cpu_shares = 512
+memory_limit = "1Gi"
+io_weight = 50
+pids_max = 128
+
+[network]
+mode = "isolated"
+allowed_zones = []
+allowed_egress = []
+allowed_ingress = []
+
+[filesystem]
+shared_layers = true
+writable_paths = []
+
+[devices]
+allowed = ["/dev/null", "/dev/zero", "/dev/urandom"]
+
+[syscalls]
+deny = []
+broker = ["openat", "openat2"]
