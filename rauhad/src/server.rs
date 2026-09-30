@@ -468,11 +468,24 @@ impl ZoneService for ZoneServiceImpl {
 
 pub struct ContainerServiceImpl {
     registry: Arc<ZoneRegistry>,
+    /// Enforcement event broadcast sender (Linux only, None on macOS) —
+    /// used to live-stream broker decisions for started containers.
+    #[cfg(target_os = "linux")]
+    event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
 }
 
 impl ContainerServiceImpl {
-    pub fn new(registry: Arc<ZoneRegistry>) -> Self {
-        Self { registry }
+    pub fn new(
+        registry: Arc<ZoneRegistry>,
+        #[cfg(target_os = "linux")] event_tx: Option<
+            tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>,
+        >,
+    ) -> Self {
+        Self {
+            registry,
+            #[cfg(target_os = "linux")]
+            event_tx,
+        }
     }
 }
 
@@ -524,6 +537,20 @@ impl ContainerService for ContainerServiceImpl {
             .start_container(&container_id)
             .await
             .map_err(to_status)?;
+
+        // Live-stream broker decisions for this container onto the event
+        // broadcast (no-op unless the zone brokers syscalls) — the same
+        // surface sandbox tasks get, so `rauha events` is consistent for
+        // every container regardless of how it was created.
+        #[cfg(target_os = "linux")]
+        if let Some(tx) = &self.event_tx {
+            crate::broker_events::spawn_broker_tailer(
+                std::sync::Arc::clone(&self.registry),
+                tx.clone(),
+                container_id,
+            )
+            .await;
+        }
 
         Ok(Response::new(pb::container::StartContainerResponse {}))
     }
@@ -1441,6 +1468,19 @@ impl SandboxServiceImpl {
             .await
             .map_err(|e| format!("failed to start container: {e}"))?;
         events.push(event("container.started", "sandbox container started"));
+        // Live-stream broker decisions for this container onto the event
+        // broadcast (no-op unless the zone brokers syscalls). The
+        // authoritative record for the result is the file read below —
+        // the broadcast can race the task's final decisions.
+        #[cfg(target_os = "linux")]
+        if let Some(tx) = &self.event_tx {
+            crate::broker_events::spawn_broker_tailer(
+                std::sync::Arc::clone(&self.registry),
+                tx.clone(),
+                *container_id,
+            )
+            .await;
+        }
         sandbox_event_builder(
             &self.registry,
             event_name::SANDBOX_CONTAINER_STARTED,
@@ -1530,6 +1570,19 @@ impl SandboxServiceImpl {
         })
         .await
         .unwrap_or_default();
+        // The broker decision record is read from the same shim-written
+        // directory, same cap: the file is the authoritative, complete,
+        // ordered record — the broadcast tailer is for live streaming only
+        // and its events are excluded from the drain below to avoid
+        // duplicates.
+        let cid = *container_id;
+        let run_dir = self.registry.config().paths.run_dir.clone();
+        let log_cap = self.registry.config().evidence.sandbox_log_max_bytes;
+        let broker_decisions = tokio::task::spawn_blocking(move || {
+            crate::broker_events::read_decisions_capped(&cid, &run_dir, log_cap)
+        })
+        .await
+        .unwrap_or_default();
         sandbox_event_builder(
             &self.registry,
             event_name::SANDBOX_STDOUT_CAPTURED,
@@ -1564,6 +1617,23 @@ impl SandboxServiceImpl {
         };
 
         let (enforcement_events, enforcement_drop_count) = drain_enforcement_capture(capture);
+        // Broker decisions join the result after the kernel enforcement
+        // events, in file (seq) order. The summary projection is the same
+        // one the broadcast path uses, so live events and result events
+        // show identical shapes.
+        let kernel_zone_id = self.registry.kernel_zone_id(zone_name).await;
+        let zone_label = match kernel_zone_id {
+            Some(id) => format!("zone-{id}"),
+            None => zone_id.to_string(),
+        };
+        let mut enforcement_events = enforcement_events;
+        enforcement_events.extend(broker_decisions.iter().map(|decision| {
+            project_enforcement_event(&rauha_evidence::broker_decision_event(
+                decision,
+                &zone_label,
+                kernel_zone_id.unwrap_or(0),
+            ))
+        }));
         sandbox_event_builder(
             &self.registry,
             event_name::SANDBOX_RESULT_BUILT,
@@ -1777,6 +1847,16 @@ fn drain_enforcement_capture(
 /// no events is safer than mis-attributing another zone's enforcement activity
 /// to this task's result.
 fn enforcement_event_matches(event: &FalseEvent, kernel_zone_id: Option<u32>) -> bool {
+    // Broker decisions arrive in the result via the authoritative file
+    // read, not the broadcast — including them here would duplicate every
+    // decision (the live tailer broadcasts the same lines for `rauha
+    // events`). Exclude by their hook marker.
+    if matches!(
+        event.fields.get("hook"),
+        Some(FieldValue::String(hook)) if hook == "seccomp_notify"
+    ) {
+        return false;
+    }
     let Some(zid) = kernel_zone_id else {
         return false;
     };
@@ -2330,6 +2410,25 @@ mod tests {
             .build()
             .expect("build lifecycle event");
         assert!(!enforcement_event_matches(&lifecycle, Some(7)));
+    }
+
+    #[test]
+    fn broker_decisions_do_not_match_the_broadcast_drain() {
+        // They arrive in the result via the authoritative file read;
+        // matching here would duplicate every decision.
+        let decision = rauha_evidence::BrokerDecision {
+            seq: 1,
+            ts_ms: 1,
+            notif_id: 1,
+            tid: 10,
+            syscall: "openat".into(),
+            path: "/a".into(),
+            decision: "granted".into(),
+            errno: 0,
+            reason: None,
+        };
+        let event = rauha_evidence::broker_decision_event(&decision, "zone-7", 7);
+        assert!(!enforcement_event_matches(&event, Some(7)));
     }
 
     #[test]

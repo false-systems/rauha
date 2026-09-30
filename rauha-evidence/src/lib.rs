@@ -114,6 +114,8 @@ pub mod event_name {
     pub const ZONE_IPC_DENIED: &str = "zone.ipc.denied";
     pub const ZONE_ESCAPE_CGROUP_ATTACH: &str = "zone.escape.cgroup_attach";
     pub const ZONE_NET_DENIED: &str = "zone.net.denied";
+    pub const ZONE_SYSCALL_BROKERED_DENIED: &str = "zone.syscall.brokered.denied";
+    pub const ZONE_SYSCALL_BROKERED_GRANTED: &str = "zone.syscall.brokered.granted";
     pub const ZONE_PROC_FILTERED: &str = "zone.proc.filtered";
     pub const ZONE_CREATED: &str = "zone.created";
     pub const ZONE_STARTED: &str = "zone.started";
@@ -134,6 +136,8 @@ pub mod event_name {
 }
 
 pub const BACKEND_LINUX_EBPF: &str = "linux-ebpf";
+/// The zone shim's seccomp-notify broker — the non-eBPF judgment surface.
+pub const BACKEND_SECCOMP_BROKER: &str = "linux-seccomp-broker";
 
 const MAX_FIELD_CHARS: usize = 4096;
 pub const RUNTIME_EVENT_VERSION: u32 = 1;
@@ -1170,6 +1174,24 @@ fn narrative_for(event: &str) -> FalseNarrative {
                 "escape attempt",
             ]),
         },
+        ZONE_SYSCALL_BROKERED_DENIED => FalseNarrative {
+            what_failed: "brokered syscall denied".into(),
+            why_it_matters: "the workload asked for authority the broker does not grant \
+                             (or the kernel returned an error the broker answered honestly)"
+                .into(),
+            possible_causes: causes(&[
+                "write attempt under a read-only broker policy",
+                "argument shape the kernel would reject",
+                "path outside the confined root",
+            ]),
+        },
+        ZONE_SYSCALL_BROKERED_GRANTED => FalseNarrative {
+            what_failed: "brokered syscall granted".into(),
+            why_it_matters: "the broker opened a confined read-only handle on the workload's \
+                             behalf — the workload never exercised ambient authority"
+                .into(),
+            possible_causes: causes(&["normal brokered access"]),
+        },
         ZONE_MOUNT_DENIED => FalseNarrative {
             what_failed: "zone mount denied".into(),
             why_it_matters: "mount operations can change the filesystem boundary".into(),
@@ -1211,8 +1233,15 @@ fn default_severity(event: &str) -> Severity {
     use event_name::*;
     match event {
         ZONE_ESCAPE_CGROUP_ATTACH | RINGBUF_DROP => Severity::Error,
-        ZONE_FILE_DENIED | ZONE_EXEC_DENIED | ZONE_PTRACE_DENIED | ZONE_SIGNAL_DENIED
-        | ZONE_MOUNT_DENIED | ZONE_IPC_DENIED | ZONE_NET_DENIED | PIPELINE_SHED => Severity::Warn,
+        ZONE_FILE_DENIED
+        | ZONE_EXEC_DENIED
+        | ZONE_PTRACE_DENIED
+        | ZONE_SIGNAL_DENIED
+        | ZONE_MOUNT_DENIED
+        | ZONE_IPC_DENIED
+        | ZONE_NET_DENIED
+        | ZONE_SYSCALL_BROKERED_DENIED
+        | PIPELINE_SHED => Severity::Warn,
         ZONE_FILE_ALLOWED | ZONE_PROC_FILTERED => Severity::Trace,
         _ => Severity::Info,
     }
@@ -1253,9 +1282,156 @@ fn display_field(value: &FieldValue) -> String {
     }
 }
 
+/// One decision line from the zone shim's seccomp broker
+/// (`/run/rauha/containers/<id>/broker.log`) — the raw record this crate
+/// normalizes. Field names are the shim's stable JSONL schema; see
+/// `rauha-shim/src/broker/decision.rs`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrokerDecision {
+    pub seq: u64,
+    /// Wall-clock judgment time, unix milliseconds.
+    pub ts_ms: u64,
+    pub notif_id: u64,
+    /// The workload thread that made the call.
+    pub tid: u32,
+    pub syscall: String,
+    /// Raw path bytes as UTF-8 (lossy in the shim's log).
+    pub path: String,
+    /// "granted" | "denied".
+    pub decision: String,
+    /// Positive errno; 0 for grants.
+    pub errno: i64,
+    pub reason: Option<String>,
+}
+
+impl BrokerDecision {
+    pub fn granted(&self) -> bool {
+        self.decision == "granted"
+    }
+}
+
+/// Normalize one broker decision into the evidence schema. Pure: the same
+/// line always yields the same event. `zone` is the identity label the
+/// caller resolved (kernel zone id when available, else the zone's UUID);
+/// `caller_zone` carries the kernel zone id (0 when unknown) so the
+/// daemon-side broadcast correlation can scope by zone.
+pub fn broker_decision_event(
+    decision: &BrokerDecision,
+    zone: &str,
+    caller_zone: u32,
+) -> FalseEvent {
+    let event_name = if decision.granted() {
+        event_name::ZONE_SYSCALL_BROKERED_GRANTED
+    } else {
+        event_name::ZONE_SYSCALL_BROKERED_DENIED
+    };
+    let mut event = FalseEventBuilder::new(event_name)
+        .zone(zone.to_string(), None)
+        .actor(format!("tid:{}", decision.tid), Vec::new())
+        .resource(format!("path:{}", decision.path))
+        .resource_attributes(ResourceAttrs::new(BACKEND_SECCOMP_BROKER))
+        .field("pid", FieldValue::U64(decision.tid as u64))
+        .field("hook", FieldValue::String("seccomp_notify".into()))
+        .field(
+            "decision",
+            FieldValue::String(if decision.granted() { "allow" } else { "deny" }.into()),
+        )
+        .field("caller_zone", FieldValue::U64(caller_zone as u64))
+        .field("syscall", FieldValue::String(decision.syscall.clone()))
+        .field("errno", FieldValue::I64(decision.errno))
+        .field("seq", FieldValue::U64(decision.seq))
+        .field(
+            "reason",
+            FieldValue::String(decision.reason.clone().unwrap_or_default()),
+        )
+        .field("ts_ms", FieldValue::U64(decision.ts_ms))
+        .build()
+        .unwrap_or_else(|e| {
+            tracing::error!(%e, "failed to normalize broker decision");
+            pipeline_shed_event("normalization_failed", BACKEND_SECCOMP_BROKER)
+        });
+    // The event's timestamp is the judgment time from the record — not
+    // ingestion time. Evidence that claims "when" must say when it
+    // happened, not when we happened to read about it. (Fallback: the
+    // builder's now() if the millis cannot convert.)
+    if let Some(judged_at) = chrono::DateTime::from_timestamp_millis(decision.ts_ms as i64) {
+        event.ts = judged_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    }
+    event
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broker_decision_round_trips_the_shims_log_line() {
+        // A byte-exact line from a live container's broker.log (the schema
+        // is pinned by the shim's own record test).
+        let line = r#"{"seq":1,"ts_ms":1790691636813,"notif_id":12798333422445265481,"tid":39559,"syscall":"openat","path":"/tmp/broker-write-test","decision":"denied","errno":1,"reason":"not read-only"}"#;
+        let decision: BrokerDecision = serde_json::from_str(line).unwrap();
+        assert!(!decision.granted());
+        assert_eq!(decision.path, "/tmp/broker-write-test");
+    }
+
+    #[test]
+    fn broker_decision_event_projects_into_the_evidence_schema() {
+        let decision = BrokerDecision {
+            seq: 7,
+            ts_ms: 1790691636813,
+            notif_id: 42,
+            tid: 1234,
+            syscall: "openat".into(),
+            path: "/etc/hostname".into(),
+            decision: "granted".into(),
+            errno: 0,
+            reason: None,
+        };
+        let event = broker_decision_event(&decision, "zone-3", 3);
+        assert_eq!(event.event, event_name::ZONE_SYSCALL_BROKERED_GRANTED);
+        assert_eq!(event.zone.id, "zone-3");
+        assert_eq!(event.resource.as_deref(), Some("path:/etc/hostname"));
+        assert_eq!(event.fields.get("caller_zone"), Some(&FieldValue::U64(3)));
+        assert_eq!(
+            event.fields.get("hook"),
+            Some(&FieldValue::String("seccomp_notify".into()))
+        );
+        assert_eq!(
+            event.fields.get("decision"),
+            Some(&FieldValue::String("allow".into()))
+        );
+        assert_eq!(event.fields.get("pid"), Some(&FieldValue::U64(1234)));
+        assert_eq!(event.backend, BACKEND_SECCOMP_BROKER);
+        assert!(!event.what_failed.is_empty(), "narrative is filled");
+        // The timestamp is the judgment time from the record, not ingestion
+        // time — evidence must say when it happened.
+        let expected = chrono::DateTime::from_timestamp_millis(1_790_691_636_813_i64)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert_eq!(event.ts, expected);
+    }
+
+    #[test]
+    fn broker_denial_event_carries_the_reason() {
+        let decision = BrokerDecision {
+            seq: 8,
+            ts_ms: 1,
+            notif_id: 2,
+            tid: 3,
+            syscall: "openat2".into(),
+            path: "/x".into(),
+            decision: "denied".into(),
+            errno: 2,
+            reason: Some("open failed".into()),
+        };
+        let event = broker_decision_event(&decision, "zone-0", 0);
+        assert_eq!(event.event, event_name::ZONE_SYSCALL_BROKERED_DENIED);
+        assert_eq!(
+            event.fields.get("reason"),
+            Some(&FieldValue::String("open failed".into()))
+        );
+        assert_eq!(event.fields.get("errno"), Some(&FieldValue::I64(2)));
+    }
 
     #[test]
     fn metric_labels_reject_high_cardinality() {

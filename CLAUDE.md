@@ -265,7 +265,11 @@ judgment re-validates the notification id after pinning
 are cached per task id (`[broker] cache_max_tasks`, 0 = cold) behind a
 pidfd that pins the task struct, evicted when the task exits. Every
 decision is one JSON line in the container's `broker.log`
-(`/run/rauha/containers/<id>/`) — the seed for evidence projection. The
+(`/run/rauha/containers/<id>/`) and is projected by rauhad into evidence
+events (`zone.syscall.brokered.granted`/`.denied`, backend
+`linux-seccomp-broker`): a live tailer broadcasts them on `rauha events`,
+and sandbox results carry them as enforcement events (`hook:
+seccomp_notify`) read authoritatively from the file at result time. The
 admitted names live in `rauha_common::zone::BROKERABLE_SYSCALLS` (v1:
 `openat`, `openat2`); a name both denied and brokered is refused at
 policy-build time, and the shim's tests fail if the two crates drift.

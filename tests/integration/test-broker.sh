@@ -89,4 +89,48 @@ else
     exit 1
 fi
 
+echo "8. Broker decisions surface in the sandbox result as enforcement events..."
+JSON=$($RAUHA --json sandbox --name "$ZONE_NAME" --image "$IMAGE" --timeout 30 \
+    -- /bin/cat /etc/hostname)
+if echo "$JSON" | grep -q '"hook":"seccomp_notify"' \
+    && echo "$JSON" | grep -q '"action":"zone.syscall.brokered.granted"'; then
+    echo "   enforcement event in result (OK)"
+else
+    echo "   FAIL: sandbox result did not carry broker decisions as enforcement events"
+    echo "$JSON" | head -5
+    exit 1
+fi
+
+echo "9. Broker decisions stream live on rauha events..."
+EVENTS_OUT=$(mktemp /tmp/rauha-events-XXXXXX.jsonl)
+(timeout 12 $RAUHA events --json >"$EVENTS_OUT" 2>/dev/null || true) &
+EVENTS_PID=$!
+sleep 1
+$RAUHA sandbox --name "$ZONE_NAME" --image "$IMAGE" --timeout 30 \
+    -- /bin/cat /etc/hostname >/dev/null 2>&1 || true
+wait "$EVENTS_PID" 2>/dev/null || true
+if grep -q 'zone.syscall.brokered' "$EVENTS_OUT"; then
+    echo "   live event seen (OK)"
+    grep -m 1 -o '"event":"zone.syscall.brokered[^"]*"' "$EVENTS_OUT" | sed 's/^/     /'
+else
+    echo "   FAIL: no zone.syscall.brokered event on the events stream"
+    exit 1
+fi
+rm -f "$EVENTS_OUT"
+
+echo "10. run-created containers stream broker decisions too..."
+EVENTS_OUT=$(mktemp /tmp/rauha-events-XXXXXX.jsonl)
+(timeout 12 $RAUHA events --json >"$EVENTS_OUT" 2>/dev/null || true) &
+EVENTS_PID=$!
+sleep 1
+$RAUHA run --zone "$ZONE_NAME" "$IMAGE" /bin/cat /etc/hostname >/dev/null 2>&1 || true
+wait "$EVENTS_PID" 2>/dev/null || true
+if grep -q 'zone.syscall.brokered' "$EVENTS_OUT"; then
+    echo "   live event from run container (OK)"
+else
+    echo "   FAIL: no brokered event for a run-created container"
+    exit 1
+fi
+rm -f "$EVENTS_OUT"
+
 echo "=== PASS: seccomp-notify FD broker ==="
