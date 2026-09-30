@@ -118,4 +118,19 @@ else
 fi
 rm -f "$EVENTS_OUT"
 
+echo "10. run-created containers stream broker decisions too..."
+EVENTS_OUT=$(mktemp /tmp/rauha-events-XXXXXX.jsonl)
+(timeout 12 $RAUHA events --json >"$EVENTS_OUT" 2>/dev/null || true) &
+EVENTS_PID=$!
+sleep 1
+$RAUHA run --zone "$ZONE_NAME" "$IMAGE" /bin/cat /etc/hostname >/dev/null 2>&1 || true
+wait "$EVENTS_PID" 2>/dev/null || true
+if grep -q 'zone.syscall.brokered' "$EVENTS_OUT"; then
+    echo "   live event from run container (OK)"
+else
+    echo "   FAIL: no brokered event for a run-created container"
+    exit 1
+fi
+rm -f "$EVENTS_OUT"
+
 echo "=== PASS: seccomp-notify FD broker ==="

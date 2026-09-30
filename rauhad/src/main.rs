@@ -137,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
     let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone(), event_tx.clone());
     #[cfg(not(target_os = "linux"))]
     let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone());
+    #[cfg(target_os = "linux")]
+    let container_svc = server::ContainerServiceImpl::new(registry.clone(), event_tx.clone());
+    #[cfg(not(target_os = "linux"))]
     let container_svc = server::ContainerServiceImpl::new(registry.clone());
     let image_svc = server::ImageServiceImpl::new(image_service);
     #[cfg(target_os = "linux")]

@@ -468,11 +468,24 @@ impl ZoneService for ZoneServiceImpl {
 
 pub struct ContainerServiceImpl {
     registry: Arc<ZoneRegistry>,
+    /// Enforcement event broadcast sender (Linux only, None on macOS) —
+    /// used to live-stream broker decisions for started containers.
+    #[cfg(target_os = "linux")]
+    event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
 }
 
 impl ContainerServiceImpl {
-    pub fn new(registry: Arc<ZoneRegistry>) -> Self {
-        Self { registry }
+    pub fn new(
+        registry: Arc<ZoneRegistry>,
+        #[cfg(target_os = "linux")] event_tx: Option<
+            tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>,
+        >,
+    ) -> Self {
+        Self {
+            registry,
+            #[cfg(target_os = "linux")]
+            event_tx,
+        }
     }
 }
 
@@ -526,11 +539,18 @@ impl ContainerService for ContainerServiceImpl {
             .map_err(to_status)?;
 
         // Live-stream broker decisions for this container onto the event
-        // broadcast (no-op unless the zone brokers syscalls). The
-        // ContainerService does not hold the broadcast handle — the
-        // sandbox path and the zone event stream cover the product
-        // surfaces; `rauha events` for run-created containers rides the
-        // sandbox/zone paths' tailers.
+        // broadcast (no-op unless the zone brokers syscalls) — the same
+        // surface sandbox tasks get, so `rauha events` is consistent for
+        // every container regardless of how it was created.
+        #[cfg(target_os = "linux")]
+        if let Some(tx) = &self.event_tx {
+            crate::broker_events::spawn_broker_tailer(
+                std::sync::Arc::clone(&self.registry),
+                tx.clone(),
+                container_id,
+            )
+            .await;
+        }
 
         Ok(Response::new(pb::container::StartContainerResponse {}))
     }
