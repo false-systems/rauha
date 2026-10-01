@@ -105,6 +105,7 @@ impl ShimState {
     pub fn stop_container(&mut self, id: &str, signal: i32) -> anyhow::Result<()> {
         const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+        self.reap_children();
         self.signal_container(id, signal)?;
         let proc = self
             .containers
