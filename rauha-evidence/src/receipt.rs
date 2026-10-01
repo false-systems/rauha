@@ -44,6 +44,9 @@ pub struct ExecutionReceiptPayload {
     pub finished_at: Option<String>,
     pub enforcement: EnforcementTotals,
     pub unavailable_controls: Vec<String>,
+    /// Omit when empty to preserve verification of existing v1 receipts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capture_issues: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +267,7 @@ mod tests {
             finished_at: None,
             enforcement: EnforcementTotals::default(),
             unavailable_controls: Vec::new(),
+            capture_issues: Vec::new(),
         }
     }
 
@@ -279,6 +283,15 @@ mod tests {
         receipt.verify_trusted(&trusted).unwrap();
         receipt.payload.status = "failed".into();
         assert!(receipt.verify().is_err());
+        let mut receipt = signer.sign(payload());
+        receipt
+            .payload
+            .capture_issues
+            .push("stdout.storage_incomplete".into());
+        assert!(
+            receipt.verify().is_err(),
+            "capture completeness must be signed"
+        );
     }
 
     #[test]

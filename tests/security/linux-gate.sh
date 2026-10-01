@@ -105,6 +105,11 @@ for test_script in tests/integration/*.sh; do
     fi
 done
 
+# Keep the Rust output and raw broker-record regression mandatory.
+LIVE_OUTPUT_TEST=$(cargo test --quiet -p rauhad --test runtime_output --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "runtime_output") | .executable // empty')
+sudo env RAUHA_TEST_RUN_DIR=/run/rauha RAUHA_TEST_ENDPOINT="$RAUHA_ADDR" \
+    timeout --foreground --kill-after=5s "$TEST_TIMEOUT" "$LIVE_OUTPUT_TEST" hostile_output --ignored --nocapture --test-threads=1
+
 # Prove crash recovery against live kernel state, not only serialized metadata.
 RECOVERY_STATE="$RUN_ROOT/recovery-probe.state"
 sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" TEST_IMAGE="$TEST_IMAGE" \
@@ -113,6 +118,7 @@ crash_daemon
 start_daemon
 sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" TEST_IMAGE="$TEST_IMAGE" \
     bash "$ROOT/tests/security/recovery-probe.sh" verify "$RECOVERY_STATE"
+sudo env RAUHA_TEST_RECOVERY_STATE="$RECOVERY_STATE" "$LIVE_OUTPUT_TEST" recovered_shim_cleanup --ignored --nocapture
 
 # Prove the production two-phase OCI handoff against a Rauha-prepared rootfs.
 sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" TEST_IMAGE="$TEST_IMAGE" \

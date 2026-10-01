@@ -259,6 +259,7 @@ mod tests {
             finished_at: Some("2026-09-28T10:00:01Z".into()),
             enforcement: Default::default(),
             unavailable_controls: vec!["ebpf:cgroup_attach_task".into()],
+            capture_issues: Vec::new(),
         }
     }
 

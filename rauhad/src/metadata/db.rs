@@ -14,11 +14,23 @@ const CONTAINERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("con
 /// Stores zone and container metadata with ACID transactions.
 /// redb is pure Rust, zero C deps — aligns with Rauha's dependency philosophy.
 pub struct MetadataStore {
-    db: Arc<Database>,
+    pub(super) db: Arc<Database>,
 }
 
 impl MetadataStore {
     pub fn open(path: &Path) -> Result<Self> {
+        // This database also holds workload output. Create it privately and
+        // tighten databases made by older versions before adding result data.
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        drop(file);
         let db = Database::create(path).map_err(|e| RauhaError::MetadataError(e.to_string()))?;
 
         // Ensure tables exist.
@@ -31,6 +43,9 @@ impl MetadataStore {
                 .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
             let _ = write_txn
                 .open_table(CONTAINERS_TABLE)
+                .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
+            write_txn
+                .open_table(super::results::RESULTS_TABLE)
                 .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
         }
         write_txn

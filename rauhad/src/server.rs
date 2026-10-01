@@ -1,3 +1,4 @@
+use prost::Message;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -1228,6 +1229,27 @@ pub struct SandboxServiceImpl {
     /// results carry no enforcement events.
     event_tx: Option<tokio::sync::broadcast::Sender<FalseEvent>>,
     receipt_signer: ReceiptSigner,
+    active_tasks: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+struct ActiveTask<'a> {
+    tasks: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    id: String,
+}
+
+impl Drop for ActiveTask<'_> {
+    fn drop(&mut self) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+fn valid_task_id(id: &str) -> bool {
+    id.strip_prefix("task-")
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .is_some_and(|uuid| id == format!("task-{uuid}"))
 }
 
 struct ContainerCleanupGuard {
@@ -1320,6 +1342,7 @@ impl SandboxServiceImpl {
             registry,
             event_tx,
             receipt_signer,
+            active_tasks: Default::default(),
         }
     }
 
@@ -1565,24 +1588,50 @@ impl SandboxServiceImpl {
         let cid = container_id.to_string();
         let run_dir = self.registry.config().paths.run_dir.clone();
         let log_cap = self.registry.config().evidence.sandbox_log_max_bytes;
-        let (stdout, stderr) = tokio::task::spawn_blocking(move || {
+        let captured = tokio::task::spawn_blocking(move || {
             crate::logs::read_all_capped(&cid, &run_dir, log_cap)
         })
         .await
-        .unwrap_or_default();
+        .map_err(|e| format!("output capture failed: {e}"))?;
+        let crate::logs::CapturedLogs {
+            stdout,
+            stderr,
+            issues: mut capture_issues,
+        } = captured;
         // The broker decision record is read from the same shim-written
-        // directory, same cap: the file is the authoritative, complete,
-        // ordered record — the broadcast tailer is for live streaming only
+        // directory, same cap: the file is the ordered capture, with any
+        // loss reported explicitly — the broadcast tailer is for streaming only
         // and its events are excluded from the drain below to avoid
         // duplicates.
         let cid = *container_id;
         let run_dir = self.registry.config().paths.run_dir.clone();
         let log_cap = self.registry.config().evidence.sandbox_log_max_bytes;
-        let broker_decisions = tokio::task::spawn_blocking(move || {
-            crate::broker_events::read_decisions_capped(&cid, &run_dir, log_cap)
+        let (broker_decisions, broker_issues) = tokio::task::spawn_blocking(move || {
+            let mut issues = Vec::new();
+            let decisions =
+                crate::broker_events::read_decisions_capped(&cid, &run_dir, log_cap, &mut issues);
+            (decisions, issues)
         })
         .await
-        .unwrap_or_default();
+        .map_err(|e| format!("broker capture failed: {e}"))?;
+        capture_issues.extend(broker_issues);
+        if !self
+            .registry
+            .get_zone(zone_name)
+            .await
+            .map_err(|e| e.to_string())?
+            .policy
+            .syscalls
+            .broker
+            .is_empty()
+            && !std::path::Path::new(&self.registry.config().paths.run_dir)
+                .join("containers")
+                .join(container_id.to_string())
+                .join("broker.log")
+                .exists()
+        {
+            capture_issues.push("broker.unavailable".into());
+        }
         sandbox_event_builder(
             &self.registry,
             event_name::SANDBOX_STDOUT_CAPTURED,
@@ -1593,7 +1642,20 @@ impl SandboxServiceImpl {
         )
         .container_id(container_id.to_string())
         .field("bytes", FieldValue::U64(stdout.len() as u64))
-        .trust_level(TrustLevel::Complete)
+        .trust_level(
+            if capture_issues
+                .iter()
+                .any(|issue| issue.starts_with("stdout."))
+            {
+                TrustLevel::Partial
+            } else {
+                TrustLevel::Complete
+            },
+        )
+        .field(
+            "capture_issues",
+            FieldValue::String(capture_issues.join(",")),
+        )
         .emit();
         sandbox_event_builder(
             &self.registry,
@@ -1605,7 +1667,20 @@ impl SandboxServiceImpl {
         )
         .container_id(container_id.to_string())
         .field("bytes", FieldValue::U64(stderr.len() as u64))
-        .trust_level(TrustLevel::Complete)
+        .trust_level(
+            if capture_issues
+                .iter()
+                .any(|issue| issue.starts_with("stderr."))
+            {
+                TrustLevel::Partial
+            } else {
+                TrustLevel::Complete
+            },
+        )
+        .field(
+            "capture_issues",
+            FieldValue::String(capture_issues.join(",")),
+        )
         .emit();
 
         let status = if timed_out {
@@ -1669,6 +1744,7 @@ impl SandboxServiceImpl {
             // Drain the events that landed on this task's zone while it ran.
             enforcement_events,
             enforcement_drop_count,
+            capture_issues,
         })
     }
 
@@ -1906,6 +1982,12 @@ fn project_enforcement_event(event: &FalseEvent) -> EnforcementEventSummary {
 /// Validate the request before touching any zone/container state.
 #[allow(clippy::result_large_err)] // `tonic::Status` is the handler's native error type.
 fn validate_sandbox_request(req: &pb::sandbox::RunSandboxRequest) -> Result<(), Status> {
+    // Reserve most of the reply for output/evidence rather than echoed argv.
+    if req.encoded_len() > rauha_common::sandbox::MAX_RESULT_BYTES / 4 {
+        return Err(Status::invalid_argument(
+            "sandbox request exceeds the metadata budget (1 MiB)",
+        ));
+    }
     if req.image.trim().is_empty() {
         return Err(Status::invalid_argument("image is required"));
     }
@@ -1992,11 +2074,167 @@ fn to_proto_result(
         unavailable_controls,
         receipt_json,
         receipt_dsse_json,
+        capture_issues: exec.capture_issues,
+    }
+}
+
+/// Budget the actual protobuf, including both signatures. Any reduction is
+/// recorded before re-signing, so the receipt always hashes the delivered text.
+fn seal_bounded_result(
+    mut result: pb::sandbox::SandboxResult,
+    mut payload: ExecutionReceiptPayload,
+    signer: &ReceiptSigner,
+) -> Result<pb::sandbox::SandboxResult, String> {
+    loop {
+        result.capture_issues.sort();
+        result.capture_issues.dedup();
+        payload.capture_issues = result.capture_issues.clone();
+        payload.outputs_sha256 = sha256_json(&serde_json::json!({
+            "salt": result.task_id,
+            "status": result.status,
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }))
+        .map_err(|e| e.to_string())?;
+        let receipt = signer.sign(payload.clone());
+        receipt.verify().map_err(|e| e.to_string())?;
+        result.receipt_json = serde_json::to_string(&receipt).map_err(|e| e.to_string())?;
+        result.receipt_dsse_json =
+            serde_json::to_string(&signer.sign_dsse(payload.clone())).map_err(|e| e.to_string())?;
+        if result.encoded_len() <= rauha_common::sandbox::MAX_RESULT_BYTES {
+            return Ok(result);
+        }
+        if !result.enforcement_events.is_empty() {
+            result
+                .enforcement_events
+                .truncate(result.enforcement_events.len() / 2);
+            result
+                .capture_issues
+                .push("enforcement_events.preview_truncated".into());
+        } else if !result.stdout.is_empty() || !result.stderr.is_empty() {
+            let (text, stream) = if result.stdout.len() >= result.stderr.len() {
+                (&mut result.stdout, "stdout")
+            } else {
+                (&mut result.stderr, "stderr")
+            };
+            crate::logs::truncate_utf8(text, text.len() / 2);
+            result
+                .capture_issues
+                .push(format!("{stream}.preview_truncated"));
+        } else {
+            return Err("sandbox result metadata exceeds the wire budget".into());
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_output_and_events_fit_and_receipts_cover_the_delivered_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = ReceiptSigner::load_or_create(&dir.path().join("key")).unwrap();
+        let result = pb::sandbox::SandboxResult {
+            task_id: "task-budget".into(),
+            status: "succeeded".into(),
+            exit_code: Some(0),
+            stdout: "�".repeat(1024 * 1024),
+            stderr: "�".repeat(1024 * 1024),
+            enforcement_events: vec![pb::sandbox::EnforcementEventSummary {
+                message: "x".repeat(5 * 1024 * 1024),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let payload = ExecutionReceiptPayload {
+            schema: EXECUTION_RECEIPT_SCHEMA.into(),
+            task_id: result.task_id.clone(),
+            zone_id: String::new(),
+            image: ImageAdmission {
+                reference: "test".into(),
+                manifest_digest: String::new(),
+                digest_verified: false,
+            },
+            policy_sha256: String::new(),
+            inputs_sha256: String::new(),
+            outputs_sha256: String::new(),
+            status: result.status.clone(),
+            exit_code: result.exit_code,
+            started_at: None,
+            finished_at: None,
+            enforcement: Default::default(),
+            unavailable_controls: Vec::new(),
+            capture_issues: Vec::new(),
+        };
+        let result = seal_bounded_result(result, payload, &signer).unwrap();
+        assert!(result.encoded_len() <= rauha_common::sandbox::MAX_RESULT_BYTES);
+        assert!(!result.capture_issues.is_empty());
+        let receipt: rauha_evidence::receipt::SignedExecutionReceipt =
+            serde_json::from_str(&result.receipt_json).unwrap();
+        receipt.verify().unwrap();
+        assert_eq!(receipt.payload.capture_issues, result.capture_issues);
+        assert_eq!(
+            receipt.payload.outputs_sha256,
+            sha256_json(&serde_json::json!({
+                "salt": result.task_id, "status": result.status, "exit_code": result.exit_code,
+                "stdout": result.stdout, "stderr": result.stderr,
+            }))
+            .unwrap()
+        );
+        let dsse: rauha_evidence::dsse::DsseEnvelope =
+            serde_json::from_str(&result.receipt_dsse_json).unwrap();
+        dsse.verify_public_hex(&receipt.public_key).unwrap();
     }
 }
 
 #[tonic::async_trait]
 impl SandboxService for SandboxServiceImpl {
+    async fn get_sandbox_result(
+        &self,
+        request: Request<pb::sandbox::SandboxResultRequest>,
+    ) -> Result<Response<pb::sandbox::SandboxResult>, Status> {
+        let id = request.into_inner().task_id;
+        if !valid_task_id(&id) {
+            return Err(Status::invalid_argument("expected task-<UUID>"));
+        }
+        let bytes = self
+            .registry
+            .metadata()
+            .get_result(&id)
+            .map_err(to_internal_status)?
+            .ok_or_else(|| Status::not_found("task result not found"))?;
+        if bytes.is_empty() {
+            return Err(Status::failed_precondition("task has no completed result: still running or interrupted; do not assume it had no effects"));
+        }
+        let result =
+            pb::sandbox::SandboxResult::decode(bytes.as_slice()).map_err(to_internal_status)?;
+        Ok(Response::new(result))
+    }
+
+    async fn delete_sandbox_result(
+        &self,
+        request: Request<pb::sandbox::SandboxResultRequest>,
+    ) -> Result<Response<pb::sandbox::DeleteSandboxResultResponse>, Status> {
+        let id = request.into_inner().task_id;
+        if !valid_task_id(&id) {
+            return Err(Status::invalid_argument("expected task-<UUID>"));
+        }
+        let tasks = self.active_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if tasks.contains(&id) {
+            return Err(Status::failed_precondition("task is still active"));
+        }
+        let deleted = self
+            .registry
+            .metadata()
+            .delete_result(&id)
+            .map_err(to_internal_status)?;
+        Ok(Response::new(pb::sandbox::DeleteSandboxResultResponse {
+            deleted,
+        }))
+    }
+
     async fn run_sandbox(
         &self,
         request: Request<pb::sandbox::RunSandboxRequest>,
@@ -2009,7 +2247,11 @@ impl SandboxService for SandboxServiceImpl {
         async move {
             tracing::info!(event.name = "grpc.request.started", "grpc request started");
             let req = request.into_inner();
-            let task_id = format!("task-{}", uuid::Uuid::new_v4());
+            let task_id = if req.task_id.is_empty() {
+                format!("task-{}", uuid::Uuid::new_v4())
+            } else {
+                req.task_id.clone()
+            };
             RuntimeEventBuilder::new(
                 event_name::SANDBOX_RUN_STARTED,
                 EventKind::Execution,
@@ -2056,6 +2298,27 @@ impl SandboxService for SandboxServiceImpl {
             // Resolve the zone. An empty name allocates a temporary zone that we own
             // and (by default) delete afterwards; a named zone must already exist
             // and is left intact.
+            if !valid_task_id(&task_id) {
+                return Err(Status::invalid_argument("expected task-<UUID>"));
+            }
+            {
+                let mut tasks = self.active_tasks.lock().unwrap_or_else(|e| e.into_inner());
+                if !self
+                    .registry
+                    .metadata()
+                    .reserve_result(&task_id, self.registry.config().evidence.results_max_bytes)
+                    .map_err(|e| Status::resource_exhausted(e.to_string()))?
+                {
+                    return Err(Status::already_exists(
+                        "task identifier already used; retrieve its result instead of re-executing",
+                    ));
+                }
+                tasks.insert(task_id.clone());
+            }
+            let _active = ActiveTask {
+                tasks: &self.active_tasks,
+                id: task_id.clone(),
+            };
             let (zone_name, zone_id, temp_zone, policy) = if req.name.trim().is_empty() {
                 let name = format!(
                     "sandbox-{}",
@@ -2184,7 +2447,7 @@ impl SandboxService for SandboxServiceImpl {
                 SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
             });
             let receipt_env = req.env.iter().collect::<std::collections::BTreeMap<_, _>>();
-            let receipt = self.receipt_signer.sign(ExecutionReceiptPayload {
+            let receipt_payload = ExecutionReceiptPayload {
                 schema: EXECUTION_RECEIPT_SCHEMA.into(),
                 task_id: task_id.clone(),
                 zone_id: zone_id.clone(),
@@ -2224,13 +2487,8 @@ impl SandboxService for SandboxServiceImpl {
                     exec.enforcement_drop_count,
                 ),
                 unavailable_controls: unavailable_controls.clone(),
-            });
-            receipt.verify().map_err(to_internal_status)?;
-            let receipt_json = serde_json::to_string(&receipt).map_err(to_internal_status)?;
-            // The same receipt as a DSSE in-toto statement: spec-compliant
-            // PAE signing, verifiable by ecosystem tooling unchanged.
-            let dsse = self.receipt_signer.sign_dsse(receipt.payload.clone());
-            let receipt_dsse_json = serde_json::to_string(&dsse).map_err(to_internal_status)?;
+                capture_issues: exec.capture_issues.clone(),
+            };
             let run_event = match exec.status {
                 SandboxStatus::Succeeded => (
                     event_name::SANDBOX_RUN_SUCCEEDED,
@@ -2280,13 +2538,20 @@ impl SandboxService for SandboxServiceImpl {
             .degraded_reason("enforcement_events_are_best_effort")
             .emit();
 
-            Ok(Response::new(to_proto_result(
+            let result = to_proto_result(
                 exec,
                 admission,
                 unavailable_controls,
-                receipt_json,
-                receipt_dsse_json,
-            )))
+                String::new(),
+                String::new(),
+            );
+            let result = seal_bounded_result(result, receipt_payload, &self.receipt_signer)
+                .map_err(to_internal_status)?;
+            self.registry
+                .metadata()
+                .save_result(&task_id, &result.encode_to_vec())
+                .map_err(to_internal_status)?;
+            Ok(Response::new(result))
         }
         .instrument(span)
         .await

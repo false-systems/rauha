@@ -27,6 +27,8 @@ enum Commands {
     },
     /// Run an agent task in a sandbox zone, capturing output and events
     Sandbox(commands::sandbox::SandboxArgs),
+    /// Retrieve a saved sandbox result without re-running the task.
+    SandboxResult(commands::sandbox::SandboxResultArgs),
     /// Verify a signed execution receipt
     Receipt(commands::receipt::ReceiptArgs),
     /// Run a container in a zone
@@ -95,6 +97,7 @@ async fn main() {
     let result = match cli.command {
         Commands::Zone { action } => commands::zone::handle(action, out).await,
         Commands::Sandbox(args) => commands::sandbox::handle_sandbox(args, out).await,
+        Commands::SandboxResult(args) => commands::sandbox::handle_result(args, out).await,
         Commands::Receipt(args) => commands::receipt::verify(args, out),
         Commands::Run(args) => commands::run::handle_run(args, out).await,
         Commands::Ps(args) => commands::run::handle_ps(args, out).await,

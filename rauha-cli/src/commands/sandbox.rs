@@ -30,6 +30,9 @@ fn parse_env_pair(value: &str) -> Result<(String, String), String> {
 
 #[derive(Args)]
 pub struct SandboxArgs {
+    /// Stable task-<UUID> for result retrieval; an existing ID never re-executes.
+    #[arg(long)]
+    pub task_id: Option<String>,
     /// Container image to run the task in.
     #[arg(long)]
     pub image: String,
@@ -70,6 +73,11 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
     // "image not pulled" from the container-create path.
     pull_if_absent(channel, &args.image, out).await?;
 
+    let task_id = args
+        .task_id
+        .unwrap_or_else(|| format!("task-{}", uuid::Uuid::new_v4()));
+    eprintln!("task: {task_id} (retrieve with: rauha sandbox-result {task_id})");
+
     let request = pb::sandbox::RunSandboxRequest {
         image: args.image,
         command: args.command,
@@ -80,6 +88,7 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         timeout_seconds: args.timeout,
         env: args.env.into_iter().collect(),
         audit: args.audit,
+        task_id,
     };
 
     // Strip the tonic Status wrapper so the user sees the daemon's message,
@@ -92,6 +101,45 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         .map_err(|s| anyhow::anyhow!("{}", s.message()))?
         .into_inner();
 
+    print_result(result, out)
+}
+
+#[derive(Args)]
+pub struct SandboxResultArgs {
+    pub task_id: String,
+    /// Explicitly discard a retained result or an interrupted reservation.
+    #[arg(long)]
+    pub delete: bool,
+}
+
+pub async fn handle_result(args: SandboxResultArgs, out: OutputMode) -> anyhow::Result<()> {
+    let mut client = SandboxServiceClient::new(super::connect().await?);
+    let request = pb::sandbox::SandboxResultRequest {
+        task_id: args.task_id,
+    };
+    if args.delete {
+        let response = client
+            .delete_sandbox_result(request)
+            .await
+            .map_err(|s| anyhow::anyhow!("{}", s.message()))?
+            .into_inner();
+        output::print(
+            out,
+            &serde_json::json!({"deleted":response.deleted}),
+            || println!("deleted: {}", response.deleted),
+        );
+        Ok(())
+    } else {
+        let result = client
+            .get_sandbox_result(request)
+            .await
+            .map_err(|s| anyhow::anyhow!("{}", s.message()))?
+            .into_inner();
+        print_result(result, out)
+    }
+}
+
+fn print_result(result: pb::sandbox::SandboxResult, out: OutputMode) -> anyhow::Result<()> {
     // `rauha sandbox` mirrors the task: its exit code is the task's exit code.
     // When the task produced no code (timed out, or never started), map the
     // status to a conventional code: 137 (SIGKILL) for timeout, 1 otherwise.
@@ -121,6 +169,7 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         duration_ms: result.duration_ms,
         admission: result.admission,
         unavailable_controls: result.unavailable_controls,
+        capture_issues: result.capture_issues,
         events: result
             .events
             .into_iter()
@@ -181,6 +230,9 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
                 "degraded controls: {}",
                 view.unavailable_controls.join(", ")
             );
+        }
+        if !view.capture_issues.is_empty() {
+            eprintln!("capture incomplete: {}", view.capture_issues.join(", "));
         }
     });
 
@@ -315,6 +367,7 @@ mod tests {
                 finished_at: None,
                 enforcement: EnforcementTotals::default(),
                 unavailable_controls: Vec::new(),
+                capture_issues: Vec::new(),
             };
             let receipt = signer.sign(payload.clone());
             let dsse = signer.sign_dsse(payload);

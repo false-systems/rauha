@@ -102,8 +102,6 @@ pub struct LinuxBackend {
     zone_id_map: Mutex<HashMap<Uuid, u32>>,
     /// Maps zone name → Uuid for reverse lookups.
     zone_name_map: Mutex<HashMap<String, Uuid>>,
-    /// Shim connections per zone.
-    shim_connections: Mutex<HashMap<String, ShimConnection>>,
     /// Registered inodes per zone, for correct cleanup without re-walking.
     /// Key is zone name, value is the inode list registered in INODE_ZONE_MAP.
     registered_inodes: Mutex<HashMap<String, Vec<u64>>>,
@@ -156,7 +154,6 @@ impl LinuxBackend {
             next_zone_id: AtomicU32::new(1), // 0 is reserved for "no zone".
             zone_id_map: Mutex::new(HashMap::new()),
             zone_name_map: Mutex::new(HashMap::new()),
-            shim_connections: Mutex::new(HashMap::new()),
             registered_inodes: Mutex::new(HashMap::new()),
             zone_policies: Mutex::new(HashMap::new()),
             zone_degradations: Mutex::new(HashMap::new()),
@@ -200,20 +197,10 @@ impl LinuxBackend {
     fn ensure_shim(&self, zone_name: &str) -> Result<()> {
         let socket_path = self.shim_socket_path(zone_name);
 
-        // Check if shim is already connected and responsive.
-        {
-            let conns = lock_backend(&self.shim_connections, "shim_connections")?;
-            if let Some(conn) = conns.get(zone_name) {
-                // Try a quick health check.
-                if conn
-                    .send_request(&ShimRequest::GetState {
-                        id: "__ping__".into(),
-                    })
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-            }
+        // A shim can outlive rauhad. Probe its actual socket, including after
+        // recovery, rather than treating an empty process-local cache as death.
+        if socket_path.exists() && self.shim_request(zone_name, &ShimRequest::GetStats).is_ok() {
+            return Ok(());
         }
 
         // If socket exists but shim is dead, remove the stale socket.
@@ -245,9 +232,13 @@ impl LinuxBackend {
 
         let shim_bin = find_shim_binary()?;
 
-        Command::new(&shim_bin)
+        let mut child = Command::new(&shim_bin)
             .env("RAUHA_RUN_DIR", &self.config.paths.run_dir)
             .env("RAUHA_CRUN", &self.config.executor.crun)
+            .env(
+                "RAUHA_LOG_MAX_BYTES",
+                self.config.evidence.container_log_max_bytes.to_string(),
+            )
             .env(
                 "RAUHA_BROKER_CACHE_MAX",
                 self.config.broker.cache_max_tasks.to_string(),
@@ -272,6 +263,14 @@ impl LinuxBackend {
                 message: format!("failed to spawn shim: {e}"),
             })?;
 
+        // Dropping Child does not reap it. Every deleted temporary zone would
+        // otherwise leave a zombie owned by the long-running daemon.
+        std::thread::spawn(move || {
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "failed to reap zone shim");
+            }
+        });
+
         // Wait for socket to appear.
         for _ in 0..50 {
             if socket_path.exists() {
@@ -287,23 +286,13 @@ impl LinuxBackend {
             });
         }
 
-        // Register connection.
-        let conn = ShimConnection::new(socket_path);
-        lock_backend(&self.shim_connections, "shim_connections")?
-            .insert(zone_name.to_string(), conn);
-
         tracing::info!(zone = zone_name, "shim spawned");
         Ok(())
     }
 
     /// Send a request to a zone's shim.
     fn shim_request(&self, zone_name: &str, request: &ShimRequest) -> Result<ShimResponse> {
-        let conns = lock_backend(&self.shim_connections, "shim_connections")?;
-        let conn = conns.get(zone_name).ok_or_else(|| RauhaError::ShimError {
-            zone: zone_name.into(),
-            message: "no shim connection".into(),
-        })?;
-        conn.send_request(request)
+        ShimConnection::new(self.shim_socket_path(zone_name)).send_request(request)
     }
 
     /// Apply nftables forward rules for a zone based on its network policy.
@@ -869,6 +858,10 @@ fn find_shim_binary() -> Result<PathBuf> {
 }
 
 impl IsolationBackend for LinuxBackend {
+    fn shim_request(&self, zone_name: &str, request: &ShimRequest) -> Result<ShimResponse> {
+        LinuxBackend::shim_request(self, zone_name, request)
+    }
+
     fn recover_zone(
         &self,
         zone: &ZoneHandle,
@@ -1215,10 +1208,9 @@ impl IsolationBackend for LinuxBackend {
         tracing::info!(zone = zone.name, "destroying zone");
 
         // Shut down shim if running.
-        {
-            let mut conns = lock_backend(&self.shim_connections, "shim_connections")?;
-            if let Some(conn) = conns.remove(&zone.name) {
-                let _ = conn.send_request(&ShimRequest::Shutdown);
+        if self.shim_socket_path(&zone.name).exists() {
+            if let Err(error) = self.shim_request(&zone.name, &ShimRequest::Shutdown) {
+                tracing::warn!(%error, zone = zone.name, "shim shutdown failed; draining the zone cgroup");
             }
         }
 

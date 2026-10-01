@@ -145,6 +145,20 @@ impl ShimState {
     }
 
     /// Get the state of a container.
+    pub fn delete_container(&mut self, id: &str) -> anyhow::Result<()> {
+        self.reap_children();
+        if self
+            .containers
+            .get(id)
+            .is_some_and(|p| p.status == ContainerStatus::Running)
+        {
+            anyhow::bail!("container {id} is running");
+        }
+        self.containers.remove(id);
+        Ok(())
+    }
+
+    /// Get the state of a container.
     pub fn get_state(&self, id: &str) -> Option<(u32, String, Option<i32>)> {
         self.containers
             .get(id)

@@ -61,6 +61,9 @@ fn validate_zone_name(name: &str) -> Result<()> {
 }
 
 impl ZoneRegistry {
+    pub fn metadata(&self) -> &MetadataStore {
+        &self.metadata
+    }
     pub fn new(
         metadata: Arc<MetadataStore>,
         backend: Arc<dyn IsolationBackend>,
@@ -409,6 +412,10 @@ impl ZoneRegistry {
         }
 
         // Remove from metadata.
+        for container in &containers {
+            self.remove_container_logs(&container.id)?;
+            self.container_handles.write().await.remove(&container.id);
+        }
         self.metadata.delete_zone(name)?;
 
         tracing::info!(zone = name, "zone deleted");
@@ -728,6 +735,19 @@ impl ZoneRegistry {
         {
             let zone_name = self.zone_name_for_container(&container.zone_id).await;
             if let Some(zone_name) = zone_name {
+                match self.backend.shim_request(
+                    &zone_name,
+                    &rauha_common::shim::ShimRequest::DeleteContainer {
+                        id: container_id.to_string(),
+                    },
+                )? {
+                    rauha_common::shim::ShimResponse::Ok => {}
+                    response => {
+                        return Err(RauhaError::BackendError(format!(
+                            "shim did not delete container: {response:?}"
+                        )))
+                    }
+                }
                 let zone_data = std::path::PathBuf::from(&self.root)
                     .join("zones")
                     .join(&zone_name);
@@ -739,11 +759,25 @@ impl ZoneRegistry {
             }
         }
 
+        self.remove_container_logs(container_id)?;
         self.container_handles.write().await.remove(container_id);
         self.metadata.delete_container(container_id)?;
 
         tracing::info!(container = %container_id, "container deleted");
         Ok(())
+    }
+
+    fn remove_container_logs(&self, container_id: &Uuid) -> Result<()> {
+        let path = std::path::Path::new(&self.config.paths.run_dir)
+            .join("containers")
+            .join(container_id.to_string());
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(RauhaError::BackendError(format!(
+                "cannot remove container logs: {e}"
+            ))),
+        }
     }
 
     /// Get a container by ID.
@@ -953,6 +987,17 @@ mod tests {
     }
 
     impl IsolationBackend for MockBackend {
+        fn shim_request(
+            &self,
+            _: &str,
+            request: &rauha_common::shim::ShimRequest,
+        ) -> Result<rauha_common::shim::ShimResponse> {
+            assert!(matches!(
+                request,
+                rauha_common::shim::ShimRequest::DeleteContainer { .. }
+            ));
+            Ok(rauha_common::shim::ShimResponse::Ok)
+        }
         fn create_zone(&self, _config: &ZoneConfig) -> Result<ZoneHandle> {
             Ok(ZoneHandle {
                 id: Uuid::new_v4(),
@@ -1050,12 +1095,14 @@ mod tests {
             tmp.path().to_path_buf(),
         ));
         let backend: Arc<dyn IsolationBackend> = Arc::new(MockBackend::new());
+        let mut config = crate::config::DaemonConfig::default();
+        config.paths.run_dir = tmp.path().join("run").to_string_lossy().into_owned();
         ZoneRegistry::new(
             metadata,
             backend,
             image_svc,
             tmp.path().to_string_lossy().into(),
-            std::sync::Arc::new(crate::config::DaemonConfig::default()),
+            std::sync::Arc::new(config),
         )
     }
 
@@ -1239,7 +1286,13 @@ mod tests {
         assert!(stopped.finished_at.is_some());
 
         // Delete.
+        let log_dir = std::path::Path::new(&reg.config.paths.run_dir)
+            .join("containers")
+            .join(ctr.id.to_string());
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("stdout.log"), "private output").unwrap();
         reg.delete_container(&ctr.id, false).await.unwrap();
+        assert!(!log_dir.exists());
         assert!(reg.get_container(&ctr.id).is_err());
     }
 
