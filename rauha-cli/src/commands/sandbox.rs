@@ -273,6 +273,30 @@ fn verify_receipts(
             Some(format!("daemon returned an unverifiable receipt: {error}")),
         );
     }
+    let payload = &receipt.payload;
+    let outputs = rauha_evidence::receipt::sha256_json(&serde_json::json!({
+        "salt": result.task_id,
+        "status": result.status,
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }));
+    if payload.task_id != result.task_id
+        || payload.zone_id != result.zone_id
+        || payload.status != result.status
+        || payload.exit_code != result.exit_code
+        || payload.started_at.as_deref().unwrap_or_default() != result.started_at
+        || payload.finished_at.as_deref().unwrap_or_default() != result.finished_at
+        || payload.unavailable_controls != result.unavailable_controls
+        || payload.capture_issues != result.capture_issues
+        || outputs.as_ref().ok() != Some(&payload.outputs_sha256)
+    {
+        return (
+            None,
+            None,
+            Some("signed receipt does not match the task result".into()),
+        );
+    }
     if result.receipt_dsse_json.is_empty() {
         return (Some(receipt), None, None);
     }
@@ -288,9 +312,17 @@ fn verify_receipts(
                 None,
                 Some(format!("DSSE envelope verification failed: {error}")),
             ),
-            // The statement is the envelope's payload — already covered by
-            // the legacy receipt verification above.
-            Ok(_statement) => (Some(receipt), Some(envelope), None),
+            Ok(statement)
+                if statement
+                    == rauha_evidence::dsse::statement_from_payload(receipt.payload.clone()) =>
+            {
+                (Some(receipt), Some(envelope), None)
+            }
+            Ok(_) => (
+                Some(receipt),
+                None,
+                Some("DSSE statement does not match the signed receipt".into()),
+            ),
         },
     }
 }
@@ -360,7 +392,11 @@ mod tests {
                 },
                 policy_sha256: "sha256:policy".into(),
                 inputs_sha256: "sha256:inputs".into(),
-                outputs_sha256: "sha256:outputs".into(),
+                outputs_sha256: rauha_evidence::receipt::sha256_json(&serde_json::json!({
+                    "salt": "task-cli-test", "status": "succeeded", "exit_code": 0,
+                    "stdout": "", "stderr": "",
+                }))
+                .unwrap(),
                 status: "succeeded".into(),
                 exit_code: Some(0),
                 started_at: None,
@@ -380,6 +416,10 @@ mod tests {
 
     fn result_with(receipt_json: &str, dsse_json: &str) -> pb::sandbox::SandboxResult {
         pb::sandbox::SandboxResult {
+            task_id: "task-cli-test".into(),
+            zone_id: "zone-cli-test".into(),
+            status: "succeeded".into(),
+            exit_code: Some(0),
             receipt_json: receipt_json.into(),
             receipt_dsse_json: dsse_json.into(),
             ..Default::default()
@@ -423,6 +463,44 @@ mod tests {
         assert!(receipt.is_some());
         assert!(dsse.is_some());
         assert!(problem.is_none());
+    }
+
+    #[test]
+    fn signed_receipt_rejects_changed_result() {
+        let fixture = receipts::signed(&tmp("changed-result"));
+        let original = result_with(&fixture.receipt_json, &fixture.dsse_json);
+        for field in ["stdout", "task_id", "capture_issues"] {
+            let mut result = original.clone();
+            match field {
+                "stdout" => result.stdout = "altered output".into(),
+                "task_id" => result.task_id = "another-task".into(),
+                _ => result
+                    .capture_issues
+                    .push("stdout.storage_incomplete".into()),
+            }
+            let (receipt, dsse, problem) = verify_receipts(&result);
+            assert!(
+                receipt.is_none() && dsse.is_none(),
+                "accepted changed {field}"
+            );
+            assert!(problem.unwrap().contains("does not match"));
+        }
+    }
+
+    #[test]
+    fn different_statement_signed_by_same_key_is_rejected() {
+        let key = tmp("same-key-different-statement");
+        let fixture = receipts::signed(&key);
+        let mut receipt: rauha_evidence::receipt::SignedExecutionReceipt =
+            serde_json::from_str(&fixture.receipt_json).unwrap();
+        receipt.payload.task_id = "another-task".into();
+        let signer = rauha_evidence::receipt::ReceiptSigner::load_or_create(&key).unwrap();
+        let envelope = serde_json::to_string(&signer.sign_dsse(receipt.payload)).unwrap();
+        let (receipt, dsse, problem) =
+            verify_receipts(&result_with(&fixture.receipt_json, &envelope));
+        assert!(receipt.is_some());
+        assert!(dsse.is_none());
+        assert!(problem.unwrap().contains("does not match"));
     }
 
     #[test]
