@@ -182,6 +182,23 @@ impl ZoneRegistry {
                     }
                     handles.push(handle.clone());
                     self.handles.write().await.insert(zone.name.clone(), handle);
+                    // Linux controls containers through the surviving zone shim
+                    // by UUID, not by a process handle retained by this daemon.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let mut container_handles = self.container_handles.write().await;
+                        for container in self.metadata.list_containers(Some(&zone.id))? {
+                            container_handles.insert(
+                                container.id,
+                                ContainerHandle {
+                                    id: container.id,
+                                    zone_id: container.zone_id,
+                                    pid: container.pid.unwrap_or_default(),
+                                    platform_id: 0,
+                                },
+                            );
+                        }
+                    }
                     tracing::info!(zone = zone.name, "zone reconciled");
                 }
                 Err(e) => {
@@ -373,6 +390,13 @@ impl ZoneRegistry {
             err
         })?;
 
+        // Serialize against container creation, which holds a read guard through
+        // backend creation and metadata persistence.
+        let mut handles = self.handles.write().await;
+        let handle = handles.get(name).ok_or_else(|| {
+            RauhaError::BackendError(format!("zone {name} has no recovered backend handle"))
+        })?;
+
         // Check for running containers unless force.
         let containers = self.metadata.list_containers(Some(&zone.id))?;
         if !containers.is_empty() && !force {
@@ -397,26 +421,24 @@ impl ZoneRegistry {
             for container in &containers {
                 // Stop running containers.
                 if container.state == ContainerState::Running {
-                    if let Some(handle) = self.container_handles.write().await.remove(&container.id)
-                    {
-                        let _ = self.backend.stop_container(&handle);
+                    if let Some(handle) = self.container_handles.read().await.get(&container.id) {
+                        let _ = self.backend.stop_container(handle);
                     }
                 }
-                self.metadata.delete_container(&container.id)?;
             }
         }
 
         // Destroy in backend.
-        if let Some(handle) = self.handles.write().await.remove(name) {
-            self.backend.destroy_zone(&handle)?;
-        }
+        self.backend.destroy_zone(handle)?;
 
         // Remove from metadata.
         for container in &containers {
             self.remove_container_logs(&container.id)?;
+            self.metadata.delete_container(&container.id)?;
             self.container_handles.write().await.remove(&container.id);
         }
         self.metadata.delete_zone(name)?;
+        handles.remove(name);
 
         tracing::info!(zone = name, "zone deleted");
         self.event(
@@ -976,12 +998,16 @@ mod tests {
     /// Minimal mock backend for testing registry logic.
     struct MockBackend {
         next_id: AtomicU64,
+        destroy_failures: AtomicU64,
+        destroy_attempts: AtomicU64,
     }
 
     impl MockBackend {
         fn new() -> Self {
             Self {
                 next_id: AtomicU64::new(1),
+                destroy_failures: AtomicU64::new(0),
+                destroy_attempts: AtomicU64::new(0),
             }
         }
     }
@@ -1008,6 +1034,14 @@ mod tests {
         }
 
         fn destroy_zone(&self, _zone: &ZoneHandle) -> Result<()> {
+            self.destroy_attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .destroy_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(RauhaError::BackendError("injected teardown failure".into()));
+            }
             Ok(())
         }
 
@@ -1086,6 +1120,10 @@ mod tests {
     }
 
     fn test_registry(tmp: &TempDir) -> ZoneRegistry {
+        test_registry_with_backend(tmp, Arc::new(MockBackend::new()))
+    }
+
+    fn test_registry_with_backend(tmp: &TempDir, backend: Arc<MockBackend>) -> ZoneRegistry {
         let db_path = tmp.path().join("test.redb");
         let content_path = tmp.path().join("content");
         let metadata = Arc::new(MetadataStore::open(&db_path).unwrap());
@@ -1094,7 +1132,6 @@ mod tests {
             content,
             tmp.path().to_path_buf(),
         ));
-        let backend: Arc<dyn IsolationBackend> = Arc::new(MockBackend::new());
         let mut config = crate::config::DaemonConfig::default();
         config.paths.run_dir = tmp.path().join("run").to_string_lossy().into_owned();
         ZoneRegistry::new(
@@ -1116,6 +1153,139 @@ mod tests {
             rootfs_path: None,
             overlay_layers: None,
         }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn recovered_container_can_be_stopped_individually() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+        reg.create_zone(
+            "recover-control",
+            ZoneType::NonGlobal,
+            ZonePolicy::default(),
+        )
+        .await
+        .unwrap();
+        let container = reg
+            .create_container("recover-control", make_spec("task"))
+            .await
+            .unwrap();
+        reg.start_container(&container.id).await.unwrap();
+        reg.container_handles.write().await.clear();
+        reg.handles.write().await.clear();
+        reg.reconcile().await.unwrap();
+        reg.stop_container(&container.id, 10).await.unwrap();
+        assert_eq!(
+            reg.get_container(&container.id).unwrap().state,
+            ContainerState::Stopped
+        );
+        reg.delete_container(&container.id, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_zone_teardown_preserves_state_for_retry() {
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(MockBackend::new());
+        backend.destroy_failures.store(1, Ordering::SeqCst);
+        let reg = test_registry_with_backend(&tmp, backend.clone());
+        reg.create_zone("retry", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        let container = reg
+            .create_container("retry", make_spec("task"))
+            .await
+            .unwrap();
+        assert!(reg.delete_zone("retry", true).await.is_err());
+        assert!(
+            reg.get_container(&container.id).is_ok(),
+            "failed cleanup must not forget the container"
+        );
+        assert!(reg.handles.read().await.contains_key("retry"));
+        reg.delete_zone("retry", true).await.unwrap();
+        assert_eq!(
+            backend.destroy_attempts.load(Ordering::SeqCst),
+            2,
+            "retry must invoke the backend again"
+        );
+        assert!(reg.get_container(&container.id).is_err());
+    }
+
+    #[tokio::test]
+    async fn refused_sandbox_releases_its_result_reservation() {
+        use crate::server::{
+            pb::sandbox::{sandbox_service_server::SandboxService, RunSandboxRequest},
+            SandboxServiceImpl,
+        };
+        let tmp = TempDir::new().unwrap();
+        let reg = Arc::new(test_registry(&tmp));
+        let signer =
+            rauha_evidence::receipt::ReceiptSigner::load_or_create(&tmp.path().join("key"))
+                .unwrap();
+        let service = SandboxServiceImpl::new(reg.clone(), None, signer);
+        let id = format!("task-{}", Uuid::new_v4());
+        let error = service
+            .run_sandbox(tonic::Request::new(RunSandboxRequest {
+                task_id: id.clone(),
+                name: "missing-zone".into(),
+                image: "alpine".into(),
+                command: vec!["true".into()],
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        assert!(
+            reg.metadata.get_result(&id).unwrap().is_none(),
+            "refusal leaked a 4 MiB reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_task_cannot_lose_its_reservation_before_container_cleanup() {
+        use crate::server::{
+            pb::sandbox::{sandbox_service_server::SandboxService, SandboxResultRequest},
+            SandboxServiceImpl,
+        };
+        let tmp = TempDir::new().unwrap();
+        let reg = Arc::new(test_registry(&tmp));
+        reg.create_zone("recover-task", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        let id = format!("task-{}", Uuid::new_v4());
+        let container = reg
+            .create_container("recover-task", make_spec(&format!("{id}-task")))
+            .await
+            .unwrap();
+        reg.metadata
+            .reserve_result(&id, rauha_common::sandbox::MAX_RESULT_BYTES)
+            .unwrap();
+        // A newly created service has no in-memory active task, as after restart.
+        let signer =
+            rauha_evidence::receipt::ReceiptSigner::load_or_create(&tmp.path().join("key"))
+                .unwrap();
+        let service = SandboxServiceImpl::new(reg.clone(), None, signer);
+        let request = SandboxResultRequest {
+            task_id: id.clone(),
+        };
+        let error = service
+            .delete_sandbox_result(tonic::Request::new(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(!reg
+            .metadata
+            .reserve_result(&id, rauha_common::sandbox::MAX_RESULT_BYTES)
+            .unwrap());
+        reg.delete_container(&container.id, false).await.unwrap();
+        assert!(
+            service
+                .delete_sandbox_result(tonic::Request::new(request))
+                .await
+                .unwrap()
+                .into_inner()
+                .deleted
+        );
     }
 
     #[tokio::test]

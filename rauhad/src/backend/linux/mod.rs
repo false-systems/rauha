@@ -1665,7 +1665,7 @@ impl IsolationBackend for LinuxBackend {
                 message: "zone not found for container".into(),
             })?;
 
-        // Send SIGTERM first.
+        // The shim owns SIGTERM, the grace period, and SIGKILL escalation.
         let response = self.shim_request(
             &zone_name,
             &ShimRequest::StopContainer {
@@ -1676,19 +1676,14 @@ impl IsolationBackend for LinuxBackend {
 
         match response {
             ShimResponse::Ok => Ok(()),
-            ShimResponse::Error { message } => {
-                tracing::warn!(container = %container.id, %message, "SIGTERM failed, trying SIGKILL");
-                // Try SIGKILL as fallback.
-                let _ = self.shim_request(
-                    &zone_name,
-                    &ShimRequest::Signal {
-                        id: container.id.to_string(),
-                        signal: 9, // SIGKILL
-                    },
-                );
-                Ok(())
-            }
-            _ => Ok(()),
+            ShimResponse::Error { message } => Err(RauhaError::ContainerExecError {
+                container: container.id.to_string(),
+                message,
+            }),
+            other => Err(RauhaError::ShimError {
+                zone: zone_name,
+                message: format!("unexpected response to StopContainer: {other:?}"),
+            }),
         }
     }
 

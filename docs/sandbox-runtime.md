@@ -101,7 +101,9 @@ size, while interrupted reservations keep the full budget. Database bookkeeping
 is additional. Capacity exhaustion refuses
 new tasks before execution; results are not silently evicted. Explicitly release
 capacity with `rauha sandbox-result <task-id> --delete`. Active tasks cannot be
-deleted. A reservation without a completed result means running or interrupted,
+deleted, including after restart while their container still requires cleanup.
+Requests refused before execution release their reservation. A reservation
+without a completed result means running or interrupted,
 not “nothing happened”; this is result retention, not task resume or replay.
 
 Per-container caps bound workload output, not the total number of containers

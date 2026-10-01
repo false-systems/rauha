@@ -75,6 +75,38 @@ async fn hostile_output_is_bounded_signed_retrievable_and_cleaned() {
     let mut client = pb::sandbox_service_client::SandboxServiceClient::connect(endpoint.clone())
         .await
         .unwrap();
+    let refused_id = format!("task-{}", uuid::Uuid::new_v4());
+    let refused = pb::RunSandboxRequest {
+        task_id: refused_id.clone(),
+        name: format!("missing-{}", uuid::Uuid::new_v4()),
+        image: "alpine:latest".into(),
+        command: vec!["/bin/true".into()],
+        audit: true,
+        ..Default::default()
+    };
+    for _ in 0..20 {
+        assert_eq!(
+            client
+                .run_sandbox(refused.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::NotFound
+        );
+    }
+    assert_eq!(
+        client
+            .get_sandbox_result(pb::SandboxResultRequest {
+                task_id: refused_id
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    println!(
+        "PASS refused requests: repeated identifier remains reusable, no retained reservation"
+    );
     for (script, expected_issue) in [
         ("printf hello; printf world >&2", None),
         ("head -c 1048576 /dev/zero | tr '\\000' '\\377'; head -c 1048576 /dev/zero | tr '\\000' '\\377' >&2", Some("stdout.invalid_utf8")),
@@ -90,6 +122,7 @@ async fn hostile_output_is_bounded_signed_retrievable_and_cleaned() {
         let duplicate = request.clone();
         let run = tokio::spawn(async move { runner.run_sandbox(request).await });
         let mut observed_logs = false;
+        let mut checked_active = false;
         while !run.is_finished() {
             for dir in log_directories(&logs).difference(&before) {
                 for stream in ["stdout", "stderr", "broker"] {
@@ -98,6 +131,11 @@ async fn hostile_output_is_bounded_signed_retrievable_and_cleaned() {
                         assert!(metadata.len() <= 1024 * 1024, "unbounded {stream}");
                     }
                 }
+            }
+            if observed_logs && !checked_active && expected_issue == Some("stdout.storage_incomplete") {
+                assert_eq!(client.delete_sandbox_result(pb::SandboxResultRequest { task_id: task_id.clone() }).await.unwrap_err().code(), Code::FailedPrecondition);
+                assert_eq!(client.run_sandbox(duplicate.clone()).await.unwrap_err().code(), Code::AlreadyExists);
+                checked_active = true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -108,7 +146,7 @@ async fn hostile_output_is_bounded_signed_retrievable_and_cleaned() {
         assert!(result.stdout.len() <= 1024 * 1024 && result.stderr.len() <= 1024 * 1024);
         if let Some(issue) = expected_issue { assert!(result.capture_issues.iter().any(|value| value == issue)); }
         else { assert!(result.capture_issues.is_empty()); }
-        if expected_issue == Some("stdout.storage_incomplete") { assert!(observed_logs); }
+        if expected_issue == Some("stdout.storage_incomplete") { assert!(observed_logs && checked_active); }
         let receipt: rauha_evidence::receipt::SignedExecutionReceipt = serde_json::from_str(&result.receipt_json).unwrap();
         receipt.verify().unwrap();
         assert_eq!(receipt.payload.capture_issues, result.capture_issues);
@@ -189,6 +227,14 @@ async fn broker_records_are_bounded_and_live_only_until_container_deletion(
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    // A shim refusal must reach the caller, not be turned into a successful stop.
+    assert!(containers
+        .stop_container(container::StopContainerRequest {
+            container_id: id.clone(),
+            timeout_seconds: 10,
+        })
+        .await
+        .is_err());
     let dir = logs.join(&id);
     let bytes = std::fs::read(dir.join("broker.log")).unwrap();
     assert!(bytes.len() <= 1024 * 1024);

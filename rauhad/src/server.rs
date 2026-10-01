@@ -1234,15 +1234,20 @@ pub struct SandboxServiceImpl {
 
 struct ActiveTask<'a> {
     tasks: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    metadata: &'a crate::metadata::db::MetadataStore,
     id: String,
+    execution_attempted: bool,
 }
 
 impl Drop for ActiveTask<'_> {
     fn drop(&mut self) {
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.execution_attempted {
+            if let Err(error) = self.metadata.delete_result(&self.id) {
+                tracing::error!(task_id = %self.id, %error, "failed to release refused task reservation");
+            }
+        }
+        tasks.remove(&self.id);
     }
 }
 
@@ -2225,6 +2230,22 @@ impl SandboxService for SandboxServiceImpl {
         if tasks.contains(&id) {
             return Err(Status::failed_precondition("task is still active"));
         }
+        // Container ownership survives daemon restart and asynchronous cancellation
+        // cleanup. Keep the identifier reserved until that ownership is released.
+        // ponytail: scan retained containers; index task ownership if this becomes hot.
+        let container_name = format!("{id}-task");
+        if self
+            .registry
+            .metadata()
+            .list_containers(None)
+            .map_err(to_internal_status)?
+            .iter()
+            .any(|container| container.name == container_name)
+        {
+            return Err(Status::failed_precondition(
+                "task container still requires cleanup",
+            ));
+        }
         let deleted = self
             .registry
             .metadata()
@@ -2315,9 +2336,11 @@ impl SandboxService for SandboxServiceImpl {
                 }
                 tasks.insert(task_id.clone());
             }
-            let _active = ActiveTask {
+            let mut active = ActiveTask {
                 tasks: &self.active_tasks,
+                metadata: self.registry.metadata(),
                 id: task_id.clone(),
+                execution_attempted: false,
             };
             let (zone_name, zone_id, temp_zone, policy) = if req.name.trim().is_empty() {
                 let name = format!(
@@ -2399,6 +2422,7 @@ impl SandboxService for SandboxServiceImpl {
                 )));
             }
 
+            active.execution_attempted = true;
             let (outcome, manifest_digest) = match self
                 .execute_task(&task_id, &zone_name, &zone_id, &req)
                 .await
