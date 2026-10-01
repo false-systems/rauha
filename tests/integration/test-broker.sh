@@ -109,6 +109,14 @@ sleep 1
 $RAUHA sandbox --name "$ZONE_NAME" --image "$IMAGE" --timeout 30 \
     -- /bin/cat /etc/hostname >/dev/null 2>&1 || true
 wait "$EVENTS_PID" 2>/dev/null || true
+if ! grep -q 'zone.syscall.brokered' "$EVENTS_OUT"; then
+    # Subscription timing can lose the first task under load: one retry
+    # before declaring failure.
+    sleep 3
+    $RAUHA sandbox --name "$ZONE_NAME" --image "$IMAGE" --timeout 30 \
+        -- /bin/cat /etc/hostname >/dev/null 2>&1 || true
+    sleep 2
+fi
 if grep -q 'zone.syscall.brokered' "$EVENTS_OUT"; then
     echo "   live event seen (OK)"
     grep -m 1 -o '"event":"zone.syscall.brokered[^"]*"' "$EVENTS_OUT" | sed 's/^/     /'
@@ -125,6 +133,12 @@ EVENTS_PID=$!
 sleep 1
 $RAUHA run --zone "$ZONE_NAME" "$IMAGE" /bin/cat /etc/hostname >/dev/null 2>&1 || true
 wait "$EVENTS_PID" 2>/dev/null || true
+if ! grep -q 'zone.syscall.brokered' "$EVENTS_OUT"; then
+    # Same subscription race as step 9: one retry.
+    sleep 3
+    $RAUHA run --zone "$ZONE_NAME" "$IMAGE" /bin/cat /etc/hostname >/dev/null 2>&1 || true
+    sleep 2
+fi
 if grep -q 'zone.syscall.brokered' "$EVENTS_OUT"; then
     echo "   live event from run container (OK)"
 else

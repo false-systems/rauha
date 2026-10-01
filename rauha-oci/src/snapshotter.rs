@@ -253,8 +253,9 @@ impl OverlayfsSnapshotter {
 }
 
 /// Recursively copy a directory tree, merging into the destination.
-#[cfg(not(target_os = "linux"))]
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Cross-platform: used by the snapshotter on non-Linux and by the
+/// daemon's writable-path copy-up on Linux.
+pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| RauhaError::RootfsError {
         message: format!("failed to create dir {}: {e}", dst.display()),
     })?;
