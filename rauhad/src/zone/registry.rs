@@ -1156,6 +1156,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_seals_once_and_retries_cleanup_without_losing_result() {
+        use crate::metadata::recovery::RecoveryRecord;
+        use crate::server::{pb::sandbox::SandboxResult, SandboxServiceImpl};
+        use prost::Message;
+        use rauha_evidence::receipt::{
+            ExecutionReceiptPayload, ImageAdmission, ReceiptSigner, SignedExecutionReceipt,
+            EXECUTION_RECEIPT_SCHEMA,
+        };
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(MockBackend::new());
+        backend.destroy_failures.store(1, Ordering::SeqCst);
+        let reg = Arc::new(test_registry_with_backend(&tmp, backend.clone()));
+        let zone = reg
+            .create_zone("durable-task", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        let id = format!("task-{}", Uuid::new_v4());
+        let record = RecoveryRecord {
+            zone_name: zone.name.clone(),
+            container_id: None,
+            cleanup_zone: true,
+            command: vec!["/bin/true".into()],
+            admission: zone.policy.admission,
+            receipt: ExecutionReceiptPayload {
+                schema: EXECUTION_RECEIPT_SCHEMA.into(),
+                task_id: id.clone(),
+                zone_id: zone.id.to_string(),
+                image: ImageAdmission {
+                    reference: "alpine".into(),
+                    manifest_digest: String::new(),
+                    digest_verified: false,
+                },
+                policy_sha256: "policy".into(),
+                inputs_sha256: "inputs".into(),
+                outputs_sha256: String::new(),
+                status: String::new(),
+                exit_code: None,
+                started_at: None,
+                finished_at: None,
+                enforcement: Default::default(),
+                unavailable_controls: vec![],
+                capture_issues: vec![],
+            },
+        };
+        reg.metadata
+            .reserve_result(&id, rauha_common::sandbox::MAX_RESULT_BYTES)
+            .unwrap();
+        reg.metadata.put_recovery(&record).unwrap();
+        assert!(reg.metadata.finish_recovery(&id).is_err());
+        assert!(reg.metadata.delete_result(&id).is_err());
+        let signer = ReceiptSigner::load_or_create(&tmp.path().join("key")).unwrap();
+        let service = SandboxServiceImpl::new(reg.clone(), None, signer.clone());
+        // Crash before container creation: recover uncertainty, then fail cleanup.
+        assert!(service.recover_tasks().await.is_err());
+        let bytes = reg.metadata.get_result(&id).unwrap().unwrap();
+        let result = SandboxResult::decode(bytes.as_slice()).unwrap();
+        assert_eq!(result.status, "runtime_error");
+        assert_eq!(result.exit_code, None);
+        assert!(result
+            .capture_issues
+            .contains(&"execution.outcome_unknown".into()));
+        let receipt: SignedExecutionReceipt = serde_json::from_str(&result.receipt_json).unwrap();
+        receipt.verify().unwrap();
+        assert_eq!(receipt.payload.capture_issues, result.capture_issues);
+        assert!(reg.metadata.has_recovery(&id).unwrap());
+        assert!(reg
+            .metadata
+            .reserve_result("another", rauha_common::sandbox::MAX_RESULT_BYTES)
+            .is_err());
+        drop(service);
+        let service = SandboxServiceImpl::new(reg.clone(), None, signer);
+        service.recover_tasks().await.unwrap();
+        service.recover_tasks().await.unwrap();
+        assert_eq!(reg.metadata.get_result(&id).unwrap().unwrap(), bytes);
+        assert!(!reg.metadata.has_recovery(&id).unwrap());
+        assert_eq!(backend.destroy_attempts.load(Ordering::SeqCst), 2);
+        assert!(reg.get_zone("durable-task").await.is_err());
+        assert!(reg.metadata.delete_result(&id).unwrap());
+    }
+
+    #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn recovered_container_can_be_stopped_individually() {
         let tmp = TempDir::new().unwrap();

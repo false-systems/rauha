@@ -71,6 +71,10 @@ invalid UTF-8, and capture failures in both the result and its signed receipts.
 The CLI prints a task ID before execution; `rauha sandbox-result <task-id>`
 retrieves the saved result without executing again. Use `--delete` to discard
 a retained result. Completed task containers release their raw log files.
+Accepted tasks survive client disconnects. After a daemon crash, recovery stops
+interrupted tasks and saves an explicitly uncertain signed result without
+rerunning the command. Results are saved before output cleanup; see
+[`durable task recovery`](docs/sandbox-runtime.md#durable-task-recovery) for the boundaries.
 
 Underneath, the same primitives are available directly:
 
@@ -160,7 +164,7 @@ rauha (CLI) ──gRPC──▶ rauhad ──spawns──▶ rauha-shim (one per
                         │                     │
                         │                     ├── broker.log, stdout/stderr  (root-only)
                         │                     └── exec/attach IPC
-                        ├── redb: zones, containers — source of truth on restart
+                        ├── redb: zones, containers, task recovery, saved results
                         └── evidence events ──▶ `rauha events`, sandbox results
 ```
 

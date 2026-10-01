@@ -109,6 +109,17 @@ done
 LIVE_OUTPUT_TEST=$(cargo test --quiet -p rauhad --test runtime_output --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "runtime_output") | .executable // empty')
 sudo env RAUHA_TEST_RUN_DIR=/run/rauha RAUHA_TEST_ENDPOINT="$RAUHA_ADDR" \
     timeout --foreground --kill-after=5s "$TEST_TIMEOUT" "$LIVE_OUTPUT_TEST" hostile_output --ignored --nocapture --test-threads=1
+sudo env RAUHA_TEST_RUN_DIR=/run/rauha RAUHA_TEST_ENDPOINT="$RAUHA_ADDR" \
+    timeout --foreground --kill-after=5s "$TEST_TIMEOUT" "$LIVE_OUTPUT_TEST" transport_disconnect --ignored --nocapture
+
+# Admitted task recovery: interruption is sealed honestly, never replayed.
+TASK_RECOVERY_STATE="$RUN_ROOT/task-recovery.json"
+sudo env RAUHA_TEST_RUN_DIR=/run/rauha RAUHA_TEST_ENDPOINT="$RAUHA_ADDR" RAUHA_TEST_TASK_RECOVERY_STATE="$TASK_RECOVERY_STATE" \
+    timeout --foreground --kill-after=5s "$TEST_TIMEOUT" "$LIVE_OUTPUT_TEST" durable_recovery_prepare --ignored --nocapture
+crash_daemon
+start_daemon
+sudo env RAUHA_TEST_RUN_DIR=/run/rauha RAUHA_TEST_ENDPOINT="$RAUHA_ADDR" RAUHA_TEST_TASK_RECOVERY_STATE="$TASK_RECOVERY_STATE" \
+    timeout --foreground --kill-after=5s "$TEST_TIMEOUT" "$LIVE_OUTPUT_TEST" durable_recovery_verify --ignored --nocapture
 
 # Prove crash recovery against live kernel state, not only serialized metadata.
 RECOVERY_STATE="$RUN_ROOT/recovery-probe.state"

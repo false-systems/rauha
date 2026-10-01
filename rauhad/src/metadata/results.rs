@@ -18,13 +18,16 @@ impl MetadataStore {
             // ponytail: scan retained entries under the write transaction;
             // add a transactional byte counter if large histories make this costly.
             let mut used = 0usize;
+            let recovery = transaction.open_table(super::recovery::RECOVERY_TABLE)?;
             for entry in table.iter()? {
-                let (_, value) = entry?;
-                used = used.saturating_add(if value.value().is_empty() {
-                    MAX_RESULT_BYTES
-                } else {
-                    value.value().len()
-                });
+                let (id, value) = entry?;
+                used = used.saturating_add(
+                    if value.value().is_empty() || recovery.get(id.value())?.is_some() {
+                        MAX_RESULT_BYTES
+                    } else {
+                        value.value().len()
+                    },
+                );
             }
             // Interrupted reservations still consume their full wire budget.
             anyhow::ensure!(
@@ -63,6 +66,13 @@ impl MetadataStore {
 
     pub fn delete_result(&self, id: &str) -> anyhow::Result<bool> {
         let transaction = self.db.begin_write()?;
+        anyhow::ensure!(
+            transaction
+                .open_table(super::recovery::RECOVERY_TABLE)?
+                .get(id)?
+                .is_none(),
+            "task still requires recovery or cleanup"
+        );
         let removed = transaction.open_table(RESULTS_TABLE)?.remove(id)?.is_some();
         transaction.commit()?;
         Ok(removed)

@@ -26,9 +26,10 @@ What exists today:
   (`SandboxExecResult`, `SandboxStatus`, `SandboxEventSummary`,
   `EnforcementEventSummary`).
 
-Temporary task containers and zones have cancellation cleanup guards. If a
-client disconnects while the request future is running, the daemon schedules
-forced deletion for resources it owns.
+Accepted tasks are owned by the daemon, independently of the request connection.
+A client disconnect does not cancel execution: retrieve the result by task ID.
+Graceful daemon shutdown waits for those tasks before removing network controls;
+use task timeouts to bound execution. Forced daemon termination uses recovery.
 
 ## Result Contract
 
@@ -97,14 +98,44 @@ silently runs the task twice.
 
 `evidence.results_max_bytes` defaults to 64 MiB of payload capacity. Each task
 reserves 4 MiB before executing; completed results occupy their actual encoded
-size, while interrupted reservations keep the full budget. Database bookkeeping
+size after cleanup, while interrupted or cleanup-pending tasks keep the full budget. Database bookkeeping
 is additional. Capacity exhaustion refuses
 new tasks before execution; results are not silently evicted. Explicitly release
 capacity with `rauha sandbox-result <task-id> --delete`. Active tasks cannot be
 deleted, including after restart while their container still requires cleanup.
 Requests refused before execution release their reservation. A reservation
 without a completed result means running or interrupted,
-not “nothing happened”; this is result retention, not task resume or replay.
+not “nothing happened”.
+
+### Durable task recovery
+
+After admission and before container creation, the daemon commits recovery
+context to the existing redb database: task and zone identity, cleanup ownership,
+command, policy and input commitments, and admission limits. Environment values
+are hashed with the inputs rather than copied into this context. The image
+commitment is updated after container creation and before start. Each recovery
+record is capped at 4 MiB, in addition to the reserved result budget.
+
+The signed result is committed **before** deleting the container, raw output or
+temporary zone. Recovery context is removed only after cleanup succeeds.
+On daemon startup, before accepting requests:
+
+- Already committed results remain byte-for-byte unchanged; pending cleanup is retried.
+- For an uncommitted task, the surviving shim is consulted and any running
+  task is stopped. Available output is captured and a signed `runtime_error`
+  result is stored with no exit-code claim and explicit `runtime.interrupted`,
+  `execution.outcome_unknown`, and `enforcement_events.recovery_gap` issues.
+- The command is never restarted. A stopped task whose result was not committed
+  also remains uncertain; recovery does not infer success from partial evidence.
+- If state cannot be reconciled or a task cannot be stopped, startup fails and
+  preserves the recovery record for repair and retry. No successful recovery is claimed.
+
+This covers admitted tasks created by this version across daemon crashes. A
+crash before the recovery-context commit cannot have started the task, but may
+leave a pre-admission reservation or zone for explicit cleanup. Older empty
+reservations have no recovery context and still require operator resolution.
+Loss of both the daemon and shim, host reboot, agent checkpoints/resumption,
+portable Run journals, and ownership epochs are not implemented by this slice.
 
 Per-container caps bound workload output, not the total number of containers
 an authorized host client can create. Old orphan logs from earlier versions
@@ -115,6 +146,10 @@ Live regression (Linux, isolated daemon with Alpine pulled, default budgets):
 Run the test executable as a user able to inspect the daemon's root-only logs.
 The Linux gate also runs `recovered_shim_cleanup` after its live crash-recovery
 probe, checking that deleting the recovered zone shuts down its surviving shim.
+It additionally runs `transport_disconnect` and the two-phase
+`durable_recovery_prepare` / `durable_recovery_verify` tests, with a daemon
+SIGKILL and restart between phases. Set `RAUHA_TEST_TASK_RECOVERY_STATE` to the
+same state-file path for both phases.
 
 ## Runtime Flow
 
@@ -127,7 +162,9 @@ probe, checking that deleting the recovered zone shuts down its surviving shim.
 4. Capture stdout, stderr, exit code, and wall-clock duration.
 5. Collect zone-level audit events and (where available) Linux kernel
    enforcement events.
-6. Clean up the zone unless `keep_zone` is set.
-7. Build a `SandboxResult` and return it. CLI then renders human or JSON
+6. Build, sign and durably save the `SandboxResult`.
+7. Delete the container and clean up the zone unless `keep_zone` is set;
+   retain recovery context if cleanup fails.
+8. Return the saved result. CLI then renders human or JSON
    output via the existing `OutputMode` plumbing and mirrors the task exit
    code.

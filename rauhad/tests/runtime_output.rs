@@ -16,6 +16,224 @@ mod container {
     tonic::include_proto!("rauha.container.v1");
 }
 
+async fn detached_task(script: &str) -> (String, container::ContainerInfo) {
+    let endpoint =
+        std::env::var("RAUHA_TEST_ENDPOINT").unwrap_or_else(|_| "http://[::1]:9876".into());
+    let mut client = pb::sandbox_service_client::SandboxServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
+    let mut containers =
+        container::container_service_client::ContainerServiceClient::connect(endpoint)
+            .await
+            .unwrap();
+    let id = format!("task-{}", uuid::Uuid::new_v4());
+    let request = pb::RunSandboxRequest {
+        task_id: id.clone(),
+        image: "alpine:latest".into(),
+        command: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        audit: true,
+        ..Default::default()
+    };
+    let run = tokio::spawn(async move { client.run_sandbox(request).await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let run_dir = std::env::var("RAUHA_TEST_RUN_DIR").expect("set isolated daemon run dir");
+    loop {
+        let list = containers
+            .list_containers(container::ListContainersRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        if let Some(container) = list
+            .containers
+            .into_iter()
+            .find(|c| c.name == format!("{id}-task") && c.state == "Running")
+        {
+            let log = Path::new(&run_dir)
+                .join("containers")
+                .join(&container.id)
+                .join("stdout.log");
+            if std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .contains("before-interruption")
+            {
+                run.abort();
+                let _ = run.await;
+                return (id, container);
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "task did not start");
+        assert!(!run.is_finished(), "task ended before disconnect probe");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn verify_result_receipts(result: &pb::SandboxResult) {
+    let receipt: rauha_evidence::receipt::SignedExecutionReceipt =
+        serde_json::from_str(&result.receipt_json).unwrap();
+    receipt.verify().unwrap();
+    assert_eq!(receipt.payload.capture_issues, result.capture_issues);
+    assert_eq!(receipt.payload.status, result.status);
+    assert_eq!(receipt.payload.exit_code, result.exit_code);
+    assert_eq!(
+        receipt.payload.outputs_sha256,
+        rauha_evidence::receipt::sha256_json(&json!({
+            "salt": result.task_id, "status": result.status, "exit_code": result.exit_code,
+            "stdout": result.stdout, "stderr": result.stderr,
+        }))
+        .unwrap()
+    );
+    let envelope: rauha_evidence::dsse::DsseEnvelope =
+        serde_json::from_str(&result.receipt_dsse_json).unwrap();
+    assert_eq!(
+        envelope.verify_public_hex(&receipt.public_key).unwrap(),
+        rauha_evidence::dsse::statement_from_payload(receipt.payload)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Linux daemon and its log directory"]
+async fn transport_disconnect_keeps_result_retrievable() {
+    let (id, _) = detached_task("echo before-interruption; sleep 2; echo after-disconnect").await;
+    let endpoint =
+        std::env::var("RAUHA_TEST_ENDPOINT").unwrap_or_else(|_| "http://[::1]:9876".into());
+    let mut client = pb::sandbox_service_client::SandboxServiceClient::connect(endpoint)
+        .await
+        .unwrap();
+    let key = pb::SandboxResultRequest { task_id: id };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let result = loop {
+        match client.get_sandbox_result(key.clone()).await {
+            Ok(result) => break result.into_inner(),
+            Err(e) => assert_eq!(e.code(), Code::FailedPrecondition),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disconnected task lost its result"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(result.status, "succeeded");
+    assert_eq!(result.stdout, "before-interruption\nafter-disconnect\n");
+    verify_result_receipts(&result);
+    // The result can become visible before cleanup is finished.
+    loop {
+        match client.delete_sandbox_result(key.clone()).await {
+            Ok(response) => {
+                assert!(response.into_inner().deleted);
+                break;
+            }
+            Err(e) => assert_eq!(e.code(), Code::FailedPrecondition),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cleanup did not finish"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    println!("PASS disconnect: task completed once and its signed result remained retrievable");
+}
+
+#[tokio::test]
+#[ignore = "prepare phase: kill and restart daemon before durable_recovery_verify"]
+async fn durable_recovery_prepare() {
+    let (id, container) =
+        detached_task("echo before-interruption; sleep 300; echo should-not-run").await;
+    let state = std::env::var("RAUHA_TEST_TASK_RECOVERY_STATE").expect("set recovery state path");
+    std::fs::write(state, serde_json::to_vec(&json!({
+        "task_id": id, "container_id": container.id, "zone": container.zone_name, "pid": container.pid,
+    })).unwrap()).unwrap();
+    println!(
+        "PASS prepared durable task {id}, pid={}; disconnect complete, ready for SIGKILL",
+        container.pid
+    );
+}
+
+#[tokio::test]
+#[ignore = "verify phase: requires daemon restart after durable_recovery_prepare"]
+async fn durable_recovery_verify() {
+    let state = std::env::var("RAUHA_TEST_TASK_RECOVERY_STATE").expect("set recovery state path");
+    let saved_result_path = Path::new(&state).with_extension("result");
+    let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state).unwrap()).unwrap();
+    let id = state["task_id"].as_str().unwrap();
+    let endpoint =
+        std::env::var("RAUHA_TEST_ENDPOINT").unwrap_or_else(|_| "http://[::1]:9876".into());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut client = loop {
+        match pb::sandbox_service_client::SandboxServiceClient::connect(endpoint.clone()).await {
+            Ok(client) => break client,
+            Err(error) => assert!(
+                std::time::Instant::now() < deadline,
+                "daemon did not recover: {error}"
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let key = pb::SandboxResultRequest { task_id: id.into() };
+    let result = client
+        .get_sandbox_result(key.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(result.status, "runtime_error");
+    assert_eq!(result.exit_code, None);
+    assert_eq!(result.stdout, "before-interruption\n");
+    assert!(result
+        .capture_issues
+        .contains(&"execution.outcome_unknown".into()));
+    assert!(result
+        .capture_issues
+        .contains(&"enforcement_events.recovery_gap".into()));
+    verify_result_receipts(&result);
+    match std::fs::read(&saved_result_path) {
+        Ok(bytes) => assert_eq!(
+            bytes,
+            result.encode_to_vec(),
+            "recovery changed a committed result"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(saved_result_path, result.encode_to_vec()).unwrap()
+        }
+        Err(error) => panic!("cannot read saved probe result: {error}"),
+    }
+    assert_eq!(
+        client.get_sandbox_result(key).await.unwrap().into_inner(),
+        result
+    );
+    assert_eq!(
+        client
+            .run_sandbox(pb::RunSandboxRequest {
+                task_id: id.into(),
+                image: "alpine:latest".into(),
+                command: vec!["/bin/true".into()],
+                audit: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let mut zones = zone::zone_service_client::ZoneServiceClient::connect(endpoint)
+        .await
+        .unwrap();
+    assert_eq!(
+        zones
+            .get_zone(zone::GetZoneRequest {
+                name: state["zone"].as_str().unwrap().into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let run_dir = std::env::var("RAUHA_TEST_RUN_DIR").expect("set isolated daemon run dir");
+    assert!(!Path::new(&run_dir)
+        .join("containers")
+        .join(state["container_id"].as_str().unwrap())
+        .exists());
+    println!("PASS recovery: signed uncertain result, captured prefix, no replay, no leftover zone or raw logs");
+}
+
 #[test]
 #[ignore = "requires completed live daemon crash-recovery probe"]
 fn recovered_shim_cleanup() {

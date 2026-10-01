@@ -89,6 +89,10 @@ must fit 4 MiB. The existing redb database (0600) reserves result capacity befor
 execution and saves results before delivery. `GetSandboxResult` and
 `DeleteSandboxResult` back `rauha sandbox-result <task-id> [--delete]`; duplicate
 retained IDs never re-execute. Container deletion removes raw logs and shim state.
+Admitted tasks persist recovery context before execution and save the signed
+result before cleanup. Client disconnects leave the daemon-owned task running.
+Startup recovery stops interrupted tasks, seals explicit uncertainty without
+replaying commands, and retries cleanup of already committed results.
 See `docs/sandbox-runtime.md` for budgets, interruption semantics and the live Rust
 regression required by the Linux gate.
 

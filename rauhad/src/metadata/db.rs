@@ -47,6 +47,9 @@ impl MetadataStore {
             write_txn
                 .open_table(super::results::RESULTS_TABLE)
                 .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
+            write_txn
+                .open_table(super::recovery::RECOVERY_TABLE)
+                .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
         }
         write_txn
             .commit()
