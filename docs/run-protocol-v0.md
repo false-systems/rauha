@@ -1,7 +1,10 @@
 # Run Protocol v0
 
-Status: draft contract, 2026-08-27. Nothing here is implemented yet. The
-purpose of this document is to fix the vocabulary and the invariants before
+Status: draft contract, 2026-08-27; lifecycle implementation added 2026-10-01.
+`rauha-common::run` implements pure lifecycle reduction (RP-1–RP-4), with
+replay and refusal checks. It is not yet connected to the CLI or daemon;
+durable journals, ownership, effects, and the remaining invariants are unimplemented.
+The purpose of this document is to fix the vocabulary and the invariants before
 the tier-0 Rust supervisor, the OTP manager, and the tools that consume runs
 are built against them.
 
@@ -49,7 +52,7 @@ preparing → running → waiting → delegated → proving → review → accep
 |---|---|---|
 | `preparing` | Run created; Sandbox being materialized; capabilities not yet granted. | `run.created` |
 | `running` | Agent executing inside the Sandbox with granted capabilities. | `sandbox.ready`, `run.resumed` |
-| `waiting` | Agent stopped on purpose: awaiting human input, an approval, a delegated child, or a lease renewal. | `run.waiting`, `run.frozen` |
+| `waiting` | Agent stopped on purpose: awaiting human input, an approval, a delegated child, or a lease renewal. | `run.waiting` |
 | `frozen` | Custodian stopped the Sandbox (lease expired, disconnection, operator). Capabilities closed. Distinct from `waiting` because the agent did not choose it. | `run.frozen` |
 | `delegated` | Control handed to one or more child Runs; parent resumes when they finish. | `run.delegated` |
 | `proving` | Declared proof gates executing (tests, check runners). | `proof.started` |
@@ -65,6 +68,37 @@ preparing → running → waiting → delegated → proving → review → accep
   `receipt.sealed` and `journal.compacted` is a protocol error.
 - **RP-4** `frozen` can only be entered by a custodian event, never by a
   supervisor event.
+
+### Initial reducer transition rules
+
+The diagram above is illustrative. The initial implementation uses these
+explicit rules; it does not infer transitions from event names:
+
+| Event | Allowed prior state | Next state |
+|---|---|---|
+| `run.created` | no Run yet | `preparing` |
+| `sandbox.ready` | `preparing` | `running` |
+| `run.waiting` | `running` | `waiting` |
+| `run.resumed` | `waiting`, `frozen`, `delegated` | `running` |
+| `run.frozen` | `preparing`, `running`, `waiting`, `delegated`, `proving` | `frozen` |
+| `run.delegated` | `running`, `waiting` | `delegated` |
+| `proof.started` | `running`, `waiting`, `delegated` | `proving` |
+| `proof.finished` | `proving` | `review` |
+| `run.accepted` | `review` | `accepted` |
+| `run.discarded` | any nonterminal state | `discarded` |
+
+Other catalogued events preserve lifecycle state. `child.finished` alone does
+not resume a parent; the supervisor must explicitly emit `run.resumed`.
+`sandbox.ready` and `run.frozen` require the custodian; the other lifecycle
+events require the supervisor. RP-3 takes precedence over unknown-event
+handling once terminal. Unknown kinds return the unchanged state and the
+offending kind for the caller to record as `journal.unknown_event`; replaying
+that marker never produces another marker.
+
+The reducer performs no I/O. Its caller must authenticate event origins,
+validate bodies and ownership epochs, and persist the journal before
+publishing state or performing sandbox actions. The `Emitter` argument is a
+trusted input from that caller, not an authorization claim from the workload.
 
 ## 3. Journal
 
@@ -100,7 +134,7 @@ preparing → running → waiting → delegated → proving → review → accep
 | `supervisor.released` | custodian | `epoch`, reason |
 | `sandbox.materialized` / `sandbox.ready` / `sandbox.destroyed` | custodian | checkpoint id, zone id |
 | `capability.granted` / `capability.revoked` | custodian | capability, grant id, scope |
-| `effect.requested` … `effect.uncertain` | capability broker | see §6 |
+| `effect.requested` … `effect.uncertain`, `effect.reconciled` | capability broker (`effect.authorized`: supervisor) | see §6 |
 | `run.waiting` / `run.resumed` / `run.frozen` | supervisor / custodian | reason, checkpoint id |
 | `run.delegated` / `child.finished` | supervisor | child run ids |
 | `checkpoint.sealed` | custodian | journal prefix hash, snapshot id |
