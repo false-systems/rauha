@@ -6,6 +6,9 @@ contract lives in [`run-protocol-v0.md`](run-protocol-v0.md), and the
 market/kernel research behind the hardening roadmap in
 [`positioning-and-roadmap.md`](positioning-and-roadmap.md)._
 
+_Platform direction updated 2026-10-01: Linux only. macOS product work is out
+of scope; the earlier macOS-first launch plan is superseded._
+
 > **Docker made applications portable across computers. Rauha makes agentic work portable across agents, environments and stages.**
 
 > **Any agent. Any environment. One Run.**
@@ -464,7 +467,7 @@ rauha run -- claude -p "fix issue 412"
 
 It includes:
 
-- macOS first.
+- Linux only, on a tested set of supported hosts.
 - One supported coding agent.
 - One or two supported project ecosystems.
 - A copy-on-write workspace constructed from Git-tracked files by default.
@@ -483,7 +486,7 @@ It includes:
 
 The five-minute test:
 
-> **A stranger with a Mac and a failing test receives the result card within five minutes of install, without reading documentation.**
+> **A stranger on a supported Linux host with a failing test receives the result card within five minutes of install, without reading documentation.**
 
 The first version should not attempt remote continuation, production coordination, shared organizational behavioural classes, live fork, child-agent trees or every language ecosystem.
 
@@ -506,8 +509,7 @@ Developers see Rauha. The implementation may reuse:
 
 ## Platform truth
 
-- **macOS:** a sandbox uses a Linux VM built with Virtualization.framework and requires no host-root privilege. The initial image supports only selected agents and toolchains.
-- **Linux:** namespaces, cgroups and eBPF-LSM may provide the sandbox boundary. Selected host tools may be exposed read-only, and the exact method is recorded. Supported distributions and BPF-LSM requirements belong in a tested compatibility matrix, not a broad product promise.
+- **Linux only:** namespaces, cgroups and eBPF-LSM provide the current sandbox boundary. A future microVM tier runs the same Linux enforcement and evidence stack inside the guest. Selected host tools may be exposed read-only, and the exact method is recorded. Supported distributions and BPF-LSM requirements belong in a tested compatibility matrix, not a broad product promise.
 - A `Dockerfile` or `devcontainer.json` is not required. Rauha may later use existing project configuration as a hint.
 - Known host credential paths are excluded by policy and every exclusion is reported. Rauha never claims to discover every possible secret by filename.
 
@@ -568,11 +570,11 @@ The Godzilla test is architectural: if a large vendor produces a better sandbox 
 ## Decisions still required
 
 - Which coding agent ships first.
-- Which one or two project ecosystems ship in the first macOS image.
+- Which one or two project ecosystems ship in the first Linux image.
 - The exact Git snapshot policy for tracked modifications, submodules and large files.
 - The protocol and identity binding for local capability handles.
 - How pending external effects are approved independently from applying code changes.
-- The macOS witness trust boundary and which observations are independently verifiable from outside the guest.
+- For the future microVM tier, the witness trust boundary and which observations are independently verifiable from outside the guest.
 - The Run Protocol: canonical journal events, ownership epochs, checkpoints, forks and reconstruction.
 - The minimum sandbox-backend contract and the first two implementations that prove portability.
 - The conservative comparison key for the first Behaviour Diff: work type, repository state, environment, authority, tools and provenance.
