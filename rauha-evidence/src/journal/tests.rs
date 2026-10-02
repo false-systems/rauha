@@ -2,6 +2,7 @@ use super::*;
 use serde_json::json;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -92,7 +93,8 @@ fn corruption_in_committed_data_is_never_repaired_or_replayed() {
             )
             .unwrap(),
             "sequence" | "prev" | "body" => {
-                let mut entry: Entry = read_record_file(&path.join("journal.jsonl")).unwrap();
+                let mut entry: Entry =
+                    read_record_file(File::open(path.join("journal.jsonl")).unwrap()).unwrap();
                 match damage {
                     "sequence" => entry.seq = 2,
                     "prev" => entry.prev = "sha256:wrong".into(),
@@ -115,7 +117,8 @@ fn corruption_in_committed_data_is_never_repaired_or_replayed() {
                     .unwrap()
             }
             _ => {
-                let mut head: JournalHead = read_record_file(&path.join("head")).unwrap();
+                let mut head: JournalHead =
+                    read_record_file(File::open(path.join("head")).unwrap()).unwrap();
                 match damage {
                     "head_sequence" => head.sequence += 1,
                     "head_root" => head.journal_root = "sha256:wrong".into(),
@@ -277,6 +280,205 @@ fn crash_child() {
             .unwrap();
     }
     panic!("crash boundary was not reached");
+}
+
+#[test]
+#[ignore = "subprocess helper isolates process-wide cwd changes"]
+fn directory_identity_child() {
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::env::set_current_dir(&a).unwrap();
+    let mut journal = Journal::create(Path::new("run"), json!({})).unwrap();
+    std::env::set_current_dir(&b).unwrap();
+    let other = Journal::create(Path::new("run"), json!({})).unwrap();
+    journal.append("run.created", 1, json!({})).unwrap();
+    drop(journal);
+    std::env::set_current_dir(&a).unwrap();
+    let mut journal = Journal::open(Path::new("run")).unwrap();
+    std::env::set_current_dir(&b).unwrap();
+    let moved = a.join("moved");
+    std::fs::rename(a.join("run"), &moved).unwrap();
+    let replacement = Journal::create(&a.join("run"), json!({})).unwrap();
+    journal.append("run.waiting", 1, json!({})).unwrap();
+    assert_eq!(entries(&journal).len(), 2);
+    assert!(matches!(Journal::open(&moved), Err(Error::Busy)));
+    drop(journal);
+    assert_eq!(Journal::open(&moved).unwrap().head().sequence, 2);
+    for (path, untouched) in [(a.join("run"), replacement), (b.join("run"), other)] {
+        let head = untouched.head().clone();
+        drop(untouched);
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(reopened.head(), &head);
+        assert_eq!(reopened.uncommitted_bytes(), 0);
+    }
+    // Leave cwd before TempDir removes it.
+    std::env::set_current_dir(tmp.path().parent().unwrap()).unwrap();
+}
+
+#[test]
+fn directory_identity_survives_cwd_changes_and_rename() {
+    assert!(Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "journal::tests::directory_identity_child",
+            "--ignored"
+        ])
+        .status()
+        .unwrap()
+        .success());
+}
+
+fn nested_value(depth: usize) -> Value {
+    let mut value = Value::Null;
+    for level in 0..depth {
+        value = if level % 2 == 0 {
+            Value::Array(vec![value])
+        } else {
+            let mut map = serde_json::Map::new();
+            map.insert("x".into(), value);
+            Value::Object(map)
+        };
+    }
+    value
+}
+
+#[test]
+#[ignore = "subprocess helper contains stack-overflow regressions"]
+fn deep_input_child() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("run");
+    assert!(Journal::create(&path, nested_value(100_000)).is_err());
+    assert!(!path.exists());
+    let mut journal = seed(&path);
+    let head = journal.head().clone();
+    for kind in ["run.waiting", "BAD"] {
+        assert!(journal.append(kind, 1, nested_value(100_000)).is_err());
+    }
+    assert_eq!(journal.head(), &head);
+    assert_eq!(journal.log.metadata().unwrap().len(), head.journal_bytes);
+    journal
+        .append("run.waiting", 1, nested_value(MAX_INPUT_DEPTH))
+        .unwrap();
+    assert!(journal
+        .append("run.waiting", 1, nested_value(MAX_INPUT_DEPTH + 2))
+        .is_err());
+    drop(journal);
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(entries(&journal).len(), 2);
+    drop(journal);
+    // Early refusal of an already damaged journal must also dispose safely.
+    OpenOptions::new()
+        .append(true)
+        .open(path.join("journal.jsonl"))
+        .unwrap()
+        .write_all(b"tail")
+        .unwrap();
+    let mut journal = Journal::open(&path).unwrap();
+    assert!(journal
+        .append("run.waiting", 1, nested_value(100_000))
+        .is_err());
+    assert_eq!(journal.uncommitted_bytes(), 4);
+    println!("PASS: 100,000-level owned input rejected and dropped safely; depth limit reopens");
+}
+
+#[test]
+fn pathological_input_cannot_abort_the_writer() {
+    assert!(Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "journal::tests::deep_input_child",
+            "--ignored",
+            "--nocapture"
+        ])
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[test]
+#[ignore = "subprocess helper installs an irreversible fsync failure filter"]
+fn recovery_sync_child() {
+    let path = PathBuf::from(std::env::var_os("RAUHA_JOURNAL_TEST_PATH").unwrap());
+    if std::env::var_os("RAUHA_JOURNAL_FAIL_SYNC").is_some() {
+        // Inject a real EIO at the syscall boundary, with no production I/O
+        // abstraction or test-only alternative recovery implementation.
+        let mut filter = [
+            libc::sock_filter {
+                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_fsync as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | libc::EIO as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // SAFETY: the filter and program remain live for prctl to copy. This
+        // affects only the isolated helper thread and denies only fsync.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+                0
+            );
+        }
+        assert!(
+            matches!(Journal::open(&path), Err(Error::Io(e)) if e.raw_os_error() == Some(libc::EIO))
+        );
+        println!("PASS: recovery refused to expose a head when fsync returned EIO");
+    } else {
+        let journal = Journal::open(&path).unwrap();
+        assert_eq!(journal.head().sequence, 2);
+        assert_eq!(entries(&journal).len(), 2);
+        println!("PASS: recovered renamed head verified and synced");
+    }
+}
+
+#[test]
+fn recovery_must_sync_before_exposing_a_renamed_head() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("run");
+    drop(seed(&path));
+    crash(&path, "head_renamed", false);
+    let before = std::fs::read(path.join("journal.jsonl")).unwrap();
+    for fail in [true, false] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "journal::tests::recovery_sync_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RAUHA_JOURNAL_TEST_PATH", &path);
+        if fail {
+            command.env("RAUHA_JOURNAL_FAIL_SYNC", "1");
+        }
+        assert!(command.status().unwrap().success());
+        assert_eq!(std::fs::read(path.join("journal.jsonl")).unwrap(), before);
+    }
 }
 
 fn crash(path: &Path, stage: &str, create: bool) {

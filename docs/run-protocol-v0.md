@@ -138,6 +138,9 @@ releases the lock. The parent directory must already exist and be trusted.
 Directories are created mode 0700 and files mode 0600. Symlink files and
 nonregular files are refused. The lock coordinates cooperating writers; it
 does not protect against a privileged process replacing the directory.
+After opening the directory, all child opens and head replacement use that
+directory descriptor. Changing the working directory or renaming the Run
+directory cannot redirect a live handle into another Run.
 
 This slice uses a **JournalHead**, a storage commit marker, not the complete
 ownership-bearing RunHead in §5. Its fields are `manifest_sha256`, `sequence`,
@@ -155,6 +158,10 @@ Floating-point parsing uses serde_json's round-trip mode. This is the local
 v0 encoding, not a claim of RFC 8785 interoperability. Each manifest, head,
 or entry is limited to 1 MiB including its newline; verification streams one
 entry at a time rather than loading the entire journal.
+Constructed manifest and body inputs are limited to 120 nested containers,
+leaving room for the entry envelope beneath the JSON reader's nesting limit.
+The limit is checked before recursive serialization; rejected owned trees
+are disposed of iteratively so even rejection cannot overflow the stack.
 
 Append writes the entry, syncs the journal, writes and syncs `head.next`,
 renames it over `head`, then syncs the directory before acknowledging success.
@@ -164,7 +171,10 @@ the new head is already visible. No retry may assume the event was absent.
 
 Reopening verifies the manifest, dense sequence, previous hashes, final root,
 and exact committed length. Corrupt or missing committed data returns an
-error without rewriting history. Replay visits records only after a full
+error without rewriting history. Before exposing the verified head, reopening
+syncs the directory under the writer lock: a killed writer may have completed
+the rename without its directory sync. A sync failure refuses the open.
+Replay visits records only after a full
 verification pass succeeds. Semantic manifest/body validation, emitter
 authentication, epoch fencing and lifecycle reduction remain the caller's job.
 
