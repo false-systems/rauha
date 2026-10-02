@@ -115,6 +115,9 @@ command, policy and input commitments, and admission limits. Environment values
 are hashed with the inputs rather than copied into this context. The image
 commitment is updated after container creation and before start. Each recovery
 record is capped at 4 MiB, in addition to the reserved result budget.
+Before that commit, image references are validated and a failure result with
+both real receipt encodings must fit the 1 MiB metadata budget. Refused requests
+release their reservation; oversized receipt metadata cannot poison recovery.
 
 The signed result is committed **before** deleting the container, raw output or
 temporary zone. Recovery context is removed only after cleanup succeeds.

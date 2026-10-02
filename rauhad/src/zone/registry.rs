@@ -1123,6 +1123,43 @@ mod tests {
         test_registry_with_backend(tmp, Arc::new(MockBackend::new()))
     }
 
+    #[tokio::test]
+    async fn refused_receipt_metadata_cannot_poison_recovery() {
+        use crate::server::{
+            pb::sandbox::{sandbox_service_server::SandboxService, RunSandboxRequest},
+            SandboxServiceImpl,
+        };
+        let tmp = TempDir::new().unwrap();
+        let reg = Arc::new(test_registry(&tmp));
+        reg.create_zone("budget", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        let signer =
+            rauha_evidence::receipt::ReceiptSigner::load_or_create(&tmp.path().join("key"))
+                .unwrap();
+        let service = SandboxServiceImpl::new(reg.clone(), None, signer);
+        // The original escape-expansion attack, and a syntactically valid name
+        // whose two receipt encodings exceed the metadata budget.
+        for image in ["\0".repeat(400_000), "a".repeat(800_000)] {
+            let id = format!("task-{}", Uuid::new_v4());
+            let error = service
+                .run_sandbox(tonic::Request::new(RunSandboxRequest {
+                    task_id: id.clone(),
+                    name: "budget".into(),
+                    image,
+                    command: vec!["true".into()],
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(reg.metadata.get_result(&id).unwrap().is_none());
+            assert!(!reg.metadata.has_recovery(&id).unwrap());
+            service.recover_tasks().await.unwrap();
+            assert!(reg.metadata.list_containers(None).unwrap().is_empty());
+        }
+    }
+
     fn test_registry_with_backend(tmp: &TempDir, backend: Arc<MockBackend>) -> ZoneRegistry {
         let db_path = tmp.path().join("test.redb");
         let content_path = tmp.path().join("content");

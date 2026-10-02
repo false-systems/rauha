@@ -1949,6 +1949,13 @@ fn validate_sandbox_request(req: &pb::sandbox::RunSandboxRequest) -> Result<(), 
     if req.image.trim().is_empty() {
         return Err(Status::invalid_argument("image is required"));
     }
+    if !req.image.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'.' | b'/' | b':' | b'_' | b'-' | b'@' | b'[' | b']')
+    }) || rauha_oci::reference::ImageReference::parse(&req.image).is_err()
+    {
+        return Err(Status::invalid_argument("invalid image reference"));
+    }
     if req.command.is_empty() {
         return Err(Status::invalid_argument("command must not be empty"));
     }
@@ -2125,6 +2132,25 @@ fn seal_bounded_result(
             return Err("sandbox result metadata exceeds the wire budget".into());
         }
     }
+}
+
+/// Measure both real receipt encodings before taking durable ownership. Keep
+/// the existing 1 MiB metadata budget, leaving room for output and later events.
+fn validate_recovery_budget(record: &RecoveryRecord, signer: &ReceiptSigner) -> Result<(), String> {
+    let result = pb::sandbox::SandboxResult {
+        task_id: record.receipt.task_id.clone(),
+        zone_id: record.receipt.zone_id.clone(),
+        command: record.command.clone(),
+        status: "runtime_error".into(),
+        admission: admission_str(record.admission).into(),
+        unavailable_controls: record.receipt.unavailable_controls.clone(),
+        ..Default::default()
+    };
+    let result = seal_bounded_result(result, record.receipt.clone(), signer)?;
+    if result.encoded_len() > rauha_common::sandbox::MAX_RESULT_BYTES / 4 {
+        return Err("sandbox receipt metadata exceeds the metadata budget (1 MiB)".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2456,6 +2482,8 @@ impl SandboxServiceImpl {
                 receipt: recovery_receipt(&task_id, &zone_id, &req, &policy, unavailable_controls.clone())
                     .map_err(to_internal_status)?,
             };
+            validate_recovery_budget(&recovery, &self.receipt_signer)
+                .map_err(Status::invalid_argument)?;
             self.registry.metadata().put_recovery(&recovery).map_err(to_internal_status)?;
             active.execution_attempted = true;
             // Durable recovery now owns cleanup. No guard may erase output
@@ -2610,7 +2638,13 @@ mod tests {
 
     #[test]
     fn valid_request_passes_validation() {
-        assert!(validate_sandbox_request(&req("alpine", vec!["echo", "hi"])).is_ok());
+        for image in [
+            "alpine",
+            "localhost:5000/team/image:v1",
+            "[::1]:5000/image:latest",
+        ] {
+            assert!(validate_sandbox_request(&req(image, vec!["echo", "hi"])).is_ok());
+        }
     }
 
     #[test]
