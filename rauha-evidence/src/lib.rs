@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod dsse;
+#[cfg(target_os = "linux")]
+pub mod journal;
 pub mod receipt;
 
 pub mod event_name {
