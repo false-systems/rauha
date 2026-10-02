@@ -135,6 +135,9 @@ streaming `replay` on Linux. It writes `manifest.json`, `journal.jsonl`, and
 `head` beneath a caller-owned directory. A persistent `.writer.lock` inode
 holds an exclusive OS lock for the lifetime of the handle; process death
 releases the lock. The parent directory must already exist and be trusted.
+Dropping the handle explicitly unlocks before closing the descriptor; a
+concurrent fork awaiting exec must not prolong writer ownership. A raw-fork
+child must exec or exit without using the inherited journal handle.
 Directories are created mode 0700 and files mode 0600. Symlink files and
 nonregular files are refused. The lock coordinates cooperating writers; it
 does not protect against a privileged process replacing the directory.
@@ -174,8 +177,8 @@ and exact committed length. Corrupt or missing committed data returns an
 error without rewriting history. Before exposing the verified head, reopening
 syncs the directory under the writer lock: a killed writer may have completed
 the rename without its directory sync. A sync failure refuses the open.
-Replay visits records only after a full
-verification pass succeeds. Semantic manifest/body validation, emitter
+Replay visits records only after a full verification pass succeeds.
+Semantic manifest/body validation, emitter
 authentication, epoch fencing and lifecycle reduction remain the caller's job.
 
 In keeping with the append-only rule, bytes after the committed prefix are
@@ -195,8 +198,11 @@ cargo test -p rauha-evidence journal:: -- --nocapture
 They SIGKILL a subprocess at creation and append boundaries, including a
 partial line and either side of head replacement; verify writer-lock release;
 reject corruption, ambiguous JSON, oversize data and symlinks; and preserve
-uncommitted bytes. These are process-crash tests on a local filesystem. They
-do not simulate a physical power failure or certify network-filesystem semantics.
+uncommitted bytes. Syscall fault tests inject EIO and ENOSPC during append,
+head publication and sync, and a file-size limit forces a real short write.
+Further tests contend across four writer processes and repeatedly kill append
+and recovery on the same Run. The manual disposable-VM probe and its durability
+limits are documented in [journal-testing.md](journal-testing.md).
 
 ### Event catalogue (v0)
 

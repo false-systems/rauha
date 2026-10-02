@@ -59,13 +59,24 @@ pub struct Entry {
 
 pub struct Journal {
     // Never unlink the lock file: another opener must lock the same inode.
-    _lock: File,
+    _lock: WriterLock,
     directory: File,
     log: File,
     manifest: Value,
     head: JournalHead,
     tail_bytes: u64,
     write_failed: bool,
+}
+
+struct WriterLock(File);
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // Closing alone leaves flock held by descriptors briefly inherited by
+        // another thread's fork/exec. Release on every exit, including failed
+        // open/create, before closing our descriptor.
+        let _ = self.0.unlock();
+    }
 }
 
 impl Journal {
@@ -143,6 +154,7 @@ impl Journal {
             write_failed: false,
         };
         journal.scan(|_| {})?;
+        boundary("recovery_verified");
         // A killed writer may have renamed a synced head without syncing its
         // directory. Make that verified head durable before exposing it.
         journal.directory.sync_all()?;
@@ -392,13 +404,13 @@ fn new_file(directory: &File, name: &CStr) -> Result<File> {
     )
 }
 
-fn lock(directory: &File) -> Result<File> {
+fn lock(directory: &File) -> Result<WriterLock> {
     let lock = open_at(directory, c".writer.lock", libc::O_RDWR | libc::O_CREAT)?;
     lock.try_lock().map_err(|error| match error {
         std::fs::TryLockError::WouldBlock => Error::Busy,
         std::fs::TryLockError::Error(error) => Error::Io(error),
     })?;
-    Ok(lock)
+    Ok(WriterLock(lock))
 }
 
 fn publish_head(directory: &File, head: &JournalHead) -> Result<()> {
@@ -431,6 +443,7 @@ fn boundary(_: &str) {}
 
 #[cfg(test)]
 fn boundary(stage: &str) {
+    tests::faults::at_boundary(stage);
     if std::env::var("RAUHA_JOURNAL_CRASH_AT").as_deref() == Ok(stage) {
         std::fs::write(
             std::env::var_os("RAUHA_JOURNAL_CRASH_MARKER").unwrap(),

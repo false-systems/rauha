@@ -7,6 +7,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+pub(super) mod faults;
+
 fn seed(path: &Path) -> Journal {
     let mut journal = Journal::create(path, json!({"task": "test", "agent": ["true"]})).unwrap();
     journal
@@ -232,10 +234,13 @@ fn sequence_gaps_and_duplicates_are_corruption_even_with_valid_json() {
         committed[1].seq = invalid_seq;
         let bytes: Vec<_> = committed.iter().flat_map(|e| record(e).unwrap()).collect();
         std::fs::write(path.join("journal.jsonl"), &bytes).unwrap();
-        assert!(matches!(
-            Journal::open(&path),
-            Err(Error::Invalid("sequence or hash chain mismatch"))
-        ));
+        let error = Journal::open(&path)
+            .err()
+            .expect("corrupt sequence was accepted");
+        assert!(
+            matches!(error, Error::Invalid("sequence or hash chain mismatch")),
+            "{error:?}"
+        );
         assert_eq!(std::fs::read(path.join("journal.jsonl")).unwrap(), bytes);
     }
 }
@@ -403,47 +408,7 @@ fn pathological_input_cannot_abort_the_writer() {
 fn recovery_sync_child() {
     let path = PathBuf::from(std::env::var_os("RAUHA_JOURNAL_TEST_PATH").unwrap());
     if std::env::var_os("RAUHA_JOURNAL_FAIL_SYNC").is_some() {
-        // Inject a real EIO at the syscall boundary, with no production I/O
-        // abstraction or test-only alternative recovery implementation.
-        let mut filter = [
-            libc::sock_filter {
-                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            },
-            libc::sock_filter {
-                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-                jt: 0,
-                jf: 1,
-                k: libc::SYS_fsync as u32,
-            },
-            libc::sock_filter {
-                code: (libc::BPF_RET | libc::BPF_K) as u16,
-                jt: 0,
-                jf: 0,
-                k: libc::SECCOMP_RET_ERRNO | libc::EIO as u32,
-            },
-            libc::sock_filter {
-                code: (libc::BPF_RET | libc::BPF_K) as u16,
-                jt: 0,
-                jf: 0,
-                k: libc::SECCOMP_RET_ALLOW,
-            },
-        ];
-        let program = libc::sock_fprog {
-            len: filter.len() as u16,
-            filter: filter.as_mut_ptr(),
-        };
-        // SAFETY: the filter and program remain live for prctl to copy. This
-        // affects only the isolated helper thread and denies only fsync.
-        unsafe {
-            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
-            assert_eq!(
-                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
-                0
-            );
-        }
+        faults::deny_syscall(libc::SYS_fsync, None, libc::EIO);
         assert!(
             matches!(Journal::open(&path), Err(Error::Io(e)) if e.raw_os_error() == Some(libc::EIO))
         );
@@ -483,6 +448,9 @@ fn recovery_must_sync_before_exposing_a_renamed_head() {
 
 fn crash(path: &Path, stage: &str, create: bool) {
     let marker = path.with_extension("reached");
+    if marker.exists() {
+        std::fs::remove_file(&marker).unwrap();
+    }
     let mut child = KillOnDrop(
         Command::new(std::env::current_exe().unwrap())
             .args([
