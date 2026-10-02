@@ -8,6 +8,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Wire ceiling shared with tonic's default receive limit (a protocol bound).
+pub const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
 /// Result of one sandboxed task execution.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxExecResult {
@@ -24,6 +27,8 @@ pub struct SandboxExecResult {
     pub events: Vec<SandboxEventSummary>,
     pub enforcement_events: Vec<EnforcementEventSummary>,
     pub enforcement_drop_count: u64,
+    #[serde(default)]
+    pub capture_issues: Vec<String>,
 }
 
 impl SandboxExecResult {
@@ -48,6 +53,7 @@ impl SandboxExecResult {
             events: Vec::new(),
             enforcement_events: Vec::new(),
             enforcement_drop_count: 0,
+            capture_issues: Vec::new(),
         }
     }
 }
@@ -114,6 +120,7 @@ mod tests {
             events: Vec::new(),
             enforcement_events: Vec::new(),
             enforcement_drop_count: 0,
+            capture_issues: Vec::new(),
         };
 
         let value = serde_json::to_value(&result).unwrap();

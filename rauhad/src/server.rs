@@ -1,3 +1,4 @@
+use prost::Message;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -16,7 +17,9 @@ use rauha_evidence::{
 #[cfg(target_os = "linux")]
 use rauha_evidence::{FalseEventBuilder, ResourceAttrs, BACKEND_LINUX_EBPF};
 
+use crate::metadata::recovery::RecoveryRecord;
 use crate::zone::registry::ZoneRegistry;
+mod recovery;
 
 /// Convert RauhaError to the appropriate gRPC status code.
 /// The error type system already distinguishes not-found, already-exists,
@@ -1220,6 +1223,7 @@ fn sandbox_event_builder(
         )
 }
 
+#[derive(Clone)]
 pub struct SandboxServiceImpl {
     registry: Arc<ZoneRegistry>,
     /// Broadcast of normalized kernel enforcement events, shared with the
@@ -1228,46 +1232,41 @@ pub struct SandboxServiceImpl {
     /// results carry no enforcement events.
     event_tx: Option<tokio::sync::broadcast::Sender<FalseEvent>>,
     receipt_signer: ReceiptSigner,
+    active_tasks: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    workers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-struct ContainerCleanupGuard {
-    registry: Arc<ZoneRegistry>,
-    container_id: uuid::Uuid,
-    armed: bool,
-}
+struct SandboxWorker(Arc<std::sync::atomic::AtomicUsize>);
 
-impl ContainerCleanupGuard {
-    fn new(registry: Arc<ZoneRegistry>, container_id: uuid::Uuid) -> Self {
-        Self {
-            registry,
-            container_id,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ContainerCleanupGuard {
+impl Drop for SandboxWorker {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-
-        let registry = self.registry.clone();
-        let container_id = self.container_id;
-        tokio::spawn(async move {
-            if let Err(e) = registry.delete_container(&container_id, true).await {
-                tracing::warn!(
-                    container = %container_id,
-                    %e,
-                    "failed to delete sandbox container during cancellation cleanup"
-                );
-            }
-        });
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+struct ActiveTask<'a> {
+    tasks: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    metadata: &'a crate::metadata::db::MetadataStore,
+    id: String,
+    execution_attempted: bool,
+}
+
+impl Drop for ActiveTask<'_> {
+    fn drop(&mut self) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.execution_attempted {
+            if let Err(error) = self.metadata.delete_result(&self.id) {
+                tracing::error!(task_id = %self.id, %error, "failed to release refused task reservation");
+            }
+        }
+        tasks.remove(&self.id);
+    }
+}
+
+fn valid_task_id(id: &str) -> bool {
+    id.strip_prefix("task-")
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .is_some_and(|uuid| id == format!("task-{uuid}"))
 }
 
 struct ZoneCleanupGuard {
@@ -1320,6 +1319,16 @@ impl SandboxServiceImpl {
             registry,
             event_tx,
             receipt_signer,
+            active_tasks: Default::default(),
+            workers: Default::default(),
+        }
+    }
+
+    pub async fn drain_tasks(&self) {
+        // Accepted tasks outlive RPCs. Keep enforcement and the Tokio runtime
+        // alive until they seal their results during graceful shutdown.
+        while self.workers.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
@@ -1327,15 +1336,16 @@ impl SandboxServiceImpl {
     ///
     /// Returns `Err(message)` for any failure that prevents producing a normal
     /// result (e.g. the image isn't pulled or the container won't start); the
-    /// caller turns that into a `RuntimeError` result. The container is always
-    /// deleted before returning, success or failure.
+    /// caller turns that into a `RuntimeError` result. Output and container state
+    /// remain available until the caller durably saves the signed result.
     async fn execute_task(
         &self,
         task_id: &str,
         zone_name: &str,
         zone_id: &str,
         req: &pb::sandbox::RunSandboxRequest,
-    ) -> std::result::Result<(SandboxExecResult, Option<String>), String> {
+        recovery: &mut RecoveryRecord,
+    ) -> std::result::Result<SandboxExecResult, String> {
         sandbox_event_builder(
             &self.registry,
             event_name::FS_ROOTFS_PREPARE_STARTED,
@@ -1381,11 +1391,18 @@ impl SandboxServiceImpl {
                     req.image
                 )
             })?;
-        let mut cleanup = ContainerCleanupGuard::new(self.registry.clone(), container.id);
         // The receipt must attest the manifest this container was built from,
         // so read it now — a concurrent pull of the same tag after this point
         // must not change what the receipt claims ran.
         let manifest_digest = self.registry.image_digest(&req.image).ok();
+        recovery.container_id = Some(container.id);
+        recovery.receipt.image.manifest_digest = manifest_digest.clone().unwrap_or_default();
+        recovery.receipt.image.digest_verified =
+            image_digest_pinned(&req.image, manifest_digest.as_deref());
+        self.registry
+            .metadata()
+            .put_recovery(recovery)
+            .map_err(|e| e.to_string())?;
 
         sandbox_event_builder(
             &self.registry,
@@ -1400,45 +1417,9 @@ impl SandboxServiceImpl {
         .trust_level(TrustLevel::Complete)
         .emit();
 
-        // Everything past container creation must still clean up the container,
-        // so capture the outcome and delete unconditionally afterwards. The
-        // guard covers client cancellation while this future is still running.
-        let outcome = self
-            .run_started_container(task_id, zone_name, zone_id, &container.id, req)
-            .await;
-
-        if let Err(e) = self.registry.delete_container(&container.id, true).await {
-            tracing::warn!(container = %container.id, %e, "failed to delete sandbox container");
-            sandbox_event_builder(
-                &self.registry,
-                event_name::SANDBOX_CLEANUP_PARTIAL,
-                EventOutcome::Degraded,
-                task_id,
-                zone_name,
-                zone_id,
-            )
-            .level(Severity::Warn)
-            .container_id(container.id.to_string())
-            .error("container_cleanup_failed", "cleanup", e.to_string())
-            .trust_level(TrustLevel::Partial)
-            .degraded_reason("container_delete_failed")
-            .emit();
-        } else {
-            sandbox_event_builder(
-                &self.registry,
-                event_name::SANDBOX_CLEANUP_SUCCEEDED,
-                EventOutcome::Succeeded,
-                task_id,
-                zone_name,
-                zone_id,
-            )
-            .container_id(container.id.to_string())
-            .trust_level(TrustLevel::Complete)
-            .emit();
-        }
-        cleanup.disarm();
-
-        outcome.map(|result| (result, manifest_digest))
+        // Result persistence precedes cleanup, including after interruption.
+        self.run_started_container(task_id, zone_name, zone_id, &container.id, req)
+            .await
     }
 
     async fn run_started_container(
@@ -1565,24 +1546,50 @@ impl SandboxServiceImpl {
         let cid = container_id.to_string();
         let run_dir = self.registry.config().paths.run_dir.clone();
         let log_cap = self.registry.config().evidence.sandbox_log_max_bytes;
-        let (stdout, stderr) = tokio::task::spawn_blocking(move || {
+        let captured = tokio::task::spawn_blocking(move || {
             crate::logs::read_all_capped(&cid, &run_dir, log_cap)
         })
         .await
-        .unwrap_or_default();
+        .map_err(|e| format!("output capture failed: {e}"))?;
+        let crate::logs::CapturedLogs {
+            stdout,
+            stderr,
+            issues: mut capture_issues,
+        } = captured;
         // The broker decision record is read from the same shim-written
-        // directory, same cap: the file is the authoritative, complete,
-        // ordered record — the broadcast tailer is for live streaming only
+        // directory, same cap: the file is the ordered capture, with any
+        // loss reported explicitly — the broadcast tailer is for streaming only
         // and its events are excluded from the drain below to avoid
         // duplicates.
         let cid = *container_id;
         let run_dir = self.registry.config().paths.run_dir.clone();
         let log_cap = self.registry.config().evidence.sandbox_log_max_bytes;
-        let broker_decisions = tokio::task::spawn_blocking(move || {
-            crate::broker_events::read_decisions_capped(&cid, &run_dir, log_cap)
+        let (broker_decisions, broker_issues) = tokio::task::spawn_blocking(move || {
+            let mut issues = Vec::new();
+            let decisions =
+                crate::broker_events::read_decisions_capped(&cid, &run_dir, log_cap, &mut issues);
+            (decisions, issues)
         })
         .await
-        .unwrap_or_default();
+        .map_err(|e| format!("broker capture failed: {e}"))?;
+        capture_issues.extend(broker_issues);
+        if !self
+            .registry
+            .get_zone(zone_name)
+            .await
+            .map_err(|e| e.to_string())?
+            .policy
+            .syscalls
+            .broker
+            .is_empty()
+            && !std::path::Path::new(&self.registry.config().paths.run_dir)
+                .join("containers")
+                .join(container_id.to_string())
+                .join("broker.log")
+                .exists()
+        {
+            capture_issues.push("broker.unavailable".into());
+        }
         sandbox_event_builder(
             &self.registry,
             event_name::SANDBOX_STDOUT_CAPTURED,
@@ -1593,7 +1600,20 @@ impl SandboxServiceImpl {
         )
         .container_id(container_id.to_string())
         .field("bytes", FieldValue::U64(stdout.len() as u64))
-        .trust_level(TrustLevel::Complete)
+        .trust_level(
+            if capture_issues
+                .iter()
+                .any(|issue| issue.starts_with("stdout."))
+            {
+                TrustLevel::Partial
+            } else {
+                TrustLevel::Complete
+            },
+        )
+        .field(
+            "capture_issues",
+            FieldValue::String(capture_issues.join(",")),
+        )
         .emit();
         sandbox_event_builder(
             &self.registry,
@@ -1605,7 +1625,20 @@ impl SandboxServiceImpl {
         )
         .container_id(container_id.to_string())
         .field("bytes", FieldValue::U64(stderr.len() as u64))
-        .trust_level(TrustLevel::Complete)
+        .trust_level(
+            if capture_issues
+                .iter()
+                .any(|issue| issue.starts_with("stderr."))
+            {
+                TrustLevel::Partial
+            } else {
+                TrustLevel::Complete
+            },
+        )
+        .field(
+            "capture_issues",
+            FieldValue::String(capture_issues.join(",")),
+        )
         .emit();
 
         let status = if timed_out {
@@ -1669,6 +1702,7 @@ impl SandboxServiceImpl {
             // Drain the events that landed on this task's zone while it ran.
             enforcement_events,
             enforcement_drop_count,
+            capture_issues,
         })
     }
 
@@ -1906,8 +1940,21 @@ fn project_enforcement_event(event: &FalseEvent) -> EnforcementEventSummary {
 /// Validate the request before touching any zone/container state.
 #[allow(clippy::result_large_err)] // `tonic::Status` is the handler's native error type.
 fn validate_sandbox_request(req: &pb::sandbox::RunSandboxRequest) -> Result<(), Status> {
+    // Reserve most of the reply for output/evidence rather than echoed argv.
+    if req.encoded_len() > rauha_common::sandbox::MAX_RESULT_BYTES / 4 {
+        return Err(Status::invalid_argument(
+            "sandbox request exceeds the metadata budget (1 MiB)",
+        ));
+    }
     if req.image.trim().is_empty() {
         return Err(Status::invalid_argument("image is required"));
+    }
+    if !req.image.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'.' | b'/' | b':' | b'_' | b'-' | b'@' | b'[' | b']')
+    }) || rauha_oci::reference::ImageReference::parse(&req.image).is_err()
+    {
+        return Err(Status::invalid_argument("invalid image reference"));
     }
     if req.command.is_empty() {
         return Err(Status::invalid_argument("command must not be empty"));
@@ -1992,15 +2039,278 @@ fn to_proto_result(
         unavailable_controls,
         receipt_json,
         receipt_dsse_json,
+        capture_issues: exec.capture_issues,
+    }
+}
+
+/// Persist only the input commitment; environment values are not recovery data.
+fn recovery_receipt(
+    task_id: &str,
+    zone_id: &str,
+    req: &pb::sandbox::RunSandboxRequest,
+    policy: &rauha_common::zone::ZonePolicy,
+    unavailable_controls: Vec<String>,
+) -> anyhow::Result<ExecutionReceiptPayload> {
+    let env = req.env.iter().collect::<std::collections::BTreeMap<_, _>>();
+    Ok(ExecutionReceiptPayload {
+        schema: EXECUTION_RECEIPT_SCHEMA.into(),
+        task_id: task_id.into(),
+        zone_id: zone_id.into(),
+        image: ImageAdmission {
+            reference: req.image.clone(),
+            manifest_digest: String::new(),
+            digest_verified: false,
+        },
+        policy_sha256: sha256_json(policy)?,
+        inputs_sha256: sha256_json(&serde_json::json!({
+            "salt": task_id, "image": req.image, "command": req.command,
+            "repo_path": req.repo_path, "workdir": req.workdir,
+            "timeout_seconds": req.timeout_seconds, "env": env,
+            "admission": admission_str(policy.admission),
+        }))?,
+        outputs_sha256: String::new(),
+        status: String::new(),
+        exit_code: None,
+        started_at: None,
+        finished_at: None,
+        enforcement: Default::default(),
+        unavailable_controls,
+        capture_issues: Vec::new(),
+    })
+}
+
+/// Budget the actual protobuf, including both signatures. Any reduction is
+/// recorded before re-signing, so the receipt always hashes the delivered text.
+fn seal_bounded_result(
+    mut result: pb::sandbox::SandboxResult,
+    mut payload: ExecutionReceiptPayload,
+    signer: &ReceiptSigner,
+) -> Result<pb::sandbox::SandboxResult, String> {
+    payload.status = result.status.clone();
+    payload.exit_code = result.exit_code;
+    payload.started_at = (!result.started_at.is_empty()).then(|| result.started_at.clone());
+    payload.finished_at = (!result.finished_at.is_empty()).then(|| result.finished_at.clone());
+    payload.unavailable_controls = result.unavailable_controls.clone();
+    loop {
+        result.capture_issues.sort();
+        result.capture_issues.dedup();
+        payload.capture_issues = result.capture_issues.clone();
+        payload.outputs_sha256 = sha256_json(&serde_json::json!({
+            "salt": result.task_id,
+            "status": result.status,
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }))
+        .map_err(|e| e.to_string())?;
+        let receipt = signer.sign(payload.clone());
+        receipt.verify().map_err(|e| e.to_string())?;
+        result.receipt_json = serde_json::to_string(&receipt).map_err(|e| e.to_string())?;
+        result.receipt_dsse_json =
+            serde_json::to_string(&signer.sign_dsse(payload.clone())).map_err(|e| e.to_string())?;
+        if result.encoded_len() <= rauha_common::sandbox::MAX_RESULT_BYTES {
+            return Ok(result);
+        }
+        if !result.enforcement_events.is_empty() {
+            result
+                .enforcement_events
+                .truncate(result.enforcement_events.len() / 2);
+            result
+                .capture_issues
+                .push("enforcement_events.preview_truncated".into());
+        } else if !result.stdout.is_empty() || !result.stderr.is_empty() {
+            let (text, stream) = if result.stdout.len() >= result.stderr.len() {
+                (&mut result.stdout, "stdout")
+            } else {
+                (&mut result.stderr, "stderr")
+            };
+            crate::logs::truncate_utf8(text, text.len() / 2);
+            result
+                .capture_issues
+                .push(format!("{stream}.preview_truncated"));
+        } else {
+            return Err("sandbox result metadata exceeds the wire budget".into());
+        }
+    }
+}
+
+/// Measure both real receipt encodings before taking durable ownership. Keep
+/// the existing 1 MiB metadata budget, leaving room for output and later events.
+fn validate_recovery_budget(record: &RecoveryRecord, signer: &ReceiptSigner) -> Result<(), String> {
+    let result = pb::sandbox::SandboxResult {
+        task_id: record.receipt.task_id.clone(),
+        zone_id: record.receipt.zone_id.clone(),
+        command: record.command.clone(),
+        status: "runtime_error".into(),
+        admission: admission_str(record.admission).into(),
+        unavailable_controls: record.receipt.unavailable_controls.clone(),
+        ..Default::default()
+    };
+    let result = seal_bounded_result(result, record.receipt.clone(), signer)?;
+    if result.encoded_len() > rauha_common::sandbox::MAX_RESULT_BYTES / 4 {
+        return Err("sandbox receipt metadata exceeds the metadata budget (1 MiB)".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_output_and_events_fit_and_receipts_cover_the_delivered_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = ReceiptSigner::load_or_create(&dir.path().join("key")).unwrap();
+        let result = pb::sandbox::SandboxResult {
+            task_id: "task-budget".into(),
+            status: "succeeded".into(),
+            exit_code: Some(0),
+            stdout: "�".repeat(1024 * 1024),
+            stderr: "�".repeat(1024 * 1024),
+            enforcement_events: vec![pb::sandbox::EnforcementEventSummary {
+                message: "x".repeat(5 * 1024 * 1024),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let payload = ExecutionReceiptPayload {
+            schema: EXECUTION_RECEIPT_SCHEMA.into(),
+            task_id: result.task_id.clone(),
+            zone_id: String::new(),
+            image: ImageAdmission {
+                reference: "test".into(),
+                manifest_digest: String::new(),
+                digest_verified: false,
+            },
+            policy_sha256: String::new(),
+            inputs_sha256: String::new(),
+            outputs_sha256: String::new(),
+            status: result.status.clone(),
+            exit_code: result.exit_code,
+            started_at: None,
+            finished_at: None,
+            enforcement: Default::default(),
+            unavailable_controls: Vec::new(),
+            capture_issues: Vec::new(),
+        };
+        let result = seal_bounded_result(result, payload, &signer).unwrap();
+        assert!(result.encoded_len() <= rauha_common::sandbox::MAX_RESULT_BYTES);
+        assert!(!result.capture_issues.is_empty());
+        let receipt: rauha_evidence::receipt::SignedExecutionReceipt =
+            serde_json::from_str(&result.receipt_json).unwrap();
+        receipt.verify().unwrap();
+        assert_eq!(receipt.payload.capture_issues, result.capture_issues);
+        assert_eq!(
+            receipt.payload.outputs_sha256,
+            sha256_json(&serde_json::json!({
+                "salt": result.task_id, "status": result.status, "exit_code": result.exit_code,
+                "stdout": result.stdout, "stderr": result.stderr,
+            }))
+            .unwrap()
+        );
+        let dsse: rauha_evidence::dsse::DsseEnvelope =
+            serde_json::from_str(&result.receipt_dsse_json).unwrap();
+        dsse.verify_public_hex(&receipt.public_key).unwrap();
     }
 }
 
 #[tonic::async_trait]
 impl SandboxService for SandboxServiceImpl {
+    async fn get_sandbox_result(
+        &self,
+        request: Request<pb::sandbox::SandboxResultRequest>,
+    ) -> Result<Response<pb::sandbox::SandboxResult>, Status> {
+        let id = request.into_inner().task_id;
+        if !valid_task_id(&id) {
+            return Err(Status::invalid_argument("expected task-<UUID>"));
+        }
+        let bytes = self
+            .registry
+            .metadata()
+            .get_result(&id)
+            .map_err(to_internal_status)?
+            .ok_or_else(|| Status::not_found("task result not found"))?;
+        if bytes.is_empty() {
+            return Err(Status::failed_precondition("task has no completed result: still running or interrupted; do not assume it had no effects"));
+        }
+        let result =
+            pb::sandbox::SandboxResult::decode(bytes.as_slice()).map_err(to_internal_status)?;
+        Ok(Response::new(result))
+    }
+
+    async fn delete_sandbox_result(
+        &self,
+        request: Request<pb::sandbox::SandboxResultRequest>,
+    ) -> Result<Response<pb::sandbox::DeleteSandboxResultResponse>, Status> {
+        let id = request.into_inner().task_id;
+        if !valid_task_id(&id) {
+            return Err(Status::invalid_argument("expected task-<UUID>"));
+        }
+        let tasks = self.active_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if tasks.contains(&id) {
+            return Err(Status::failed_precondition("task is still active"));
+        }
+        if self
+            .registry
+            .metadata()
+            .has_recovery(&id)
+            .map_err(to_internal_status)?
+        {
+            return Err(Status::failed_precondition(
+                "task still requires recovery or cleanup",
+            ));
+        }
+        // Container ownership survives daemon restart. Keep the identifier
+        // reserved until that ownership is released, including legacy tasks.
+        // ponytail: scan retained containers; index task ownership if this becomes hot.
+        let container_name = format!("{id}-task");
+        if self
+            .registry
+            .metadata()
+            .list_containers(None)
+            .map_err(to_internal_status)?
+            .iter()
+            .any(|container| container.name == container_name)
+        {
+            return Err(Status::failed_precondition(
+                "task container still requires cleanup",
+            ));
+        }
+        let deleted = self
+            .registry
+            .metadata()
+            .delete_result(&id)
+            .map_err(to_internal_status)?;
+        Ok(Response::new(pb::sandbox::DeleteSandboxResultResponse {
+            deleted,
+        }))
+    }
+
     async fn run_sandbox(
         &self,
         request: Request<pb::sandbox::RunSandboxRequest>,
     ) -> Result<Response<pb::sandbox::SandboxResult>, Status> {
+        // Transport cancellation must not cancel accepted work or discard its
+        // output. The durable record handles loss of the daemon itself.
+        let service = self.clone();
+        self.workers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let worker = SandboxWorker(self.workers.clone());
+        tokio::spawn(async move {
+            let _worker = worker;
+            service.run_owned(request).await
+        })
+        .await
+        .map_err(to_internal_status)?
+        .map_err(|status| *status)
+    }
+}
+
+impl SandboxServiceImpl {
+    async fn run_owned(
+        &self,
+        request: Request<pb::sandbox::RunSandboxRequest>,
+    ) -> Result<Response<pb::sandbox::SandboxResult>, Box<Status>> {
         // Correlate the primary sandbox path with its gRPC request like the
         // zone handlers: open a request span so this handler's logs and all the
         // sandbox evidence events (emitted inline below) share one trace.id /
@@ -2009,7 +2319,11 @@ impl SandboxService for SandboxServiceImpl {
         async move {
             tracing::info!(event.name = "grpc.request.started", "grpc request started");
             let req = request.into_inner();
-            let task_id = format!("task-{}", uuid::Uuid::new_v4());
+            let task_id = if req.task_id.is_empty() {
+                format!("task-{}", uuid::Uuid::new_v4())
+            } else {
+                req.task_id.clone()
+            };
             RuntimeEventBuilder::new(
                 event_name::SANDBOX_RUN_STARTED,
                 EventKind::Execution,
@@ -2056,6 +2370,29 @@ impl SandboxService for SandboxServiceImpl {
             // Resolve the zone. An empty name allocates a temporary zone that we own
             // and (by default) delete afterwards; a named zone must already exist
             // and is left intact.
+            if !valid_task_id(&task_id) {
+                return Err(Status::invalid_argument("expected task-<UUID>"));
+            }
+            {
+                let mut tasks = self.active_tasks.lock().unwrap_or_else(|e| e.into_inner());
+                if !self
+                    .registry
+                    .metadata()
+                    .reserve_result(&task_id, self.registry.config().evidence.results_max_bytes)
+                    .map_err(|e| Status::resource_exhausted(e.to_string()))?
+                {
+                    return Err(Status::already_exists(
+                        "task identifier already used; retrieve its result instead of re-executing",
+                    ));
+                }
+                tasks.insert(task_id.clone());
+            }
+            let mut active = ActiveTask {
+                tasks: &self.active_tasks,
+                metadata: self.registry.metadata(),
+                id: task_id.clone(),
+                execution_attempted: false,
+            };
             let (zone_name, zone_id, temp_zone, policy) = if req.name.trim().is_empty() {
                 let name = format!(
                     "sandbox-{}",
@@ -2136,13 +2473,25 @@ impl SandboxService for SandboxServiceImpl {
                 )));
             }
 
-            let (outcome, manifest_digest) = match self
-                .execute_task(&task_id, &zone_name, &zone_id, &req)
-                .await
-            {
-                Ok((result, digest)) => (Ok(result), digest),
-                Err(message) => (Err(message), None),
+            let mut recovery = RecoveryRecord {
+                zone_name: zone_name.clone(),
+                container_id: None,
+                cleanup_zone: temp_zone && !req.keep_zone,
+                command: req.command.clone(),
+                admission,
+                receipt: recovery_receipt(&task_id, &zone_id, &req, &policy, unavailable_controls.clone())
+                    .map_err(to_internal_status)?,
             };
+            validate_recovery_budget(&recovery, &self.receipt_signer)
+                .map_err(Status::invalid_argument)?;
+            self.registry.metadata().put_recovery(&recovery).map_err(to_internal_status)?;
+            active.execution_attempted = true;
+            // Durable recovery now owns cleanup. No guard may erase output
+            // before a completed result is safely stored.
+            if let Some(cleanup) = &mut zone_cleanup { cleanup.disarm(); }
+            let outcome = self
+                .execute_task(&task_id, &zone_name, &zone_id, &req, &mut recovery)
+                .await;
 
             match self.registry.verify_isolation(&zone_name).await {
                 Ok(postflight) => unavailable_controls.extend(
@@ -2157,80 +2506,16 @@ impl SandboxService for SandboxServiceImpl {
             unavailable_controls.sort();
             unavailable_controls.dedup();
 
-            // Tear down the temporary zone unless the caller asked to keep it.
-            if temp_zone && !req.keep_zone {
-                if let Err(e) = self.registry.delete_zone(&zone_name, true).await {
-                    tracing::warn!(zone = zone_name, %e, "failed to delete temporary sandbox zone");
-                    sandbox_event_builder(
-                        &self.registry,
-                        event_name::SANDBOX_CLEANUP_PARTIAL,
-                        EventOutcome::Degraded,
-                        &task_id,
-                        &zone_name,
-                        &zone_id,
-                    )
-                    .level(Severity::Warn)
-                    .error("zone_cleanup_failed", "cleanup", e.to_string())
-                    .trust_level(TrustLevel::Partial)
-                    .degraded_reason("temporary_zone_delete_failed")
-                    .emit();
-                }
-                if let Some(cleanup) = &mut zone_cleanup {
-                    cleanup.disarm();
-                }
-            }
-
             let exec = outcome.unwrap_or_else(|message| {
                 SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
             });
-            let receipt_env = req.env.iter().collect::<std::collections::BTreeMap<_, _>>();
-            let receipt = self.receipt_signer.sign(ExecutionReceiptPayload {
-                schema: EXECUTION_RECEIPT_SCHEMA.into(),
-                task_id: task_id.clone(),
-                zone_id: zone_id.clone(),
-                image: ImageAdmission {
-                    reference: req.image.clone(),
-                    manifest_digest: manifest_digest.clone().unwrap_or_default(),
-                    digest_verified: image_digest_pinned(&req.image, manifest_digest.as_deref()),
-                },
-                policy_sha256: sha256_json(&policy).map_err(to_internal_status)?,
-                inputs_sha256: sha256_json(&serde_json::json!({
-                    "salt": task_id,
-                    "image": req.image,
-                    "command": req.command,
-                    "repo_path": req.repo_path,
-                    "workdir": req.workdir,
-                    "timeout_seconds": req.timeout_seconds,
-                    "env": receipt_env,
-                    "admission": admission_str(admission),
-                }))
-                .map_err(to_internal_status)?,
-                outputs_sha256: sha256_json(&serde_json::json!({
-                    "salt": task_id,
-                    "status": sandbox_status_str(exec.status),
-                    "exit_code": exec.exit_code,
-                    "stdout": exec.stdout,
-                    "stderr": exec.stderr,
-                }))
-                .map_err(to_internal_status)?,
-                status: sandbox_status_str(exec.status),
-                exit_code: exec.exit_code,
-                started_at: exec.started_at.map(|time| time.to_rfc3339()),
-                finished_at: exec.finished_at.map(|time| time.to_rfc3339()),
-                enforcement: enforcement_totals(
+            let mut receipt_payload = recovery.receipt.clone();
+            receipt_payload.enforcement = enforcement_totals(
                     exec.enforcement_events
                         .iter()
                         .map(|event| event.decision.as_str()),
                     exec.enforcement_drop_count,
-                ),
-                unavailable_controls: unavailable_controls.clone(),
-            });
-            receipt.verify().map_err(to_internal_status)?;
-            let receipt_json = serde_json::to_string(&receipt).map_err(to_internal_status)?;
-            // The same receipt as a DSSE in-toto statement: spec-compliant
-            // PAE signing, verifiable by ecosystem tooling unchanged.
-            let dsse = self.receipt_signer.sign_dsse(receipt.payload.clone());
-            let receipt_dsse_json = serde_json::to_string(&dsse).map_err(to_internal_status)?;
+                );
             let run_event = match exec.status {
                 SandboxStatus::Succeeded => (
                     event_name::SANDBOX_RUN_SUCCEEDED,
@@ -2280,16 +2565,31 @@ impl SandboxService for SandboxServiceImpl {
             .degraded_reason("enforcement_events_are_best_effort")
             .emit();
 
-            Ok(Response::new(to_proto_result(
+            let result = to_proto_result(
                 exec,
                 admission,
                 unavailable_controls,
-                receipt_json,
-                receipt_dsse_json,
-            )))
+                String::new(),
+                String::new(),
+            );
+            let result = seal_bounded_result(result, receipt_payload, &self.receipt_signer)
+                .map_err(to_internal_status)?;
+            self.registry
+                .metadata()
+                .save_result(&task_id, &result.encode_to_vec())
+                .map_err(to_internal_status)?;
+            if let Err(error) = self.cleanup_recovered_task(&recovery).await {
+                tracing::warn!(%task_id, %error, "saved task result; cleanup remains pending for recovery");
+                sandbox_event_builder(&self.registry, event_name::SANDBOX_CLEANUP_PARTIAL,
+                    EventOutcome::Degraded, &task_id, &zone_name, &zone_id)
+                    .level(Severity::Warn).error("cleanup_pending", "cleanup", error.to_string())
+                    .trust_level(TrustLevel::Partial).degraded_reason("cleanup_pending").emit();
+            }
+            Ok(Response::new(result))
         }
         .instrument(span)
         .await
+        .map_err(Box::new)
     }
 }
 
@@ -2338,7 +2638,13 @@ mod tests {
 
     #[test]
     fn valid_request_passes_validation() {
-        assert!(validate_sandbox_request(&req("alpine", vec!["echo", "hi"])).is_ok());
+        for image in [
+            "alpine",
+            "localhost:5000/team/image:v1",
+            "[::1]:5000/image:latest",
+        ] {
+            assert!(validate_sandbox_request(&req(image, vec!["echo", "hi"])).is_ok());
+        }
     }
 
     #[test]

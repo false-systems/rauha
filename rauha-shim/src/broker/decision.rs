@@ -1,8 +1,6 @@
 //! The decision record: what the judge decided, and the append-only JSON
 //! Lines log that makes every decision evidence-grade.
 
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -54,7 +52,7 @@ struct Record<'a> {
 /// itself after the first error — it must never affect the decision
 /// itself, and never spam.
 pub(crate) struct DecisionLog {
-    file: Option<std::fs::File>,
+    file: Option<crate::output::BoundedLog>,
     seq: u64,
     disabled: bool,
 }
@@ -63,14 +61,8 @@ impl DecisionLog {
     pub(crate) fn open(path: &Path) -> Self {
         // Close-on-exec: the shim forks and execs helpers; a container's
         // decision log is not theirs to write.
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            // Root-only: the decision log records every path a workload
-            // opened — workload activity is not for other local users.
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(path);
+        let file = crate::output::max_bytes()
+            .and_then(|limit| Ok(crate::output::BoundedLog::open(path, limit)?));
         match file {
             Ok(file) => Self {
                 file: Some(file),
@@ -86,7 +78,7 @@ impl DecisionLog {
                 Self {
                     file: None,
                     seq: 0,
-                    disabled: false,
+                    disabled: true,
                 }
             }
         }
@@ -128,7 +120,7 @@ impl DecisionLog {
         };
         let mut line = serde_json::to_string(&record).unwrap_or_else(|_| "{}".into());
         line.push('\n');
-        if let Err(e) = file.write_all(line.as_bytes()) {
+        if let Err(e) = file.write(line.as_bytes(), true) {
             tracing::warn!(%e, "broker: cannot write decision log — disabling it");
             self.disabled = true;
         }
@@ -137,6 +129,14 @@ impl DecisionLog {
     #[cfg(test)]
     fn disabled(&self) -> bool {
         self.disabled
+    }
+}
+
+impl Drop for DecisionLog {
+    fn drop(&mut self) {
+        if let Some(log) = &mut self.file {
+            let _ = log.finish();
+        }
     }
 }
 
@@ -198,10 +198,19 @@ mod tests {
     fn a_failing_log_disables_itself_instead_of_spamming() {
         // /dev/full: opens fine, every write fails ENOSPC. After the first
         // failure the log must go quiet, not warn per decision.
-        let mut log = DecisionLog::open(Path::new("/dev/full"));
+        let dir = std::env::temp_dir().join(format!("rauha-full-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut log = DecisionLog::open(&dir.join("broker.log"));
+        log.file.as_mut().unwrap().file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
         log.record(1, "openat", 1, b"/x", libc::EPERM, Some("not read-only"));
         assert!(log.disabled(), "first write failure must disable the log");
         log.record(2, "openat", 1, b"/x", libc::EPERM, Some("not read-only"));
+        assert!(dir.join("broker.incomplete").exists());
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -161,18 +161,30 @@ pub struct EvidenceConfig {
     /// Per-stream cap for captured sandbox stdout/stderr.
     #[serde(default = "default_sandbox_log_max_bytes")]
     pub sandbox_log_max_bytes: usize,
+    /// Maximum bytes stored per container stdout, stderr or broker log.
+    #[serde(default = "default_sandbox_log_max_bytes")]
+    pub container_log_max_bytes: usize,
+    /// Retained result payload budget, reserved in 4 MiB slots before execution.
+    #[serde(default = "default_results_max_bytes")]
+    pub results_max_bytes: usize,
 }
 
 impl Default for EvidenceConfig {
     fn default() -> Self {
         Self {
             sandbox_log_max_bytes: default_sandbox_log_max_bytes(),
+            container_log_max_bytes: default_sandbox_log_max_bytes(),
+            results_max_bytes: default_results_max_bytes(),
         }
     }
 }
 
 fn default_sandbox_log_max_bytes() -> usize {
     1024 * 1024
+}
+
+fn default_results_max_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -332,9 +344,24 @@ impl DaemonConfig {
                 self.executor.crun
             )));
         }
+        if self.evidence.container_log_max_bytes == 0 {
+            return Err(RauhaError::InvalidInput(
+                "evidence.container_log_max_bytes must be > 0".into(),
+            ));
+        }
+        if self.evidence.results_max_bytes < rauha_common::sandbox::MAX_RESULT_BYTES {
+            return Err(RauhaError::InvalidInput(
+                "evidence.results_max_bytes must hold at least one 4 MiB result".into(),
+            ));
+        }
         if self.evidence.sandbox_log_max_bytes == 0 || self.limits.policy_max_bytes == 0 {
             return Err(RauhaError::InvalidInput(
                 "evidence.sandbox_log_max_bytes and limits.policy_max_bytes must be > 0".into(),
+            ));
+        }
+        if self.evidence.sandbox_log_max_bytes > rauha_common::sandbox::MAX_RESULT_BYTES / 4 {
+            return Err(RauhaError::InvalidInput(
+                "evidence.sandbox_log_max_bytes exceeds the per-stream wire budget (1 MiB)".into(),
             ));
         }
         if self.broker.cache_max_tasks > (1 << 20) {

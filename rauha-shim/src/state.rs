@@ -105,6 +105,7 @@ impl ShimState {
     pub fn stop_container(&mut self, id: &str, signal: i32) -> anyhow::Result<()> {
         const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+        self.reap_children();
         self.signal_container(id, signal)?;
         let proc = self
             .containers
@@ -141,6 +142,20 @@ impl ShimState {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("container {id} has no OCI runtime"))?
             .signal(signal)?;
+        Ok(())
+    }
+
+    /// Get the state of a container.
+    pub fn delete_container(&mut self, id: &str) -> anyhow::Result<()> {
+        self.reap_children();
+        if self
+            .containers
+            .get(id)
+            .is_some_and(|p| p.status == ContainerStatus::Running)
+        {
+            anyhow::bail!("container {id} is running");
+        }
+        self.containers.remove(id);
         Ok(())
     }
 

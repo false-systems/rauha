@@ -83,6 +83,19 @@ RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test -- case_001  # one case
 
 Proto files are in `proto/` (zone.proto, container.proto, image.proto, sandbox.proto). They compile automatically via `build.rs` in rauhad and rauha-cli. `sandbox.proto` defines `SandboxService.RunSandbox` (package `rauha.sandbox.v1`) — the agent-sandbox task contract that runs a command in its own zone and captures stdout/stderr/exit-code plus enforcement events into one result. `SandboxServiceImpl` (`rauhad/src/server.rs`) implements it on top of the zone/container primitives: resolve-or-allocate a zone, create+start one container, poll to exit (or timeout), read shim log files for output, and drain the enforcement-event broadcast scoped to the task's zone. Temporary zones (empty `name`) are torn down after the run unless `keep_zone` is set; a runtime failure that prevents producing a result comes back as a `runtime_error` result, not a gRPC error. The `rauha sandbox` CLI mirrors the task's exit code. Every result carries two receipt forms: the legacy Ed25519-signed `receipt_json` and `receipt_dsse_json` — the same payload as a DSSE envelope wrapping an in-toto v1 statement (subject = image manifest digest, predicate = the receipt), spec-PAE-signed, verifiable offline by `rauha receipt` and standard in-toto/DSSE tooling.
 
+Output files are bounded at the shim writer; capture loss and preview reductions
+are explicit signed `capture_issues`. The actual protobuf, including both receipts,
+must fit 4 MiB. The existing redb database (0600) reserves result capacity before
+execution and saves results before delivery. `GetSandboxResult` and
+`DeleteSandboxResult` back `rauha sandbox-result <task-id> [--delete]`; duplicate
+retained IDs never re-execute. Container deletion removes raw logs and shim state.
+Admitted tasks persist recovery context before execution and save the signed
+result before cleanup. Client disconnects leave the daemon-owned task running.
+Startup recovery stops interrupted tasks, seals explicit uncertainty without
+replaying commands, and retries cleanup of already committed results.
+See `docs/sandbox-runtime.md` for budgets, interruption semantics and the live Rust
+regression required by the Linux gate.
+
 Most read-only/list commands accept `--json`; `events --json` emits JSON Lines.
 Interactive commands (`top`, `logs`, `exec`, `attach`) do not support
 it, and the unimplemented `trace` command exits with an error.
@@ -219,6 +232,8 @@ daemon at spawn.
             netns_dir = "/var/run/netns"
             bpf_pin_dir = "/sys/fs/bpf/rauha"
 [evidence]  sandbox_log_max_bytes = 1048576
+            container_log_max_bytes = 1048576 # stored bytes per stdout/stderr/broker log
+            results_max_bytes = 67108864     # retained payload budget, 4 MiB reservations
 [limits]    policy_max_bytes = 65536
 [policy]    safe_writable_roots = ["/proc", "/sys", "/dev", "/run"]
 [broker]    cache_max_tasks = 512       # shim task-pin cache (RAUHA_BROKER_CACHE_MAX; 0 = cold; clamped to the fd budget)
@@ -264,8 +279,8 @@ the workload never exercises ambient authority for brokered calls. The
 judgment re-validates the notification id after pinning
 `/proc/<pid>/{mem,root}` (pid-reuse race from the kernel docs); the pins
 are cached per task id (`[broker] cache_max_tasks`, 0 = cold) behind a
-pidfd that pins the task struct, evicted when the task exits. Every
-decision is one JSON line in the container's `broker.log`
+pidfd that pins the task struct, evicted when the task exits. Each captured
+decision is one JSON line in the container's bounded `broker.log`
 (`/run/rauha/containers/<id>/`) and is projected by rauhad into evidence
 events (`zone.syscall.brokered.granted`/`.denied`, backend
 `linux-seccomp-broker`): a live tailer broadcasts them on `rauha events`,

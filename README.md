@@ -66,6 +66,16 @@ were missing. Every result carries two verifiable receipt forms — a legacy
 Ed25519 signature and a DSSE in-toto envelope — checkable offline with
 `rauha receipt`.
 
+Output storage is bounded per stream. `capture_issues` reports truncation,
+invalid UTF-8, and capture failures in both the result and its signed receipts.
+The CLI prints a task ID before execution; `rauha sandbox-result <task-id>`
+retrieves the saved result without executing again. Use `--delete` to discard
+a retained result. Completed task containers release their raw log files.
+Accepted tasks survive client disconnects. After a daemon crash, recovery stops
+interrupted tasks and saves an explicitly uncertain signed result without
+rerunning the command. Results are saved before output cleanup; see
+[`durable task recovery`](docs/sandbox-runtime.md#durable-task-recovery) for the boundaries.
+
 Underneath, the same primitives are available directly:
 
 ```sh
@@ -94,7 +104,7 @@ the caller's own resolve restrictions OR'd in, never weakened — and injecting
 the fd. The workload never opens anything itself; symlinks, `..`, and magic
 links cannot escape by construction. Denials answer honest errnos (`EPERM` for
 policy, the kernel's own errno otherwise), so tools fail the way they would on
-the host. Every decision is evidence: one JSON line in the container's
+the host. Decisions are recorded in the container's bounded,
 root-only `broker.log`, streamed live on `rauha events` and carried in the
 sandbox result — `zone.syscall.brokered.granted` / `.denied`. See
 [`policies/broker.toml`](policies/broker.toml) for the canonical policy.
@@ -154,7 +164,7 @@ rauha (CLI) ──gRPC──▶ rauhad ──spawns──▶ rauha-shim (one per
                         │                     │
                         │                     ├── broker.log, stdout/stderr  (root-only)
                         │                     └── exec/attach IPC
-                        ├── redb: zones, containers — source of truth on restart
+                        ├── redb: zones, containers, task recovery, saved results
                         └── evidence events ──▶ `rauha events`, sandbox results
 ```
 

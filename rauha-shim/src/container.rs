@@ -55,6 +55,10 @@ pub struct RuntimeProcess {
     runtime_root: PathBuf,
     id: String,
     cleaned: bool,
+    #[cfg(target_os = "linux")]
+    captures: Vec<crate::output::Capture>,
+    #[cfg(target_os = "linux")]
+    broker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RuntimeProcess {
@@ -152,6 +156,20 @@ impl RuntimeProcess {
             .args(["delete", "--force", &self.id])
             .status();
         self.cleaned = true;
+        #[cfg(target_os = "linux")]
+        {
+            self.captures.clear();
+            if let Some(broker) = self.broker.take() {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !broker.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if broker.is_finished() {
+                    let _ = broker.join();
+                }
+                // An unfinished broker retains its incomplete marker.
+            }
+        }
     }
 }
 
@@ -208,22 +226,29 @@ pub fn start_with_crun(
         // container — crun's listener helper connects there at start.
         // Every broker decision is appended to broker.log next to the
         // container's stdout/stderr logs.
-        if let Some(listener_path) = broker_listener_path(spec_json) {
+        let broker = if let Some(listener_path) = broker_listener_path(spec_json) {
             let decision_log = log_dir.join("broker.log");
-            std::thread::spawn(move || {
+            Some(std::thread::spawn(move || {
                 if let Err(error) = crate::broker::serve(&listener_path, &decision_log) {
                     // The broker failing after judgments is survivable —
                     // brokered calls then hang or EPERM — but say so.
                     tracing::error!(%error, "seccomp broker exited with error");
                 }
-            });
-        }
+            }))
+        } else {
+            None
+        };
 
+        let limit = crate::output::max_bytes()?;
+        let (stdout_capture, stdout) =
+            crate::output::Capture::start(&log_dir.join("stdout.log"), limit)?;
+        let (stderr_capture, stderr) =
+            crate::output::Capture::start(&log_dir.join("stderr.log"), limit)?;
         let status = runtime_command(&runtime_root)
             .args(crun_create_args(&bundle, &pid_file, container_id))
             .stdin(Stdio::null())
-            .stdout(Stdio::from(open_container_log(&log_dir, "stdout")?))
-            .stderr(Stdio::from(open_container_log(&log_dir, "stderr")?))
+            .stdout(Stdio::from(OwnedFd::from(stdout)))
+            .stderr(Stdio::from(OwnedFd::from(stderr)))
             .status()?;
         if !status.success() {
             let error = std::fs::read_to_string(log_dir.join("stderr.log")).unwrap_or_default();
@@ -291,6 +316,8 @@ pub fn start_with_crun(
                 runtime_root,
                 id: container_id.to_string(),
                 cleaned: false,
+                captures: vec![stdout_capture, stderr_capture],
+                broker,
             },
             pid,
         ))
@@ -302,18 +329,6 @@ pub fn start_with_crun(
 #[cfg(target_os = "linux")]
 pub(crate) fn run_dir() -> PathBuf {
     PathBuf::from(std::env::var("RAUHA_RUN_DIR").unwrap_or_else(|_| "/run/rauha".into()))
-}
-
-/// Open a container log file (stdout/stderr) root-only: workload output
-/// is not for other local users' eyes.
-#[cfg(target_os = "linux")]
-fn open_container_log(log_dir: &Path, stream: &str) -> anyhow::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    Ok(std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(log_dir.join(format!("{stream}.log")))?)
 }
 
 /// Extract `linux.seccomp.listenerPath` from the OCI spec, if present.
@@ -548,7 +563,6 @@ mod tests {
     fn container_logs_and_their_directory_are_root_only() {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-        use super::open_container_log;
         let base = std::env::temp_dir().join(format!("rauha-log-mode-{}", std::process::id()));
         let log_dir = base.join("run").join("containers").join("c1");
         std::fs::DirBuilder::new()
@@ -556,8 +570,10 @@ mod tests {
             .recursive(true)
             .create(&log_dir)
             .unwrap();
-        let file = open_container_log(&log_dir, "stdout").unwrap();
-        drop(file);
+        let (capture, writer) =
+            crate::output::Capture::start(&log_dir.join("stdout.log"), 1024).unwrap();
+        drop(writer);
+        drop(capture);
         let dir_mode = std::fs::metadata(&log_dir).unwrap().permissions().mode();
         assert_eq!(
             dir_mode & 0o777,

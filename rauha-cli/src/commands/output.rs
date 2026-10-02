@@ -206,6 +206,7 @@ pub struct SandboxRun {
     pub duration_ms: u64,
     pub admission: String,
     pub unavailable_controls: Vec<String>,
+    pub capture_issues: Vec<String>,
     pub events: Vec<SandboxEvent>,
     pub enforcement_events: Vec<SandboxEnforcementEvent>,
     /// `None` when the daemon predates the receipt fields or verification

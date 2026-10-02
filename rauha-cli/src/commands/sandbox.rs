@@ -30,6 +30,9 @@ fn parse_env_pair(value: &str) -> Result<(String, String), String> {
 
 #[derive(Args)]
 pub struct SandboxArgs {
+    /// Stable task-<UUID> for result retrieval; an existing ID never re-executes.
+    #[arg(long)]
+    pub task_id: Option<String>,
     /// Container image to run the task in.
     #[arg(long)]
     pub image: String,
@@ -70,6 +73,11 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
     // "image not pulled" from the container-create path.
     pull_if_absent(channel, &args.image, out).await?;
 
+    let task_id = args
+        .task_id
+        .unwrap_or_else(|| format!("task-{}", uuid::Uuid::new_v4()));
+    eprintln!("task: {task_id} (retrieve with: rauha sandbox-result {task_id})");
+
     let request = pb::sandbox::RunSandboxRequest {
         image: args.image,
         command: args.command,
@@ -80,6 +88,7 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         timeout_seconds: args.timeout,
         env: args.env.into_iter().collect(),
         audit: args.audit,
+        task_id,
     };
 
     // Strip the tonic Status wrapper so the user sees the daemon's message,
@@ -92,6 +101,45 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         .map_err(|s| anyhow::anyhow!("{}", s.message()))?
         .into_inner();
 
+    print_result(result, out)
+}
+
+#[derive(Args)]
+pub struct SandboxResultArgs {
+    pub task_id: String,
+    /// Explicitly discard a retained result or an interrupted reservation.
+    #[arg(long)]
+    pub delete: bool,
+}
+
+pub async fn handle_result(args: SandboxResultArgs, out: OutputMode) -> anyhow::Result<()> {
+    let mut client = SandboxServiceClient::new(super::connect().await?);
+    let request = pb::sandbox::SandboxResultRequest {
+        task_id: args.task_id,
+    };
+    if args.delete {
+        let response = client
+            .delete_sandbox_result(request)
+            .await
+            .map_err(|s| anyhow::anyhow!("{}", s.message()))?
+            .into_inner();
+        output::print(
+            out,
+            &serde_json::json!({"deleted":response.deleted}),
+            || println!("deleted: {}", response.deleted),
+        );
+        Ok(())
+    } else {
+        let result = client
+            .get_sandbox_result(request)
+            .await
+            .map_err(|s| anyhow::anyhow!("{}", s.message()))?
+            .into_inner();
+        print_result(result, out)
+    }
+}
+
+fn print_result(result: pb::sandbox::SandboxResult, out: OutputMode) -> anyhow::Result<()> {
     // `rauha sandbox` mirrors the task: its exit code is the task's exit code.
     // When the task produced no code (timed out, or never started), map the
     // status to a conventional code: 137 (SIGKILL) for timeout, 1 otherwise.
@@ -121,6 +169,7 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         duration_ms: result.duration_ms,
         admission: result.admission,
         unavailable_controls: result.unavailable_controls,
+        capture_issues: result.capture_issues,
         events: result
             .events
             .into_iter()
@@ -182,6 +231,9 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
                 view.unavailable_controls.join(", ")
             );
         }
+        if !view.capture_issues.is_empty() {
+            eprintln!("capture incomplete: {}", view.capture_issues.join(", "));
+        }
     });
 
     if exit_code != 0 {
@@ -221,6 +273,30 @@ fn verify_receipts(
             Some(format!("daemon returned an unverifiable receipt: {error}")),
         );
     }
+    let payload = &receipt.payload;
+    let outputs = rauha_evidence::receipt::sha256_json(&serde_json::json!({
+        "salt": result.task_id,
+        "status": result.status,
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }));
+    if payload.task_id != result.task_id
+        || payload.zone_id != result.zone_id
+        || payload.status != result.status
+        || payload.exit_code != result.exit_code
+        || payload.started_at.as_deref().unwrap_or_default() != result.started_at
+        || payload.finished_at.as_deref().unwrap_or_default() != result.finished_at
+        || payload.unavailable_controls != result.unavailable_controls
+        || payload.capture_issues != result.capture_issues
+        || outputs.as_ref().ok() != Some(&payload.outputs_sha256)
+    {
+        return (
+            None,
+            None,
+            Some("signed receipt does not match the task result".into()),
+        );
+    }
     if result.receipt_dsse_json.is_empty() {
         return (Some(receipt), None, None);
     }
@@ -236,9 +312,17 @@ fn verify_receipts(
                 None,
                 Some(format!("DSSE envelope verification failed: {error}")),
             ),
-            // The statement is the envelope's payload — already covered by
-            // the legacy receipt verification above.
-            Ok(_statement) => (Some(receipt), Some(envelope), None),
+            Ok(statement)
+                if statement
+                    == rauha_evidence::dsse::statement_from_payload(receipt.payload.clone()) =>
+            {
+                (Some(receipt), Some(envelope), None)
+            }
+            Ok(_) => (
+                Some(receipt),
+                None,
+                Some("DSSE statement does not match the signed receipt".into()),
+            ),
         },
     }
 }
@@ -308,13 +392,18 @@ mod tests {
                 },
                 policy_sha256: "sha256:policy".into(),
                 inputs_sha256: "sha256:inputs".into(),
-                outputs_sha256: "sha256:outputs".into(),
+                outputs_sha256: rauha_evidence::receipt::sha256_json(&serde_json::json!({
+                    "salt": "task-cli-test", "status": "succeeded", "exit_code": 0,
+                    "stdout": "", "stderr": "",
+                }))
+                .unwrap(),
                 status: "succeeded".into(),
                 exit_code: Some(0),
                 started_at: None,
                 finished_at: None,
                 enforcement: EnforcementTotals::default(),
                 unavailable_controls: Vec::new(),
+                capture_issues: Vec::new(),
             };
             let receipt = signer.sign(payload.clone());
             let dsse = signer.sign_dsse(payload);
@@ -327,6 +416,10 @@ mod tests {
 
     fn result_with(receipt_json: &str, dsse_json: &str) -> pb::sandbox::SandboxResult {
         pb::sandbox::SandboxResult {
+            task_id: "task-cli-test".into(),
+            zone_id: "zone-cli-test".into(),
+            status: "succeeded".into(),
+            exit_code: Some(0),
             receipt_json: receipt_json.into(),
             receipt_dsse_json: dsse_json.into(),
             ..Default::default()
@@ -370,6 +463,44 @@ mod tests {
         assert!(receipt.is_some());
         assert!(dsse.is_some());
         assert!(problem.is_none());
+    }
+
+    #[test]
+    fn signed_receipt_rejects_changed_result() {
+        let fixture = receipts::signed(&tmp("changed-result"));
+        let original = result_with(&fixture.receipt_json, &fixture.dsse_json);
+        for field in ["stdout", "task_id", "capture_issues"] {
+            let mut result = original.clone();
+            match field {
+                "stdout" => result.stdout = "altered output".into(),
+                "task_id" => result.task_id = "another-task".into(),
+                _ => result
+                    .capture_issues
+                    .push("stdout.storage_incomplete".into()),
+            }
+            let (receipt, dsse, problem) = verify_receipts(&result);
+            assert!(
+                receipt.is_none() && dsse.is_none(),
+                "accepted changed {field}"
+            );
+            assert!(problem.unwrap().contains("does not match"));
+        }
+    }
+
+    #[test]
+    fn different_statement_signed_by_same_key_is_rejected() {
+        let key = tmp("same-key-different-statement");
+        let fixture = receipts::signed(&key);
+        let mut receipt: rauha_evidence::receipt::SignedExecutionReceipt =
+            serde_json::from_str(&fixture.receipt_json).unwrap();
+        receipt.payload.task_id = "another-task".into();
+        let signer = rauha_evidence::receipt::ReceiptSigner::load_or_create(&key).unwrap();
+        let envelope = serde_json::to_string(&signer.sign_dsse(receipt.payload)).unwrap();
+        let (receipt, dsse, problem) =
+            verify_receipts(&result_with(&fixture.receipt_json, &envelope));
+        assert!(receipt.is_some());
+        assert!(dsse.is_none());
+        assert!(problem.unwrap().contains("does not match"));
     }
 
     #[test]

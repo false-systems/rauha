@@ -54,6 +54,9 @@ pub enum ShimRequest {
         rows: u32,
         cols: u32,
     },
+    DeleteContainer {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

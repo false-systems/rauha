@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         server::SandboxServiceImpl::new(registry.clone(), None, receipt_signer.clone());
 
     let addr: SocketAddr = daemon_config.server.addr.parse()?;
+    sandbox_svc.recover_tasks().await?;
     tracing::info!(%addr, "listening on gRPC");
     RuntimeEventBuilder::new(
         event_name::DAEMON_READY,
@@ -187,9 +188,11 @@ async fn main() -> anyhow::Result<()> {
         .add_service(ZoneServiceServer::new(zone_svc))
         .add_service(ContainerServiceServer::new(container_svc))
         .add_service(ImageServiceServer::new(image_svc))
-        .add_service(SandboxServiceServer::new(sandbox_svc))
+        .add_service(SandboxServiceServer::new(sandbox_svc.clone()))
         .serve_with_shutdown(addr, shutdown)
         .await;
+
+    sandbox_svc.drain_tasks().await;
 
     // Cleanup runs unconditionally — even if serve errored.
     cleanup_network(&daemon_config);

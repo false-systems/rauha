@@ -1,6 +1,8 @@
 mod attach;
 mod broker;
 mod container;
+#[cfg(target_os = "linux")]
+mod output;
 mod state;
 
 use std::os::unix::net::UnixListener;
@@ -145,6 +147,12 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
             state.request_shutdown();
             ShimResponse::Ok
         }
+        ShimRequest::DeleteContainer { id } => match state.delete_container(&id) {
+            Ok(()) => ShimResponse::Ok,
+            Err(e) => ShimResponse::Error {
+                message: e.to_string(),
+            },
+        },
         ShimRequest::GetStats => {
             let (pids, container_count) = state.container_summary();
             ShimResponse::Stats {

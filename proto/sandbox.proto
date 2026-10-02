@@ -9,7 +9,12 @@ package rauha.sandbox.v1;
 // This proto defines the public contract and daemon runtime result shape.
 service SandboxService {
     rpc RunSandbox(RunSandboxRequest) returns (SandboxResult);
+    rpc GetSandboxResult(SandboxResultRequest) returns (SandboxResult);
+    rpc DeleteSandboxResult(SandboxResultRequest) returns (DeleteSandboxResultResponse);
 }
+
+message SandboxResultRequest { string task_id = 1; }
+message DeleteSandboxResultResponse { bool deleted = 1; }
 
 message RunSandboxRequest {
     // Container image to run the task in. Required.
@@ -31,6 +36,9 @@ message RunSandboxRequest {
     // Explicitly permit execution when the selected backend reports degraded
     // enforcement. Strict admission remains the default.
     bool audit = 9;
+    // Optional caller-generated task-<UUID>, allowing retrieval after transport
+    // failure. An existing identifier is refused without re-executing the task.
+    string task_id = 10;
 }
 
 message SandboxResult {
@@ -72,6 +80,8 @@ message SandboxResult {
     // Spec-compliant PAE signing — verifiable by cosign/Witness/in-toto
     // tooling unchanged, and by `rauha receipt verify`.
     string receipt_dsse_json = 16;
+    // Capture/preview loss, also signed in both receipt forms.
+    repeated string capture_issues = 17;
 }
 
 message SandboxEventSummary {

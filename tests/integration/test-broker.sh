@@ -14,7 +14,6 @@ set -euo pipefail
 RAUHA="${RAUHA_BIN:-cargo run --bin rauha --}"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BROKER_POLICY=${RAUHA_TEST_BROKER_POLICY:-$ROOT/policies/broker.toml}
-RUN_DIR="${RAUHA_RUN_DIR:-/run/rauha}"
 ZONE_NAME="test-broker-$$"
 IMAGE="${TEST_IMAGE:-alpine:latest}"
 
@@ -73,21 +72,9 @@ else
     exit 1
 fi
 
-echo "7. Decisions were recorded in the container's broker.log..."
-LOGS=$(ls -t "$RUN_DIR"/containers/*/broker.log 2>/dev/null | head -3 || true)
-if [ -z "$LOGS" ]; then
-    echo "   FAIL: no broker.log under $RUN_DIR/containers/"
-    exit 1
-fi
-GRANTED=$(grep -h '"decision":"granted"' $LOGS | wc -l | tr -d ' ')
-DENIED=$(grep -h '"decision":"denied"' $LOGS | wc -l | tr -d ' ')
-if [ "$GRANTED" -ge 1 ] && [ "$DENIED" -ge 1 ]; then
-    echo "   broker.log: $GRANTED granted, $DENIED denied (OK)"
-    grep -h '"syscall":"openat"' $LOGS | head -2 | sed 's/^/     /'
-else
-    echo "   FAIL: expected grants and denials in broker.log, got $GRANTED/$DENIED"
-    exit 1
-fi
+# Raw broker.log checks moved to rauhad/tests/runtime_output.rs, required by
+# linux-gate.sh. It checks this container's grants/denials, record order, cap,
+# permissions and deletion. Completed sandboxes no longer leave raw logs behind.
 
 echo "8. Broker decisions surface in the sandbox result as enforcement events..."
 JSON=$($RAUHA --json sandbox --name "$ZONE_NAME" --image "$IMAGE" --timeout 30 \

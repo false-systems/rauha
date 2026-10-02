@@ -7,8 +7,8 @@
 //! evidence schema:
 //!
 //! - [`read_decisions_capped`]: one-shot read at sandbox result time —
-//!   the authoritative, complete, ordered record for the task's result
-//!   (broadcast races can drop late lines; the file cannot).
+//!   the ordered capture for the task's result, with storage and parse loss
+//!   reported explicitly (broadcast races can also drop live events).
 //! - [`spawn_broker_tailer`]: a follow tailer for live streaming — each
 //!   new decision is normalized and broadcast on the daemon-wide event
 //!   channel, so broker decisions ride `rauha events` like kernel
@@ -30,8 +30,12 @@ pub(crate) fn read_decisions_capped(
     container_id: &Uuid,
     run_dir: &str,
     max_bytes: usize,
+    issues: &mut Vec<String>,
 ) -> Vec<BrokerDecision> {
     let path = broker_log_path(run_dir, container_id);
+    if path.with_extension("incomplete").exists() {
+        issues.push("broker.storage_incomplete".into());
+    }
     let Ok(file) = std::fs::File::open(&path) else {
         return Vec::new();
     };
@@ -39,10 +43,12 @@ pub(crate) fn read_decisions_capped(
     // Read one byte past the cap so truncation is detectable.
     let mut limited = file.take(max_bytes.saturating_add(1) as u64);
     if limited.read_to_end(&mut bytes).is_err() {
+        issues.push("broker.read_failed".into());
         return Vec::new();
     }
     let truncated = bytes.len() > max_bytes;
     if truncated {
+        issues.push("broker.preview_truncated".into());
         bytes.truncate(max_bytes);
     }
     let text = String::from_utf8_lossy(&bytes);
@@ -55,6 +61,7 @@ pub(crate) fn read_decisions_capped(
         }
     }
     if malformed > 0 {
+        issues.push("broker.malformed_records".into());
         tracing::warn!(
             container = %container_id,
             malformed,
@@ -163,7 +170,7 @@ pub(crate) async fn spawn_broker_tailer(
                 let mut chunk = String::new();
                 let read_ok = file
                     .seek(SeekFrom::Start(*offset))
-                    .and_then(|_| file.read_to_string(&mut chunk))
+                    .and_then(|_| file.take(1024 * 1024).read_to_string(&mut chunk))
                     .is_ok();
                 // Consume only complete, newline-terminated lines: a
                 // tailer must not assume the writer's write granularity.
@@ -230,7 +237,9 @@ mod tests {
         )
         .unwrap();
 
-        let decisions = read_decisions_capped(&id, &run_dir, 64 * 1024);
+        let mut issues = Vec::new();
+        let decisions = read_decisions_capped(&id, &run_dir, 64 * 1024, &mut issues);
+        assert_eq!(issues, ["broker.malformed_records"]);
         assert_eq!(decisions.len(), 2, "malformed line skipped, rest kept");
         assert_eq!(decisions[0].seq, 1);
         assert_eq!(decisions[1].path, "/b");
@@ -254,7 +263,12 @@ mod tests {
 
     #[test]
     fn missing_log_is_empty_not_an_error() {
-        let decisions = read_decisions_capped(&Uuid::new_v4(), "/nonexistent-run-dir", 1024);
+        let decisions = read_decisions_capped(
+            &Uuid::new_v4(),
+            "/nonexistent-run-dir",
+            1024,
+            &mut Vec::new(),
+        );
         assert!(decisions.is_empty());
     }
 
@@ -271,7 +285,9 @@ mod tests {
         );
         // Two lines, capped to less than two: at most one survives whole.
         std::fs::write(log_dir.join("broker.log"), line.repeat(2)).unwrap();
-        let decisions = read_decisions_capped(&id, &run_dir, line.len() + 10);
+        let mut issues = Vec::new();
+        let decisions = read_decisions_capped(&id, &run_dir, line.len() + 10, &mut issues);
+        assert!(issues.contains(&"broker.preview_truncated".to_string()));
         assert!(decisions.len() <= 2);
         assert!(!decisions.is_empty());
     }
