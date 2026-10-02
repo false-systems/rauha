@@ -1,9 +1,12 @@
 # Run Protocol v0
 
-Status: draft contract, 2026-08-27; lifecycle implementation added 2026-10-01.
+Status: draft contract, 2026-08-27; lifecycle implementation added 2026-10-01;
+standalone Linux journal storage added 2026-10-03.
 `rauha-common::run` implements pure lifecycle reduction (RP-1–RP-4), with
-replay and refusal checks. It is not yet connected to the CLI or daemon;
-durable journals, ownership, effects, and the remaining invariants are unimplemented.
+replay and refusal checks. `rauha-evidence::journal` implements local journal
+storage and committed-prefix verification (RP-5–RP-8). Neither is connected to
+the CLI or daemon. The full RunHead, lifecycle integration, ownership epochs,
+effects and the remaining invariants are unimplemented.
 The purpose of this document is to fix the vocabulary and the invariants before
 the tier-0 Rust supervisor, the OTP manager, and the tools that consume runs
 are built against them.
@@ -124,6 +127,66 @@ trusted input from that caller, not an authorization claim from the workload.
 - **RP-7** Writers use append-then-fsync-then-advance-head; a line is not
   part of the Run until the RunHead references a `journal_root` that covers
   it.
+
+### Initial local storage slice
+
+`rauha-evidence::journal::Journal` provides `create`, `open`, `append`, and
+streaming `replay` on Linux. It writes `manifest.json`, `journal.jsonl`, and
+`head` beneath a caller-owned directory. A persistent `.writer.lock` inode
+holds an exclusive OS lock for the lifetime of the handle; process death
+releases the lock. The parent directory must already exist and be trusted.
+Directories are created mode 0700 and files mode 0600. Symlink files and
+nonregular files are refused. The lock coordinates cooperating writers; it
+does not protect against a privileged process replacing the directory.
+
+This slice uses a **JournalHead**, a storage commit marker, not the complete
+ownership-bearing RunHead in §5. Its fields are `manifest_sha256`, `sequence`,
+`journal_root`, and `journal_bytes`. At sequence zero the root is the manifest
+hash. Later it is the hash of the last committed entry. The byte count names
+the exact newline-terminated prefix covered by the head. Do not use this
+marker to authorize effects, assert ownership, or issue a Run Receipt.
+
+Files contain canonical JSON plus a trailing newline: recursively sorted
+object keys, compact serde_json encoding, UTF-8, and preserved array order.
+Hashes exclude that newline and use `sha256:<lowercase hex>`; entries do not
+store a separate `hash` field. Parsing requires the same canonical bytes,
+rejecting duplicate keys, ignored fields and alternate representations.
+Floating-point parsing uses serde_json's round-trip mode. This is the local
+v0 encoding, not a claim of RFC 8785 interoperability. Each manifest, head,
+or entry is limited to 1 MiB including its newline; verification streams one
+entry at a time rather than loading the entire journal.
+
+Append writes the entry, syncs the journal, writes and syncs `head.next`,
+renames it over `head`, then syncs the directory before acknowledging success.
+Creation also syncs the manifest, empty journal, directory and parent.
+A write error requires closing and reopening: an error after rename can mean
+the new head is already visible. No retry may assume the event was absent.
+
+Reopening verifies the manifest, dense sequence, previous hashes, final root,
+and exact committed length. Corrupt or missing committed data returns an
+error without rewriting history. Replay visits records only after a full
+verification pass succeeds. Semantic manifest/body validation, emitter
+authentication, epoch fencing and lifecycle reduction remain the caller's job.
+
+In keeping with the append-only rule, bytes after the committed prefix are
+preserved, counted by `uncommitted_bytes()`, and never parsed or promoted.
+The valid committed prefix remains readable, but appends return
+`UncommittedTail` until explicit repair. There is no automatic tail truncation
+or repair command in this slice. Incomplete creation is refused, not silently
+reinitialized. A hash chain detects changes relative to its trusted head; it
+does not detect replacement or rollback of an entire directory by an attacker.
+
+Run the storage tests on Linux with:
+
+```sh
+cargo test -p rauha-evidence journal:: -- --nocapture
+```
+
+They SIGKILL a subprocess at creation and append boundaries, including a
+partial line and either side of head replacement; verify writer-lock release;
+reject corruption, ambiguous JSON, oversize data and symlinks; and preserve
+uncommitted bytes. These are process-crash tests on a local filesystem. They
+do not simulate a physical power failure or certify network-filesystem semantics.
 
 ### Event catalogue (v0)
 
