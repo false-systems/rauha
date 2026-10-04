@@ -196,6 +196,9 @@ pub struct SandboxEnforcementEvent {
 /// Field names are stable; agents and scripts can rely on them.
 #[derive(Serialize)]
 pub struct SandboxRun {
+    /// Lifecycle prefix authenticated by the verified execution receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal: Option<rauha_evidence::receipt::JournalCommitment>,
     pub ok: bool,
     pub task_id: String,
     pub zone_id: String,

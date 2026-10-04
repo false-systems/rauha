@@ -140,6 +140,34 @@ reservations have no recovery context and still require operator resolution.
 Loss of both the daemon and shim, host reboot, agent checkpoints/resumption,
 portable Run journals, and ownership epochs are not implemented by this slice.
 
+### Local task journal
+
+New Linux tasks store a journal at `${RAUHA_ROOT}/runs/<task-id>/`. The daemon
+commits `run.created` before recovery context and `sandbox.ready` before starting
+the container. After confirming execution has stopped, ordinary command outcomes
+commit `run.waiting`; timeouts, runtime failures and interrupted tasks commit `run.frozen`.
+Command success is not acceptance, and neither path claims proof or review.
+
+The signed receipt's optional `journal` field binds the lifecycle state, manifest
+hash, sequence and journal root. The result is saved before `receipt.sealed`
+commits its complete encoded-result hash. Recovery can finish that seal without
+changing saved result bytes. Retrieval checks the journal and seal; the CLI
+displays the authenticated prefix. Older receipts omit this field and older
+recovery records retain their original recovery path.
+
+Startup stops owned executors before checking journals. A corrupt history or
+uncommitted tail prevents sealing and startup, preserving recovery context and
+raw output for explicit repair. It never truncates the tail or reruns a command.
+A crash before the recovery-context commit can leave an orphan journal requiring
+explicit cleanup; its task ID cannot be reused while that directory remains.
+`sandbox-result --delete` explicitly discards the saved result and journal after
+execution and recovery cleanup finish. It must acquire the journal lock first.
+
+This local manifest contains task/zone identity and input/policy commitments,
+not command or environment values. Epoch zero grants no ownership authority.
+The adapter supports only these task events and rejects unsupported histories;
+it does not implement a portable RunHead, checkpoint, effect ledger or resume.
+
 Per-container caps bound workload output, not the total number of containers
 an authorized host client can create. Old orphan logs from earlier versions
 are not deleted automatically.

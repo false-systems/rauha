@@ -22,13 +22,27 @@ impl SandboxServiceImpl {
 
     /// Called before accepting RPCs. Never starts a container or replays a command.
     pub async fn recover_tasks(&self) -> anyhow::Result<()> {
-        for record in self.registry.metadata().recovery_records()? {
+        let records = self.registry.metadata().recovery_records()?;
+        // Stop every owned executor before attempting journal verification.
+        // A corrupt or incomplete journal must not leave its workload running.
+        for record in &records {
+            self.stop_task(record).await?;
+        }
+        for record in records {
             let id = &record.receipt.task_id;
+            #[cfg(target_os = "linux")]
+            let mut run = if record.journaled {
+                let run = task_run::TaskRun::open(&self.registry.root_path(), id)?;
+                run.verify_context(&record)?;
+                Some(run)
+            } else {
+                None
+            };
             let result =
                 self.registry.metadata().get_result(id)?.ok_or_else(|| {
                     anyhow::anyhow!("recovery record without reserved result: {id}")
                 })?;
-            if result.is_empty() {
+            let result = if result.is_empty() {
                 let containers = self.task_containers(&record)?;
                 let mut result = pb::sandbox::SandboxResult {
                     task_id: id.clone(), zone_id: record.receipt.zone_id.clone(),
@@ -44,25 +58,6 @@ impl SandboxServiceImpl {
                     ..Default::default()
                 };
                 if let Some(container) = containers.first() {
-                    // Consult the shim: a crash can occur after start but before
-                    // the daemon persists the container's Running state.
-                    let (state, _) = self.registry.get_container_state(&container.id).await?;
-                    if state == "running" {
-                        if let Err(error) = self.registry.stop_container(&container.id, 5).await {
-                            // Exit may race StopContainer. Only a fresh shim
-                            // confirmation of stopped permits recovery to proceed.
-                            if !matches!(self.registry.get_container_state(&container.id).await,
-                                Ok((state, _)) if state == "stopped")
-                            {
-                                return Err(error.into());
-                            }
-                        }
-                    } else {
-                        anyhow::ensure!(
-                            state == "stopped" || state == "created",
-                            "unknown recovered container state: {state}"
-                        );
-                    }
                     let logs = crate::logs::read_all_capped(
                         &container.id.to_string(),
                         &self.registry.config().paths.run_dir,
@@ -79,17 +74,48 @@ impl SandboxServiceImpl {
                         .capture_issues
                         .push("output.unavailable_after_interruption".into());
                 }
-                let result =
-                    seal_bounded_result(result, record.receipt.clone(), &self.receipt_signer)
-                        .map_err(anyhow::Error::msg)?;
+                let mut payload = record.receipt.clone();
+                #[cfg(target_os = "linux")]
+                if let Some(run) = &mut run {
+                    run.finish(Some("daemon_interrupted"))?;
+                    payload.journal = Some(run.commitment()?);
+                }
+                let result = seal_bounded_result(result, payload, &self.receipt_signer)
+                    .map_err(anyhow::Error::msg)?;
                 self.registry
                     .metadata()
                     .save_result(id, &result.encode_to_vec())?;
                 tracing::warn!(task_id = %id, "recovered interrupted task without replay; signed uncertain result saved");
+                result
+            } else {
+                pb::sandbox::SandboxResult::decode(result.as_slice())?
+            };
+            #[cfg(target_os = "linux")]
+            if let Some(run) = &mut run {
+                run.seal_result(&result)?;
             }
             // A committed result is immutable, even if recovery crashes again
             // during cleanup. The record remains until cleanup succeeds.
             self.cleanup_recovered_task(&record).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn stop_task(&self, record: &RecoveryRecord) -> anyhow::Result<()> {
+        for container in self.task_containers(record)? {
+            // Consult the shim even if metadata never reached Running.
+            let (mut state, _) = self.registry.get_container_state(&container.id).await?;
+            if state == "running" {
+                let stopped = self.registry.stop_container(&container.id, 5).await;
+                state = self.registry.get_container_state(&container.id).await?.0;
+                if state != "stopped" {
+                    stopped?;
+                }
+            }
+            anyhow::ensure!(
+                state == "stopped" || state == "created",
+                "cannot confirm task stopped: {state}"
+            );
         }
         Ok(())
     }

@@ -73,7 +73,9 @@ retrieves the saved result without executing again. Use `--delete` to discard
 a retained result. Completed task containers release their raw log files.
 Accepted tasks survive client disconnects. After a daemon crash, recovery stops
 interrupted tasks and saves an explicitly uncertain signed result without
-rerunning the command. Results are saved before output cleanup; see
+rerunning the command. New Linux tasks journal their lifecycle and bind its
+prefix into the signed result: completed commands wait; interrupted tasks freeze.
+Results are saved before output cleanup; see
 [`durable task recovery`](docs/sandbox-runtime.md#durable-task-recovery) for the boundaries.
 
 Underneath, the same primitives are available directly:

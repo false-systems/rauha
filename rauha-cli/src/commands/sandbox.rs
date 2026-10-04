@@ -159,6 +159,7 @@ fn print_result(result: pb::sandbox::SandboxResult, out: OutputMode) -> anyhow::
     }
 
     let view = output::SandboxRun {
+        journal: receipt.as_ref().and_then(|r| r.payload.journal.clone()),
         ok: result.status == "succeeded",
         task_id: result.task_id,
         zone_id: result.zone_id,
@@ -233,6 +234,9 @@ fn print_result(result: pb::sandbox::SandboxResult, out: OutputMode) -> anyhow::
         }
         if !view.capture_issues.is_empty() {
             eprintln!("capture incomplete: {}", view.capture_issues.join(", "));
+        }
+        if let Some(journal) = &view.journal {
+            eprintln!("run: {}", journal.state);
         }
     });
 
@@ -404,6 +408,7 @@ mod tests {
                 enforcement: EnforcementTotals::default(),
                 unavailable_controls: Vec::new(),
                 capture_issues: Vec::new(),
+                journal: None,
             };
             let receipt = signer.sign(payload.clone());
             let dsse = signer.sign_dsse(payload);

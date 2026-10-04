@@ -1,12 +1,17 @@
 # Run Protocol v0
 
 Status: draft contract, 2026-08-27; lifecycle implementation added 2026-10-01;
-standalone Linux journal storage added 2026-10-03.
+standalone Linux journal storage added 2026-10-03; local task integration added 2026-10-04.
 `rauha-common::run` implements pure lifecycle reduction (RP-1–RP-4), with
 replay and refusal checks. `rauha-evidence::journal` implements local journal
-storage and committed-prefix verification (RP-5–RP-8). Neither is connected to
-the CLI or daemon. The full RunHead, lifecycle integration, ownership epochs,
-effects and the remaining invariants are unimplemented.
+storage and committed-prefix verification (RP-5–RP-8). The Linux daemon now
+uses both for admitted sandbox tasks: preparing → running → waiting, or frozen
+after interruption/failure, followed by a result seal. The CLI displays the
+lifecycle prefix authenticated by the execution receipt. This is a local task
+adapter, not full protocol conformance: it uses epoch zero without ownership
+authority and refuses unsupported events. See [the integration boundary](sandbox-runtime.md#local-task-journal).
+The full RunHead, portable manifest, ownership epochs, effects, proof and
+acceptance workflows remain unimplemented.
 The purpose of this document is to fix the vocabulary and the invariants before
 the tier-0 Rust supervisor, the OTP manager, and the tools that consume runs
 are built against them.
