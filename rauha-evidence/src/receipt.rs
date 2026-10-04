@@ -47,6 +47,19 @@ pub struct ExecutionReceiptPayload {
     /// Omit when empty to preserve verification of existing v1 receipts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capture_issues: Vec<String>,
+    /// Verified local lifecycle prefix at result sealing, not a full RunHead
+    /// or an ownership/effect authorization. Absent in older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal: Option<JournalCommitment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalCommitment {
+    pub state: String,
+    pub manifest_sha256: String,
+    pub sequence: u64,
+    pub journal_root: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,7 +220,7 @@ where
     }
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
+pub fn sha256_bytes(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
@@ -268,6 +281,7 @@ mod tests {
             enforcement: EnforcementTotals::default(),
             unavailable_controls: Vec::new(),
             capture_issues: Vec::new(),
+            journal: None,
         }
     }
 
@@ -292,6 +306,24 @@ mod tests {
             receipt.verify().is_err(),
             "capture completeness must be signed"
         );
+        let legacy = signer.sign(payload());
+        let serialized = serde_json::to_string(&legacy).unwrap();
+        assert!(!serialized.contains("journal"));
+        serde_json::from_str::<SignedExecutionReceipt>(&serialized)
+            .unwrap()
+            .verify()
+            .unwrap();
+        let mut with_journal = payload();
+        with_journal.journal = Some(JournalCommitment {
+            state: "waiting".into(),
+            manifest_sha256: sha256_bytes(b"manifest"),
+            sequence: 3,
+            journal_root: sha256_bytes(b"prefix"),
+        });
+        let mut receipt = signer.sign(with_journal);
+        receipt.verify().unwrap();
+        receipt.payload.journal.as_mut().unwrap().state = "accepted".into();
+        assert!(receipt.verify().is_err(), "lifecycle claims must be signed");
     }
 
     #[test]

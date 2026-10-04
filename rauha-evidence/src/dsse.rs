@@ -260,6 +260,7 @@ mod tests {
             enforcement: Default::default(),
             unavailable_controls: vec!["ebpf:cgroup_attach_task".into()],
             capture_issues: Vec::new(),
+            journal: None,
         }
     }
 

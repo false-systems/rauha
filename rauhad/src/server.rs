@@ -20,6 +20,8 @@ use rauha_evidence::{FalseEventBuilder, ResourceAttrs, BACKEND_LINUX_EBPF};
 use crate::metadata::recovery::RecoveryRecord;
 use crate::zone::registry::ZoneRegistry;
 mod recovery;
+#[cfg(target_os = "linux")]
+pub(crate) mod task_run;
 
 /// Convert RauhaError to the appropriate gRPC status code.
 /// The error type system already distinguishes not-found, already-exists,
@@ -1345,6 +1347,7 @@ impl SandboxServiceImpl {
         zone_id: &str,
         req: &pb::sandbox::RunSandboxRequest,
         recovery: &mut RecoveryRecord,
+        #[cfg(target_os = "linux")] run: &mut task_run::TaskRun,
     ) -> std::result::Result<SandboxExecResult, String> {
         sandbox_event_builder(
             &self.registry,
@@ -1418,6 +1421,8 @@ impl SandboxServiceImpl {
         .emit();
 
         // Result persistence precedes cleanup, including after interruption.
+        #[cfg(target_os = "linux")]
+        run.ready(recovery).map_err(|e| e.to_string())?;
         self.run_started_container(task_id, zone_name, zone_id, &container.id, req)
             .await
     }
@@ -2076,6 +2081,7 @@ fn recovery_receipt(
         enforcement: Default::default(),
         unavailable_controls,
         capture_issues: Vec::new(),
+        journal: None,
     })
 }
 
@@ -2192,6 +2198,7 @@ mod output_budget_tests {
             enforcement: Default::default(),
             unavailable_controls: Vec::new(),
             capture_issues: Vec::new(),
+            journal: None,
         };
         let result = seal_bounded_result(result, payload, &signer).unwrap();
         assert!(result.encoded_len() <= rauha_common::sandbox::MAX_RESULT_BYTES);
@@ -2235,6 +2242,23 @@ impl SandboxService for SandboxServiceImpl {
         }
         let result =
             pb::sandbox::SandboxResult::decode(bytes.as_slice()).map_err(to_internal_status)?;
+        #[cfg(target_os = "linux")]
+        {
+            let receipt: rauha_evidence::receipt::SignedExecutionReceipt =
+                serde_json::from_str(&result.receipt_json).map_err(to_internal_status)?;
+            let root = self.registry.root_path();
+            if receipt.payload.journal.is_some()
+                || task_run::path(&root, &id)
+                    .map_err(to_internal_status)?
+                    .exists()
+            {
+                task_run::TaskRun::open(&root, &id)
+                    .and_then(|run| run.verify_result(&result, true))
+                    .map_err(|e| {
+                        Status::failed_precondition(format!("Run journal verification failed: {e}"))
+                    })?;
+            }
+        }
         Ok(Response::new(result))
     }
 
@@ -2276,6 +2300,8 @@ impl SandboxService for SandboxServiceImpl {
                 "task container still requires cleanup",
             ));
         }
+        #[cfg(target_os = "linux")]
+        task_run::discard(&self.registry.root_path(), &id).map_err(to_internal_status)?;
         let deleted = self
             .registry
             .metadata()
@@ -2474,6 +2500,7 @@ impl SandboxServiceImpl {
             }
 
             let mut recovery = RecoveryRecord {
+                journaled: cfg!(target_os = "linux"),
                 zone_name: zone_name.clone(),
                 container_id: None,
                 cleanup_zone: temp_zone && !req.keep_zone,
@@ -2484,13 +2511,17 @@ impl SandboxServiceImpl {
             };
             validate_recovery_budget(&recovery, &self.receipt_signer)
                 .map_err(Status::invalid_argument)?;
+            #[cfg(target_os = "linux")]
+            let mut run = task_run::TaskRun::create(&self.registry.root_path(), &recovery)
+                .map_err(|e| Status::failed_precondition(format!("cannot create task Run: {e}")))?;
             self.registry.metadata().put_recovery(&recovery).map_err(to_internal_status)?;
             active.execution_attempted = true;
             // Durable recovery now owns cleanup. No guard may erase output
             // before a completed result is safely stored.
             if let Some(cleanup) = &mut zone_cleanup { cleanup.disarm(); }
             let outcome = self
-                .execute_task(&task_id, &zone_name, &zone_id, &req, &mut recovery)
+                .execute_task(&task_id, &zone_name, &zone_id, &req, &mut recovery,
+                    #[cfg(target_os = "linux")] &mut run)
                 .await;
 
             match self.registry.verify_isolation(&zone_name).await {
@@ -2509,7 +2540,20 @@ impl SandboxServiceImpl {
             let exec = outcome.unwrap_or_else(|message| {
                 SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
             });
+            // Do not publish waiting/frozen while a failed start or timeout
+            // may have left an executor alive. Failed stop preserves recovery.
+            self.stop_task(&recovery).await.map_err(to_internal_status)?;
             let mut receipt_payload = recovery.receipt.clone();
+            #[cfg(target_os = "linux")]
+            {
+                let freeze_reason = match exec.status {
+                    SandboxStatus::RuntimeError => Some("execution_failed"),
+                    SandboxStatus::TimedOut => Some("execution_timeout"),
+                    _ => None,
+                };
+                run.finish(freeze_reason).map_err(to_internal_status)?;
+                receipt_payload.journal = Some(run.commitment().map_err(to_internal_status)?);
+            }
             receipt_payload.enforcement = enforcement_totals(
                     exec.enforcement_events
                         .iter()
@@ -2578,6 +2622,8 @@ impl SandboxServiceImpl {
                 .metadata()
                 .save_result(&task_id, &result.encode_to_vec())
                 .map_err(to_internal_status)?;
+            #[cfg(target_os = "linux")]
+            run.seal_result(&result).map_err(to_internal_status)?;
             if let Err(error) = self.cleanup_recovered_task(&recovery).await {
                 tracing::warn!(%task_id, %error, "saved task result; cleanup remains pending for recovery");
                 sandbox_event_builder(&self.registry, event_name::SANDBOX_CLEANUP_PARTIAL,

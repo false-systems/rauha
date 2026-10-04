@@ -10,6 +10,9 @@ pub(super) const RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryRecord {
+    /// Older admitted tasks recover through their original metadata only.
+    #[serde(default)]
+    pub journaled: bool,
     pub zone_name: String,
     pub container_id: Option<uuid::Uuid>,
     pub cleanup_zone: bool,

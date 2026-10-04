@@ -71,6 +71,20 @@ fn verify_result_receipts(result: &pb::SandboxResult) {
     let receipt: rauha_evidence::receipt::SignedExecutionReceipt =
         serde_json::from_str(&result.receipt_json).unwrap();
     receipt.verify().unwrap();
+    let journal = receipt
+        .payload
+        .journal
+        .as_ref()
+        .expect("new tasks commit their lifecycle");
+    assert_eq!(
+        journal.state,
+        if matches!(result.status.as_str(), "runtime_error" | "timed_out") {
+            "frozen"
+        } else {
+            "waiting"
+        }
+    );
+    assert!(journal.sequence >= 2);
     assert_eq!(receipt.payload.capture_issues, result.capture_issues);
     assert_eq!(receipt.payload.status, result.status);
     assert_eq!(receipt.payload.exit_code, result.exit_code);
