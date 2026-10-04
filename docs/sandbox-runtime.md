@@ -155,7 +155,9 @@ changing saved result bytes. Retrieval checks the journal and seal; the CLI
 displays the authenticated prefix. Older receipts omit this field and older
 recovery records retain their original recovery path.
 
-Startup stops owned executors before checking journals. A corrupt history or
+Startup stops unfinished executors before checking journals. Saved results
+already follow stop confirmation; their cleanup can resume even when the executor
+was deleted before its metadata. A corrupt history or
 uncommitted tail prevents sealing and startup, preserving recovery context and
 raw output for explicit repair. It never truncates the tail or reruns a command.
 A crash before the recovery-context commit can leave an orphan journal requiring

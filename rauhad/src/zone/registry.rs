@@ -1277,6 +1277,18 @@ mod tests {
                 assert_eq!(backend.destroy_attempts.load(Ordering::SeqCst), 0);
                 continue;
             }
+            if journaled {
+                // An unfinished task with an unreachable shim must still fail
+                // closed. Absence is not proof that execution never happened.
+                let container = reg
+                    .create_container("durable-task", make_spec(&format!("{id}-task")))
+                    .await
+                    .unwrap();
+                assert!(service.recover_tasks().await.is_err());
+                assert!(reg.metadata.get_result(&id).unwrap().unwrap().is_empty());
+                assert_eq!(backend.destroy_attempts.load(Ordering::SeqCst), 0);
+                reg.metadata.delete_container(&container.id).unwrap();
+            }
             // Crash before container creation: recover uncertainty, then fail cleanup.
             assert!(service.recover_tasks().await.is_err());
             let bytes = reg.metadata.get_result(&id).unwrap().unwrap();
@@ -1301,8 +1313,15 @@ mod tests {
                 .is_err());
             drop(service);
             let service = SandboxServiceImpl::new(reg.clone(), None, signer);
+            // Cleanup can delete the executor before removing its metadata.
+            // There is deliberately no shim socket for this retained record.
+            let leftover = reg
+                .create_container("durable-task", make_spec(&format!("{id}-task")))
+                .await
+                .unwrap();
             service.recover_tasks().await.unwrap();
             service.recover_tasks().await.unwrap();
+            assert!(reg.metadata.get_container(&leftover.id).unwrap().is_none());
             assert_eq!(reg.metadata.get_result(&id).unwrap().unwrap(), bytes);
             assert!(!reg.metadata.has_recovery(&id).unwrap());
             assert_eq!(backend.destroy_attempts.load(Ordering::SeqCst), 2);

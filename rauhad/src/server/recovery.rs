@@ -23,10 +23,20 @@ impl SandboxServiceImpl {
     /// Called before accepting RPCs. Never starts a container or replays a command.
     pub async fn recover_tasks(&self) -> anyhow::Result<()> {
         let records = self.registry.metadata().recovery_records()?;
-        // Stop every owned executor before attempting journal verification.
+        // Stop unfinished executors before attempting journal verification.
         // A corrupt or incomplete journal must not leave its workload running.
+        // A saved result already follows stop confirmation. Its cleanup may
+        // have deleted the executor before deleting container metadata; querying
+        // that executor again would prevent idempotent cleanup from resuming.
         for record in &records {
-            self.stop_task(record).await?;
+            if self
+                .registry
+                .metadata()
+                .get_result(&record.receipt.task_id)?
+                .is_none_or(|result| result.is_empty())
+            {
+                self.stop_task(record).await?;
+            }
         }
         for record in records {
             let id = &record.receipt.task_id;
