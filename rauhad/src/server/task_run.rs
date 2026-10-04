@@ -51,6 +51,48 @@ pub(super) fn path(root: &str, id: &str) -> anyhow::Result<PathBuf> {
     Ok(Path::new(root).join("runs").join(id))
 }
 
+/// Caller holds the daemon's active-task mutex and excludes pending recovery.
+/// Keep the result reservation until this returns: it prevents ID reuse while
+/// a crash-interrupted deletion is retried. Never repair a live journal.
+pub(super) fn discard(root: &str, id: &str) -> anyhow::Result<()> {
+    let path = path(root, id)?;
+    let pending = path.with_file_name(format!(".deleting-{id}"));
+    let parent = path.parent().unwrap();
+    let pending_exists = match std::fs::symlink_metadata(&pending) {
+        Ok(meta) => {
+            ensure!(meta.is_dir(), "invalid journal deletion directory");
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    let journal = match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            ensure!(!pending_exists, "conflicting journal deletion state");
+            let journal = Journal::open(&path)?;
+            std::fs::rename(&path, &pending)?;
+            Some(journal)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if journal.is_some() || pending_exists {
+        ensure!(
+            std::fs::symlink_metadata(&pending)?.is_dir(),
+            "invalid journal deletion directory"
+        );
+        // Sync even on retry: the first writer may have died just after rename.
+        File::open(parent)?.sync_all()?;
+        std::fs::remove_dir_all(&pending)?;
+        File::open(parent)?.sync_all()?;
+    } else if parent.try_exists()? {
+        // A previous attempt may have unlinked the directory but not synced it.
+        File::open(parent)?.sync_all()?;
+    }
+    drop(journal);
+    Ok(())
+}
+
 impl TaskRun {
     pub(crate) fn create(root: &str, record: &RecoveryRecord) -> anyhow::Result<Self> {
         let path = path(root, &record.receipt.task_id)?;
@@ -338,6 +380,31 @@ fn validate_body(manifest: &Manifest, kind: &str, data: &Value) -> anyhow::Resul
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn discard_retries_each_directory_removal_boundary() {
+        for boundary in ["before_rename", "renamed", "partial_unlink", "unlinked"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().to_str().unwrap();
+            let record = record();
+            let id = &record.receipt.task_id;
+            drop(TaskRun::create(root, &record).unwrap());
+            let live = path(root, id).unwrap();
+            let pending = live.with_file_name(format!(".deleting-{id}"));
+            if boundary != "before_rename" {
+                std::fs::rename(&live, &pending).unwrap();
+            }
+            if boundary == "partial_unlink" {
+                std::fs::remove_file(pending.join("head")).unwrap();
+            }
+            if boundary == "unlinked" {
+                std::fs::remove_dir_all(&pending).unwrap();
+            }
+            discard(root, id).unwrap();
+            discard(root, id).unwrap();
+            assert!(!live.exists() && !pending.exists(), "{boundary}");
+        }
+    }
 
     fn record() -> RecoveryRecord {
         let id = format!("task-{}", uuid::Uuid::new_v4());

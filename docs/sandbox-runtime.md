@@ -164,6 +164,10 @@ A crash before the recovery-context commit can leave an orphan journal requiring
 explicit cleanup; its task ID cannot be reused while that directory remains.
 `sandbox-result --delete` explicitly discards the saved result and journal after
 execution and recovery cleanup finish. It must acquire the journal lock first.
+Deletion atomically renames the journal to `.deleting-<task-id>` and syncs the
+parent before unlinking files. The result reservation remains until removal is
+durable. Retrying `--delete` finishes that authorized deletion even if only part
+of the directory remains; it never reopens a partially removed journal.
 
 This local manifest contains task/zone identity and input/policy commitments,
 not command or environment values. Epoch zero grants no ownership authority.

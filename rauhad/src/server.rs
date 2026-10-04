@@ -2301,35 +2301,12 @@ impl SandboxService for SandboxServiceImpl {
             ));
         }
         #[cfg(target_os = "linux")]
-        let journal = {
-            let path =
-                task_run::path(&self.registry.root_path(), &id).map_err(to_internal_status)?;
-            match std::fs::symlink_metadata(&path) {
-                Ok(_) => Some((
-                    rauha_evidence::journal::Journal::open(&path).map_err(to_internal_status)?,
-                    path,
-                )),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(to_internal_status(e)),
-            }
-        };
+        task_run::discard(&self.registry.root_path(), &id).map_err(to_internal_status)?;
         let deleted = self
             .registry
             .metadata()
             .delete_result(&id)
             .map_err(to_internal_status)?;
-        #[cfg(target_os = "linux")]
-        {
-            if let Some((_run, path)) = journal {
-                // The active-task mutex excludes admission/deletion races. Hold
-                // the filesystem writer lock until the explicitly discarded
-                // directory is gone; never truncate or repair its tail.
-                std::fs::remove_dir_all(&path).map_err(to_internal_status)?;
-                std::fs::File::open(path.parent().unwrap())
-                    .and_then(|p| p.sync_all())
-                    .map_err(to_internal_status)?;
-            }
-        }
         Ok(Response::new(pb::sandbox::DeleteSandboxResultResponse {
             deleted,
         }))

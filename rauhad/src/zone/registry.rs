@@ -1343,6 +1343,15 @@ mod tests {
                     .is_err());
                 assert_eq!(reg.metadata.get_result(&id).unwrap().unwrap(), bytes);
                 drop(lock);
+                // Crash during an authorized deletion, after the durable rename
+                // and one unlink. Keep the result reservation until retry ends.
+                let pending = path.with_file_name(format!(".deleting-{id}"));
+                std::fs::rename(&path, &pending).unwrap();
+                std::fs::remove_file(pending.join("head")).unwrap();
+                assert!(!reg
+                    .metadata
+                    .reserve_result(&id, rauha_common::sandbox::MAX_RESULT_BYTES)
+                    .unwrap());
                 assert!(
                     service
                         .delete_sandbox_result(tonic::Request::new(SandboxResultRequest {
@@ -1354,6 +1363,11 @@ mod tests {
                         .deleted
                 );
                 assert!(!path.exists());
+                assert!(!pending.exists());
+                assert!(reg
+                    .metadata
+                    .reserve_result(&id, rauha_common::sandbox::MAX_RESULT_BYTES)
+                    .unwrap());
             } else {
                 assert!(reg.metadata.delete_result(&id).unwrap());
             }
