@@ -102,6 +102,7 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -152,7 +153,59 @@ impl Drop for SocketGuard<'_> {
 /// panic would leave brokered syscalls suspended forever, which is a zone
 /// deadlock, not a degraded mode. Every decision is appended to
 /// `decision_log_path` (one JSON line per judged call).
-pub fn serve(listener_path: &Path, decision_log_path: &Path) -> Result<()> {
+pub struct Broker {
+    cancel: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Broker {
+    pub fn start(listener_path: &Path, decision_log_path: &Path) -> Result<Self> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopping = cancel.clone();
+        let listener_path = listener_path.to_owned();
+        let decision_log_path = decision_log_path.to_owned();
+        let (ready, receiver) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("seccomp-broker".into())
+            .spawn(move || {
+                if let Err(error) = serve(&listener_path, &decision_log_path, stopping, ready) {
+                    tracing::error!(%error, "seccomp broker exited with error");
+                }
+            })?;
+        let broker = Self {
+            cancel,
+            thread: Some(thread),
+        };
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .context("broker did not bind its listener")?;
+        Ok(broker)
+    }
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            } else {
+                tracing::warn!("broker judgments still active; incomplete marker retained");
+            }
+        }
+    }
+}
+
+fn serve(
+    listener_path: &Path,
+    decision_log_path: &Path,
+    cancel: Arc<AtomicBool>,
+    ready: std::sync::mpsc::SyncSender<()>,
+) -> Result<()> {
     let _ = std::fs::remove_file(listener_path);
     // Bind under a restrictive umask so the socket is never briefly
     // world-connectable between bind and chmod; then pin mode 0600
@@ -172,7 +225,25 @@ pub fn serve(listener_path: &Path, decision_log_path: &Path) -> Result<()> {
     // crun's helper connects and sends the fd; one connection per
     // container, so stop listening the moment we have it — nothing else
     // may even queue.
-    let (stream, _) = listener.accept().context("accept seccomp listener")?;
+    listener.set_nonblocking(true)?;
+    ready.send(()).context("broker owner disappeared")?;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(handoff_timeout_ms());
+    let stream = loop {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(error) => return Err(error).context("accept seccomp listener"),
+        }
+    };
     drop(listener);
     let peer = peer_credentials(&stream)?;
     if peer.uid != unsafe { libc::getuid() } {
@@ -936,6 +1007,18 @@ fn respond(fd: libc::c_int, id: u64, verdict: Verdict, path: &[u8], log: &Shared
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropping_broker_before_runtime_handoff_cancels_listener() {
+        let root =
+            std::env::temp_dir().join(format!("rauha-broker-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let socket = root.join("notify.sock");
+        let broker = super::Broker::start(&socket, &root.join("broker.log")).unwrap();
+        assert!(socket.exists());
+        drop(broker);
+        assert!(!socket.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
 
     /// Test-only SCM_RIGHTS sender.

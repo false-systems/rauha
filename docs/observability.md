@@ -87,8 +87,8 @@ Evidence events reuse `rauha-evidence` names and add stable event keys such as
 
 - `DEBUG`: verbose implementation detail.
 - `INFO`: normal lifecycle and request progress.
-- `WARN`: recoverable or degraded behavior, including inactive network
-  filtering in rootless development.
+- `WARN`: recoverable or explicitly admitted degraded behavior. There is no
+  rootless/no-enforcement Linux daemon mode.
 - `ERROR`: needs operator attention.
 - Fatal process exits should be reserved for unrecoverable startup or
   enforcement faults.

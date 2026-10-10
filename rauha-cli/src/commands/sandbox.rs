@@ -39,7 +39,7 @@ pub struct SandboxArgs {
     /// Optional zone name. If omitted, the daemon allocates a temporary zone.
     #[arg(long)]
     pub name: Option<String>,
-    /// Host path to expose into the zone as a read/write source.
+    /// Reserved workspace option; currently rejected by the daemon (no host mount).
     #[arg(long, alias = "repo")]
     pub repo_path: Option<String>,
     /// Working directory inside the zone.

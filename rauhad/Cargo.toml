@@ -9,7 +9,7 @@ default = []
 otlp = []
 
 [dependencies]
-rauha-common = { path = "../rauha-common" }
+rauha-common = { path = "../rauha-common", features = ["rpc"] }
 rauha-enforcer-api = { path = "../rauha-enforcer-api" }
 rauha-evidence = { path = "../rauha-evidence" }
 rauha-oci = { path = "../rauha-oci" }
@@ -27,7 +27,7 @@ anyhow = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 postcard = { workspace = true }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 serde_json = "1"
 libc = "0.2"
 sha2 = { workspace = true }

@@ -15,17 +15,18 @@ A zone is the task/workload boundary. Rauha-the-product owns everything about a
 zone's lifecycle and shape:
 
 - **Zone lifecycle** — create, list, recover (from redb on restart), destroy.
-- **Containers** — pull OCI images, prepare rootfs, create/start/stop/exec/attach
-  containers within a zone (one shim per zone on Linux; one VM per zone on macOS).
+- **Containers** — pull OCI images, prepare rootfs, create/start/stop/delete and
+  exec within a zone (one shim per zone on Linux). Existing-container attach is
+  not implemented by the zone shim. There is no macOS execution backend.
 - **Filesystem view** — overlay/clone rootfs, writable paths, DNS injection.
 - **Networking** — veth/bridge/NAT and per-zone firewalling, IP allocation.
-- **Resources** — CPU/memory/pids limits via cgroups (Linux) or VM bounds (macOS).
+- **Resources** — CPU/memory/pids limits via Linux cgroups v2.
 - **Policy (user-facing)** — the TOML `ZonePolicy`: capabilities, resources,
   network, filesystem, devices, syscalls.
 - **The agent-sandbox task** — `RunSandbox`: run a command in its own zone and
   capture stdout/stderr/exit-code plus enforcement-event summaries.
 - **Evidence & observability** — normalize enforcement records + lifecycle events
-  into one stable schema (`rauha-evidence`); `trace`/`top`/`events`/`logs`.
+  into one stable schema (`rauha-evidence`); `events`/`logs` and signed task receipts.
 - **Metadata** — redb is the source of truth; reconciliation on startup.
 
 Rauha keeps ownership of the **name** of a zone and its user-facing policy. It
@@ -96,3 +97,43 @@ Until that lands, "Rauha never touches a BPF map" holds at the code level
 (`LinuxBackend` only calls `LinuxEnforcer`, never `aya`/maps directly), and the
 trait fully describes the boundary — so swapping backends is implementing one
 trait, not re-plumbing Rauha.
+
+## Supported controls and limits
+
+This section describes implemented behavior, not a release certification or a
+claim that every configuration has passed privileged integration tests.
+
+| Surface | Supported behavior and boundary |
+| --- | --- |
+| Control API | Private Unix socket, default `/run/rauha/rauhad.sock`; no TCP listener |
+| Workspaces | Image contents only; nonempty `repo_path` is rejected, not mounted |
+| Filesystem policy | Read-only root and writable mounts; writable paths must be normalized absolute paths, not `/`, and outside reserved roots (default `/proc`, `/sys`, `/dev`, `/run`) |
+| Devices | Only `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom` are admitted as supported device rules |
+| Syscalls | OCI seccomp deny rules; read-only `openat`/`openat2` notification broker; deny/broker overlap is rejected |
+| Policy updates | Creation-time controls require a zone without containers; empty zones can switch isolated/bridged networking, but host/external identity changes require zone recreation; dynamic updates freeze execution and roll back on failure |
+| Image snapshots | Ordered layers flattened into one immutable snapshot; whiteouts applied during composition, with a per-snapshot lock and atomic publication; less per-layer sharing |
+| Image limits | 4 GiB compressed blob, 4 MiB manifest/token response, 16 GiB expanded per layer; downloads have connect/request timeouts |
+| CLI monitoring | `events` (including NDJSON) and `logs`; placeholder `trace`/`top` removed |
+
+These image limits do not bound total cache disk usage. Audit admission may
+accept unsupported controls with explicit degradation; it must not be used to
+describe those controls as enforced.
+
+## Upgrade notes
+
+- Drain workloads before updating the BPF object and daemon together: inode
+  ownership now uses `(device, inode)`, changing the pinned map ABI. Rebuild the
+  object and offsets sidecar for the deployment kernel. Do not perform a rolling
+  in-place live-map upgrade with running workloads.
+- Legacy image-reference filenames could alias distinct names. They are not
+  trusted or migrated: pull tags again to populate `references-v2`. Existing
+  content-addressed blobs remain cached. Do not delete the entire content store.
+- `snapshots-v2` replaces independent per-layer extraction. Old snapshot/cache
+  directories are not proof that their contents are safe to reuse; reclaim old
+  storage only after draining workloads and confirming no mount references it.
+- Replace TCP endpoint configuration with the private socket path. The parent
+  directory must be daemon-owned and private (0700); the socket is 0600.
+
+Historical measurements and superseded audits live in [archive](archive/README.md).
+Current audit follow-up and verification boundaries are recorded in the
+[hardening status](hardening-2026-10-10.md).

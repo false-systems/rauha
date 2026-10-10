@@ -1,6 +1,5 @@
-use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rauha_common::error::RauhaError;
 
@@ -42,8 +41,6 @@ pub struct ImageService {
     content: Arc<ContentStore>,
     client: DistributionClient,
     root: PathBuf,
-    /// Tracks images currently being extracted to prevent concurrent extraction races.
-    extracting: Mutex<HashSet<String>>,
 }
 
 impl ImageService {
@@ -53,7 +50,6 @@ impl ImageService {
             content,
             client,
             root,
-            extracting: Mutex::new(HashSet::new()),
         }
     }
 
@@ -264,98 +260,35 @@ impl ImageService {
             })?;
 
             let decoder = flate2::read::GzDecoder::new(file);
-            let mut archive = tar::Archive::new(decoder);
+            let archive = tar::Archive::new(decoder);
 
             // Unpack with whiteout handling for OCI layer semantics.
-            unpack_layer(&mut archive, target)?;
+            unpack_layer(archive, target)?;
         }
 
         tracing::info!(rootfs = %target.display(), layers = manifest.layers.len(), "rootfs prepared");
         Ok(())
     }
 
-    /// Prepare a shared base rootfs for an image, returning the path.
-    ///
-    /// Idempotent: uses a `.complete` marker file to distinguish fully extracted
-    /// rootfs from partial/crashed extractions. Extraction happens into a temp
-    /// directory and is atomically renamed into place.
-    ///
-    /// Thread-safe: a per-image lock prevents concurrent extractions of the
-    /// same image from racing.
+    /// Prepare the same immutable layer-chain snapshot used by overlay mounts.
     pub fn prepare_base_rootfs(&self, reference_str: &str) -> Result<PathBuf, RauhaError> {
-        let reference =
-            ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
-                reference: reference_str.into(),
-                message: e,
-            })?;
-
-        let canonical = reference.to_string_canonical();
-        let safe_name = canonical.replace(['/', ':'], "_");
-        let image_dir = self.root.join("images").join(&safe_name);
-        let rootfs_path = image_dir.join("rootfs");
-        let marker = image_dir.join(".complete");
-
-        // Fast path: already fully extracted.
-        if marker.exists() {
-            tracing::debug!(rootfs = %rootfs_path.display(), "base rootfs already prepared");
-            return Ok(rootfs_path);
-        }
-
-        // Acquire per-image lock to prevent concurrent extraction races.
-        // Spin-wait if another thread is already extracting this image.
-        loop {
-            {
-                let mut extracting = self.extracting.lock().unwrap();
-                if !extracting.contains(&safe_name) {
-                    // Re-check marker after acquiring lock (another thread may have finished).
-                    if marker.exists() {
-                        return Ok(rootfs_path);
-                    }
-                    extracting.insert(safe_name.clone());
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        // Extract into a temp directory, then atomically rename into place.
-        // This prevents partial extractions from being treated as complete.
-        let temp_rootfs = image_dir.join(".rootfs-extracting");
-        if temp_rootfs.exists() {
-            let _ = std::fs::remove_dir_all(&temp_rootfs);
-        }
-
-        tracing::info!(image = %canonical, rootfs = %rootfs_path.display(), "preparing base rootfs");
-        let result = self.prepare_rootfs(reference_str, &temp_rootfs);
-
-        // Always release the per-image lock, even on failure.
-        self.extracting.lock().unwrap().remove(&safe_name);
-
-        result?;
-
-        // Atomic rename: if rootfs_path exists from a crashed run, remove it first.
-        if rootfs_path.exists() {
-            std::fs::remove_dir_all(&rootfs_path).map_err(|e| RauhaError::RootfsError {
-                message: format!("failed to remove stale rootfs: {e}"),
-            })?;
-        }
-        std::fs::rename(&temp_rootfs, &rootfs_path).map_err(|e| RauhaError::RootfsError {
-            message: format!("failed to rename rootfs into place: {e}"),
-        })?;
-
-        // Write completion marker.
-        std::fs::write(&marker, b"").map_err(|e| RauhaError::RootfsError {
-            message: format!("failed to write completion marker: {e}"),
-        })?;
-
-        Ok(rootfs_path)
+        let (_, digests, content_root) = self.layer_digests(reference_str)?;
+        crate::snapshotter::OverlayfsSnapshotter::new(&self.root)
+            .prepare_layers("", &digests, &content_root)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RauhaError::RootfsError {
+                message: "snapshot preparation returned no rootfs".into(),
+            })
     }
 
     /// Return layer digests and content root for an image.
     ///
-    /// Used by the overlayfs snapshotter to extract layers individually
-    /// rather than merging them all into one directory.
-    pub fn layer_digests(&self, reference_str: &str) -> Result<(Vec<String>, PathBuf), RauhaError> {
+    /// Pins the attested manifest and its ordered layer chain in one read.
+    pub fn layer_digests(
+        &self,
+        reference_str: &str,
+    ) -> Result<(String, Vec<String>, PathBuf), RauhaError> {
         let canonical = {
             let reference =
                 ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
@@ -384,17 +317,11 @@ impl ImageService {
         let digests = manifest.layers.iter().map(|l| l.digest.clone()).collect();
 
         let content_root = self.root.join("content");
-        Ok((digests, content_root))
-    }
-
-    /// Return the safe name for an image reference (used for directory paths).
-    pub fn image_safe_name(&self, reference_str: &str) -> Result<String, RauhaError> {
-        let reference =
-            ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
-                reference: reference_str.into(),
-                message: e,
-            })?;
-        Ok(reference.to_string_canonical().replace(['/', ':'], "_"))
+        Ok((
+            Digest::from_data(&manifest_bytes).to_string(),
+            digests,
+            content_root,
+        ))
     }
 
     /// Get the image config (CMD, ENV, WORKDIR, etc.) from a pulled image.
@@ -499,7 +426,7 @@ impl ImageService {
 
     /// List locally stored images (by scanning manifest references).
     pub fn list_images(&self) -> Result<Vec<ImageInfo>, RauhaError> {
-        let manifests_dir = self.root.join("content").join("manifests");
+        let manifests_dir = self.root.join("content").join("references-v2");
         if !manifests_dir.exists() {
             return Ok(Vec::new());
         }
@@ -515,17 +442,14 @@ impl ImageService {
                 continue;
             }
 
-            let digest_str = std::fs::read_to_string(&path).unwrap_or_default();
-            let digest_str = digest_str.trim();
-
-            // Recover reference from filename.
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
+            let bytes = std::fs::read(&path)?;
+            let (reference, digest_str): (String, String) = serde_json::from_slice(&bytes)
+                .map_err(|e| RauhaError::ContentError {
+                    message: format!("corrupt image reference: {e}"),
+                })?;
 
             // Try to load manifest for layer count / size.
-            let (layers, size) = if let Some(digest) = Digest::parse(digest_str) {
+            let (layers, size) = if let Some(digest) = Digest::parse(&digest_str) {
                 if let Ok(data) = self.content.get_blob(&digest) {
                     if let Ok(m) = serde_json::from_slice::<OciManifest>(&data) {
                         (m.layers.len(), m.layers.iter().map(|l| l.size).sum())
@@ -540,8 +464,8 @@ impl ImageService {
             };
 
             images.push(ImageInfo {
-                reference: stem.to_string(),
-                digest: digest_str.to_string(),
+                reference,
+                digest: digest_str,
                 layers,
                 size,
             });
@@ -561,12 +485,7 @@ impl ImageService {
             reference.to_string_canonical()
         };
 
-        let safe = canonical.replace(['/', ':'], "_");
-        let ref_path = self
-            .root
-            .join("content")
-            .join("manifests")
-            .join(format!("{safe}.json"));
+        let ref_path = self.content.manifest_ref_path(&canonical);
 
         if ref_path.exists() {
             std::fs::remove_file(&ref_path).map_err(|e| RauhaError::ContentError {
@@ -685,9 +604,31 @@ fn clear_directory(path: &Path) -> Result<(), RauhaError> {
 
 /// Unpack a tar layer into a target directory, handling OCI whiteout files.
 pub fn unpack_layer(
-    archive: &mut tar::Archive<flate2::read::GzDecoder<std::fs::File>>,
+    archive: tar::Archive<flate2::read::GzDecoder<std::fs::File>>,
     target: &Path,
 ) -> Result<(), RauhaError> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = archive.into_inner().into_inner();
+    // Whiteouts only remove lower-layer content, regardless of tar entry order.
+    for whiteouts in [true, false] {
+        file.seek(SeekFrom::Start(0))?;
+        let mut pass = tar::Archive::new(flate2::read::GzDecoder::new(file.try_clone()?));
+        unpack_layer_pass(&mut pass, target, whiteouts)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn unpack_layer_file(blob: &Path, target: &Path) -> Result<(), RauhaError> {
+    let archive = tar::Archive::new(flate2::read::GzDecoder::new(std::fs::File::open(blob)?));
+    unpack_layer(archive, target)
+}
+
+fn unpack_layer_pass(
+    archive: &mut tar::Archive<flate2::read::GzDecoder<std::fs::File>>,
+    target: &Path,
+    whiteouts: bool,
+) -> Result<(), RauhaError> {
+    let mut expanded = 0u64;
     for entry in archive.entries().map_err(|e| RauhaError::RootfsError {
         message: format!("failed to read tar entries: {e}"),
     })? {
@@ -699,6 +640,20 @@ pub fn unpack_layer(
             message: format!("invalid tar entry path: {e}"),
         })?;
         let path = clean_layer_path(&path)?;
+        expanded = expanded.saturating_add(entry.size());
+        if expanded > 16 * 1024 * 1024 * 1024 {
+            return Err(invalid_layer_path(
+                &path,
+                "layer exceeds 16 GiB extracted size limit",
+            ));
+        }
+        let is_whiteout = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_some_and(|v| v.starts_with(".wh."));
+        if is_whiteout != whiteouts {
+            continue;
+        }
 
         // Check for OCI whiteout markers.
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -937,15 +892,14 @@ pub(crate) mod tests {
         let rootfs = svc.prepare_base_rootfs("testimage:latest").unwrap();
 
         // Verify path structure.
-        assert!(rootfs.ends_with("rootfs"));
+        assert_eq!(rootfs.parent().unwrap(), dir.path().join("snapshots-v2"));
         assert!(rootfs.join("hello.txt").exists());
         assert_eq!(
             std::fs::read_to_string(rootfs.join("hello.txt")).unwrap(),
             "hello world"
         );
-        // Verify completion marker was written.
-        let marker = rootfs.parent().unwrap().join(".complete");
-        assert!(marker.exists());
+        // Only fully extracted trees receive their final digest name.
+        assert_eq!(rootfs.file_name().unwrap().len(), 64);
     }
 
     #[test]
@@ -1088,9 +1042,9 @@ pub(crate) mod tests {
             let layer_path = dir.path().join("layer.tar.gz");
             std::fs::write(&layer_path, layer).unwrap();
             let decoder = flate2::read::GzDecoder::new(std::fs::File::open(&layer_path).unwrap());
-            let mut archive = tar::Archive::new(decoder);
+            let archive = tar::Archive::new(decoder);
 
-            let error = unpack_layer(&mut archive, &target).unwrap_err();
+            let error = unpack_layer(archive, &target).unwrap_err();
             assert!(
                 error.to_string().contains("invalid whiteout target"),
                 "{name}"
@@ -1126,9 +1080,9 @@ pub(crate) mod tests {
         let layer_path = dir.path().join("layer.tar.gz");
         std::fs::write(&layer_path, layer).unwrap();
         let decoder = flate2::read::GzDecoder::new(std::fs::File::open(layer_path).unwrap());
-        let mut archive = tar::Archive::new(decoder);
+        let archive = tar::Archive::new(decoder);
 
-        let error = unpack_layer(&mut archive, &target).unwrap_err();
+        let error = unpack_layer(archive, &target).unwrap_err();
         assert!(error.to_string().contains("whiteout parent is a symlink"));
         assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"host data");
     }

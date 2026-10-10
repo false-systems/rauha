@@ -7,9 +7,11 @@
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, is_cross_zone_allowed, read_file_ino, maybe_run_self_test,
-            count_decision, emit_deny_event, emit_error_event, INODE_ZONE_MAP};
-use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_FILE_OPEN, HOOK_FILE_OPEN};
+use crate::{
+    count_decision, emit_deny_event, emit_error_event, is_cross_zone_allowed, lookup_caller_zone,
+    maybe_run_self_test, read_file_ino, INODE_ZONE_MAP,
+};
+use rauha_ebpf_common::{HOOK_FILE_OPEN, PROG_FILE_OPEN, ZONE_FLAG_GLOBAL};
 
 /// Called from the file_open LSM hook.
 ///
@@ -60,6 +62,6 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(0);
     }
 
-    emit_deny_event(HOOK_FILE_OPEN, caller.zone_id, file_zone_id, ino);
+    emit_deny_event(HOOK_FILE_OPEN, caller.zone_id, file_zone_id, ino.inode);
     Ok(-1)
 }

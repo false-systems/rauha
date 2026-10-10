@@ -9,7 +9,6 @@ license = "Apache-2.0"
 
 [dependencies]
 aya-ebpf = "0.1"
-aya-log-ebpf = "0.1"
 rauha-ebpf-common = { path = "../rauha-ebpf-common", default-features = false }
 
 [features]

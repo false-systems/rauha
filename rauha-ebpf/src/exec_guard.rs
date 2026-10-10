@@ -5,9 +5,11 @@
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, is_cross_zone_allowed, read_file_ino, read_kernel_u64,
-            count_decision, emit_deny_event, emit_error_event, offsets, INODE_ZONE_MAP};
-use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_BPRM_CHECK, HOOK_BPRM_CHECK};
+use crate::{
+    count_decision, emit_deny_event, emit_error_event, is_cross_zone_allowed, lookup_caller_zone,
+    offsets, read_file_ino, read_kernel_u64, INODE_ZONE_MAP, ZONE_MEMBERSHIP,
+};
+use rauha_ebpf_common::{HOOK_BPRM_CHECK, PROG_BPRM_CHECK, ZONE_FLAG_GLOBAL};
 
 /// Called from the bprm_check_security LSM hook.
 ///
@@ -29,6 +31,21 @@ pub fn bprm_check_security(ctx: &LsmContext) -> i32 {
 
 #[inline(always)]
 fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
+    // Consume the private setup grant before every exec path, including scripts
+    // and untracked executables. Failed execs deliberately cannot rearm it.
+    let cgroup = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    if let Some(info) = ZONE_MEMBERSHIP.get_ptr_mut(&cgroup) {
+        unsafe {
+            let flags = core::ptr::addr_of_mut!((*info).flags);
+            let value = core::ptr::read_volatile(flags);
+            if value & rauha_ebpf_common::ZONE_FLAG_RUNTIME_SETUP != 0 {
+                core::ptr::write_volatile(
+                    flags,
+                    value & !rauha_ebpf_common::ZONE_FLAG_RUNTIME_SETUP,
+                );
+            }
+        }
+    }
     let caller = match lookup_caller_zone(ctx) {
         Some(info) => info,
         None => return Ok(0),
@@ -62,6 +79,6 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(0);
     }
 
-    emit_deny_event(HOOK_BPRM_CHECK, caller.zone_id, file_zone_id, ino);
+    emit_deny_event(HOOK_BPRM_CHECK, caller.zone_id, file_zone_id, ino.inode);
     Ok(-1)
 }

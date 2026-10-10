@@ -49,4 +49,6 @@ pub struct ContainerSpec {
     /// Pre-extracted layer paths for overlayfs mount (set by orchestration layer).
     /// When present, the backend mounts an overlay instead of copying the rootfs.
     pub overlay_layers: Option<Vec<PathBuf>>,
+    /// A containerd OCI bundle, admitted against the zone policy by the backend.
+    pub oci_spec_json: Option<String>,
 }

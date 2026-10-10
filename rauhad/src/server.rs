@@ -471,6 +471,41 @@ impl ZoneService for ZoneServiceImpl {
 
 // --- Container Service ---
 
+fn container_log_stream(
+    id: String,
+    run_dir: String,
+    follow: bool,
+    tail: u32,
+) -> ReceiverStream<Result<pb::container::ContainerLogEntry, Status>> {
+    let (tx, rx) = mpsc::channel(256);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    let monitor = tx.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        crate::logs::tail_logs(&id, &run_dir, follow, tail, &worker_cancelled, |line| {
+            tx.blocking_send(Ok(pb::container::ContainerLogEntry {
+                source: line.source,
+                line: line.line,
+                timestamp: line.timestamp,
+            }))
+            .is_ok()
+        });
+    });
+    tokio::spawn(async move {
+        // Retaining a sender solely to await receiver closure deadlocks a
+        // one-shot stream. Drop it when either side finishes instead.
+        tokio::select! {
+            _ = monitor.closed() => cancelled.store(true, std::sync::atomic::Ordering::Relaxed),
+            result = worker => {
+                if let Err(error) = result {
+                    let _ = monitor.send(Err(Status::internal(format!("log reader failed: {error}")))).await;
+                }
+            }
+        }
+    });
+    ReceiverStream::new(rx)
+}
+
 pub struct ContainerServiceImpl {
     registry: Arc<ZoneRegistry>,
     /// Enforcement event broadcast sender (Linux only, None on macOS) —
@@ -480,6 +515,84 @@ pub struct ContainerServiceImpl {
 }
 
 impl ContainerServiceImpl {
+    #[allow(clippy::result_large_err)] // tonic::Status is the RPC boundary's native error.
+    async fn process_request(
+        &self,
+        container_id: String,
+        exec_id: String,
+        operation: rauha_common::shim::ProcessOperation,
+    ) -> Result<rauha_common::shim::ShimResponse, Status> {
+        let id = container_id
+            .parse::<uuid::Uuid>()
+            .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
+        if exec_id.len() > 128
+            || !exec_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            || exec_id == "."
+            || exec_id == ".."
+        {
+            return Err(Status::invalid_argument("invalid exec ID"));
+        }
+        let container = self.registry.get_container(&id).map_err(to_status)?;
+        let zone = self
+            .registry
+            .zone_name_for_container(&container.zone_id)
+            .await
+            .ok_or_else(|| Status::not_found("container zone not found"))?;
+        let response = self
+            .registry
+            .shim_request(
+                &zone,
+                &rauha_common::shim::ShimRequest::Process {
+                    id: id.to_string(),
+                    exec_id,
+                    operation,
+                },
+            )
+            .await
+            .map_err(to_status)?;
+        if let rauha_common::shim::ShimResponse::Error { message } = response {
+            return Err(Status::failed_precondition(message));
+        }
+        Ok(response)
+    }
+
+    #[allow(clippy::result_large_err)] // tonic::Status is the RPC boundary's native error.
+    async fn process_info(
+        &self,
+        container_id: String,
+        exec_id: String,
+        operation: rauha_common::shim::ProcessOperation,
+    ) -> Result<Response<pb::container::ProcessInfo>, Status> {
+        match self
+            .process_request(container_id, exec_id, operation)
+            .await?
+        {
+            rauha_common::shim::ShimResponse::ProcessState {
+                pid,
+                status,
+                exit_code,
+                finished_at,
+            } => {
+                let state = match status.as_str() {
+                    "created" => "Created",
+                    "running" => "Running",
+                    "stopped" => "Stopped",
+                    "paused" => "Paused",
+                    _ => return Err(Status::internal("unknown process state")),
+                };
+                Ok(Response::new(pb::container::ProcessInfo {
+                    pid,
+                    state: state.into(),
+                    exit_code,
+                    finished_at,
+                }))
+            }
+            _ => Err(Status::internal("unexpected process response")),
+        }
+    }
+
     pub fn new(
         registry: Arc<ZoneRegistry>,
         #[cfg(target_os = "linux")] event_tx: Option<
@@ -496,6 +609,233 @@ impl ContainerServiceImpl {
 
 #[tonic::async_trait]
 impl ContainerService for ContainerServiceImpl {
+    async fn create_exec(
+        &self,
+        request: Request<pb::container::CreateExecRequest>,
+    ) -> Result<Response<pb::container::ProcessInfo>, Status> {
+        let r = request.into_inner();
+        if r.exec_id.is_empty() {
+            return Err(Status::invalid_argument("exec ID is required"));
+        }
+        self.process_info(
+            r.container_id,
+            r.exec_id,
+            rauha_common::shim::ProcessOperation::Create {
+                process_json: r.process_json,
+                io: rauha_common::shim::ProcessIo {
+                    stdin: r.stdin,
+                    stdout: r.stdout,
+                    stderr: r.stderr,
+                    terminal: r.terminal,
+                },
+            },
+        )
+        .await
+    }
+    async fn start_exec(
+        &self,
+        request: Request<pb::container::ProcessRequest>,
+    ) -> Result<Response<pb::container::ProcessInfo>, Status> {
+        let r = request.into_inner();
+        if r.exec_id.is_empty() {
+            return Err(Status::invalid_argument("exec ID is required"));
+        }
+        self.process_info(
+            r.container_id,
+            r.exec_id,
+            rauha_common::shim::ProcessOperation::Start,
+        )
+        .await
+    }
+    async fn get_exec(
+        &self,
+        request: Request<pb::container::ProcessRequest>,
+    ) -> Result<Response<pb::container::ProcessInfo>, Status> {
+        let r = request.into_inner();
+        self.process_info(
+            r.container_id,
+            r.exec_id,
+            rauha_common::shim::ProcessOperation::State,
+        )
+        .await
+    }
+    async fn delete_exec(
+        &self,
+        request: Request<pb::container::ProcessRequest>,
+    ) -> Result<Response<pb::container::ProcessInfo>, Status> {
+        let r = request.into_inner();
+        if r.exec_id.is_empty() {
+            return Err(Status::invalid_argument("exec ID is required"));
+        }
+        self.process_info(
+            r.container_id,
+            r.exec_id,
+            rauha_common::shim::ProcessOperation::Delete,
+        )
+        .await
+    }
+    async fn signal_process(
+        &self,
+        request: Request<pb::container::SignalProcessRequest>,
+    ) -> Result<Response<pb::container::ProcessInfo>, Status> {
+        let r = request.into_inner();
+        if r.signal > 64 {
+            return Err(Status::invalid_argument("invalid signal"));
+        }
+        self.process_info(
+            r.container_id,
+            r.exec_id,
+            rauha_common::shim::ProcessOperation::Signal {
+                signal: r.signal as i32,
+                all: r.all,
+            },
+        )
+        .await
+    }
+    async fn resize_process(
+        &self,
+        request: Request<pb::container::ResizeProcessRequest>,
+    ) -> Result<Response<pb::container::ProcessInfo>, Status> {
+        let r = request.into_inner();
+        let rows = r
+            .rows
+            .try_into()
+            .map_err(|_| Status::invalid_argument("rows exceeds 65535"))?;
+        let cols = r
+            .cols
+            .try_into()
+            .map_err(|_| Status::invalid_argument("cols exceeds 65535"))?;
+        if rows == 0 || cols == 0 {
+            return Err(Status::invalid_argument(
+                "terminal dimensions must be positive",
+            ));
+        }
+        self.process_info(
+            r.container_id,
+            r.exec_id,
+            rauha_common::shim::ProcessOperation::Resize { rows, cols },
+        )
+        .await
+    }
+    async fn close_process_io(
+        &self,
+        request: Request<pb::container::ProcessRequest>,
+    ) -> Result<Response<pb::container::ProcessInfo>, Status> {
+        let r = request.into_inner();
+        self.process_info(
+            r.container_id,
+            r.exec_id,
+            rauha_common::shim::ProcessOperation::CloseIo,
+        )
+        .await
+    }
+    async fn container_stats(
+        &self,
+        request: Request<pb::container::GetContainerRequest>,
+    ) -> Result<Response<pb::container::ContainerStatsResponse>, Status> {
+        match self
+            .process_request(
+                request.into_inner().container_id,
+                String::new(),
+                rauha_common::shim::ProcessOperation::Stats,
+            )
+            .await?
+        {
+            rauha_common::shim::ShimResponse::ContainerStats {
+                cpu_usage_usec,
+                cpu_user_usec,
+                cpu_system_usec,
+                memory_usage_bytes,
+                memory_limit_bytes,
+                pids_current,
+                pids_limit,
+                process_ids,
+            } => Ok(Response::new(pb::container::ContainerStatsResponse {
+                cpu_usage_usec,
+                cpu_user_usec,
+                cpu_system_usec,
+                memory_usage_bytes,
+                memory_limit_bytes,
+                pids_current,
+                pids_limit,
+                process_ids,
+            })),
+            _ => Err(Status::internal("unexpected statistics response")),
+        }
+    }
+    async fn update_container_resources(
+        &self,
+        request: Request<pb::container::UpdateContainerResourcesRequest>,
+    ) -> Result<Response<pb::container::UpdateContainerResourcesResponse>, Status> {
+        let r = request.into_inner();
+        self.process_request(
+            r.container_id,
+            String::new(),
+            rauha_common::shim::ProcessOperation::UpdateResources {
+                resources_json: r.resources_json,
+            },
+        )
+        .await?;
+        Ok(Response::new(
+            pb::container::UpdateContainerResourcesResponse {},
+        ))
+    }
+    async fn set_container_paused(
+        &self,
+        request: Request<pb::container::SetContainerPausedRequest>,
+    ) -> Result<Response<pb::container::SetContainerPausedResponse>, Status> {
+        let r = request.into_inner();
+        self.process_request(
+            r.container_id,
+            String::new(),
+            rauha_common::shim::ProcessOperation::Pause { paused: r.paused },
+        )
+        .await?;
+        Ok(Response::new(pb::container::SetContainerPausedResponse {}))
+    }
+
+    async fn import_container(
+        &self,
+        request: Request<pb::container::ImportContainerRequest>,
+    ) -> Result<Response<pb::container::CreateContainerResponse>, Status> {
+        let req = request.into_inner();
+        let rootfs = std::path::Path::new(&req.rootfs);
+        if !rootfs.is_absolute() || rootfs == std::path::Path::new("/") || !rootfs.is_dir() {
+            return Err(Status::invalid_argument(
+                "bundle rootfs must be an absolute directory other than /",
+            ));
+        }
+        let rootfs = rootfs
+            .canonicalize()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if rootfs == std::path::Path::new("/") {
+            return Err(Status::invalid_argument(
+                "host root cannot be a bundle rootfs",
+            ));
+        }
+        let spec = rauha_common::container::ContainerSpec {
+            name: req.name,
+            image: String::new(),
+            command: Vec::new(),
+            env: Vec::new(),
+            working_dir: None,
+            rootfs_path: Some(rootfs),
+            overlay_layers: None,
+            oci_spec_json: Some(req.spec_json),
+        };
+        let container = self
+            .registry
+            .create_container(&req.zone_name, spec)
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(pb::container::CreateContainerResponse {
+            container_id: container.id.to_string(),
+            name: container.name,
+            state: format!("{:?}", container.state),
+            pid: container.pid.unwrap_or(0),
+        }))
+    }
+
     async fn create_container(
         &self,
         request: Request<pb::container::CreateContainerRequest>,
@@ -513,6 +853,7 @@ impl ContainerService for ContainerServiceImpl {
             },
             rootfs_path: None,
             overlay_layers: None,
+            oci_spec_json: None,
         };
 
         let container = self
@@ -525,6 +866,7 @@ impl ContainerService for ContainerServiceImpl {
             container_id: container.id.to_string(),
             name: container.name,
             state: format!("{:?}", container.state),
+            pid: container.pid.unwrap_or(0),
         }))
     }
 
@@ -557,7 +899,55 @@ impl ContainerService for ContainerServiceImpl {
             .await;
         }
 
-        Ok(Response::new(pb::container::StartContainerResponse {}))
+        let container = self
+            .registry
+            .get_container(&container_id)
+            .map_err(to_status)?;
+        Ok(Response::new(pb::container::StartContainerResponse {
+            pid: container
+                .pid
+                .ok_or_else(|| Status::internal("runtime returned no PID"))?,
+        }))
+    }
+
+    async fn signal_container(
+        &self,
+        request: Request<pb::container::SignalContainerRequest>,
+    ) -> Result<Response<pb::container::SignalContainerResponse>, Status> {
+        let req = request.into_inner();
+        if req.signal > 64 {
+            return Err(Status::invalid_argument("signal must be between 0 and 64"));
+        }
+        let id = req
+            .container_id
+            .parse::<uuid::Uuid>()
+            .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
+        let container = self.registry.get_container(&id).map_err(to_status)?;
+        let zone = self
+            .registry
+            .zone_name_for_container(&container.zone_id)
+            .await
+            .ok_or_else(|| Status::not_found("container zone not found"))?;
+        match self
+            .registry
+            .shim_request(
+                &zone,
+                &rauha_common::shim::ShimRequest::Signal {
+                    id: id.to_string(),
+                    signal: req.signal as i32,
+                },
+            )
+            .await
+            .map_err(to_status)?
+        {
+            rauha_common::shim::ShimResponse::Ok => {
+                Ok(Response::new(pb::container::SignalContainerResponse {}))
+            }
+            rauha_common::shim::ShimResponse::Error { message } => {
+                Err(Status::failed_precondition(message))
+            }
+            _ => Err(Status::internal("unexpected signal response from runtime")),
+        }
     }
 
     async fn stop_container(
@@ -606,6 +996,10 @@ impl ContainerService for ContainerServiceImpl {
             .parse::<uuid::Uuid>()
             .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
 
+        self.registry
+            .get_container_state(&container_id)
+            .await
+            .map_err(to_status)?;
         let container = self
             .registry
             .get_container(&container_id)
@@ -626,6 +1020,11 @@ impl ContainerService for ContainerServiceImpl {
                 state: format!("{:?}", container.state),
                 pid: container.pid.unwrap_or(0),
                 created_at: container.created_at.to_rfc3339(),
+                exit_code: container.exit_code,
+                finished_at: container
+                    .finished_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_default(),
                 started_at: container
                     .started_at
                     .map(|t| t.to_rfc3339())
@@ -666,6 +1065,8 @@ impl ContainerService for ContainerServiceImpl {
                 state: format!("{:?}", c.state),
                 pid: c.pid.unwrap_or(0),
                 created_at: c.created_at.to_rfc3339(),
+                exit_code: c.exit_code,
+                finished_at: c.finished_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
                 started_at: c.started_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
             });
         }
@@ -692,35 +1093,14 @@ impl ContainerService for ContainerServiceImpl {
             .get_container(&container_id)
             .map_err(to_status)?;
 
-        let (tx, rx) = mpsc::channel(256);
         let follow = req.follow;
         let tail = req.tail;
         let id_str = container_id.to_string();
         let run_dir = self.registry.config().paths.run_dir.clone();
 
-        // Cancellation flag: set when the tx channel is dropped (client disconnects).
-        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancelled_clone = cancelled.clone();
-
-        // Monitor the receiver: when the client drops, signal cancellation.
-        let tx_clone = tx.clone();
-        tokio::spawn(async move {
-            tx_clone.closed().await;
-            cancelled_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
-
-        tokio::task::spawn_blocking(move || {
-            crate::logs::tail_logs(&id_str, &run_dir, follow, tail, &cancelled, |log_line| {
-                tx.blocking_send(Ok(pb::container::ContainerLogEntry {
-                    source: log_line.source,
-                    line: log_line.line,
-                    timestamp: log_line.timestamp,
-                }))
-                .is_ok()
-            });
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(container_log_stream(
+            id_str, run_dir, follow, tail,
+        )))
     }
 
     async fn exec_in_container(
@@ -987,6 +1367,7 @@ fn spawn_exec_relay<R, W>(
     use tokio_stream::StreamExt;
 
     // Read from exec stream → send to gRPC client.
+    let exit_target = resize_target.clone();
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut reader = reader;
@@ -1004,7 +1385,27 @@ fn spawn_exec_relay<R, W>(
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!(
+                            "exec output failed: {error}"
+                        ))))
+                        .await;
+                    break;
+                }
+            }
+        }
+        let result = finish_exec_session(exit_target.as_ref(), &tx).await;
+        match result {
+            Ok(code) => {
+                let _ = tx
+                    .send(Ok(pb::container::ExecStreamResponse {
+                        message: Some(pb::container::exec_stream_response::Message::ExitCode(code)),
+                    }))
+                    .await;
+            }
+            Err(error) => {
+                let _ = tx.send(Err(error)).await;
             }
         }
     });
@@ -1030,6 +1431,95 @@ fn spawn_exec_relay<R, W>(
             }
         }
     });
+}
+
+#[allow(clippy::result_large_err)]
+fn exec_exit_status(response: rauha_common::shim::ShimResponse) -> Result<Option<i32>, Status> {
+    use rauha_common::shim::ShimResponse;
+    match response {
+        ShimResponse::ProcessState {
+            status, exit_code, ..
+        } if status == "stopped" => exit_code
+            .map(Some)
+            .ok_or_else(|| Status::internal("exec stopped without a recorded exit status")),
+        ShimResponse::ProcessState { .. } => Ok(None),
+        ShimResponse::Error { message } => Err(Status::internal(message)),
+        _ => Err(Status::internal(
+            "shim cannot report this exec session's exit status",
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)] // tonic::Status is the RPC boundary's native error.
+async fn finish_exec_session(
+    target: Option<&PtyResizeTarget>,
+    output: &mpsc::Sender<Result<pb::container::ExecStreamResponse, Status>>,
+) -> Result<i32, Status> {
+    use rauha_common::shim::{ProcessOperation, ShimRequest};
+    let target = target
+        .ok_or_else(|| Status::unimplemented("exec exit status requires a session-aware shim"))?;
+    let session = target
+        .session_id
+        .as_ref()
+        .ok_or_else(|| Status::unimplemented("legacy shim did not return an exec session ID"))?;
+    let request = |operation| ShimRequest::Process {
+        id: target.container_id.clone(),
+        exec_id: session.clone(),
+        operation,
+    };
+    let mut signaled = false;
+    let code = loop {
+        let response = target
+            .registry
+            .shim_request(&target.zone_name, &request(ProcessOperation::State))
+            .await
+            .map_err(to_status)?;
+        if let Some(code) = exec_exit_status(response)? {
+            break code;
+        }
+        if output.is_closed() && !signaled {
+            // The client may disconnect after closing its PTY but before exit.
+            let signal = target
+                .registry
+                .shim_request(
+                    &target.zone_name,
+                    &request(ProcessOperation::Signal {
+                        signal: 9,
+                        all: false,
+                    }),
+                )
+                .await
+                .map_err(to_status)?;
+            if !matches!(signal, rauha_common::shim::ShimResponse::Ok) {
+                // An exit between State and Signal is harmless; a genuine
+                // cancellation failure must not become an endless poll.
+                let state = target
+                    .registry
+                    .shim_request(&target.zone_name, &request(ProcessOperation::State))
+                    .await
+                    .map_err(to_status)?;
+                if let Some(code) = exec_exit_status(state)? {
+                    break code;
+                }
+                return Err(Status::internal(format!(
+                    "failed to cancel disconnected exec: {signal:?}"
+                )));
+            }
+            signaled = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let deleted = target
+        .registry
+        .shim_request(&target.zone_name, &request(ProcessOperation::Delete))
+        .await
+        .map_err(to_status)?;
+    if exec_exit_status(deleted)? != Some(code) {
+        return Err(Status::internal(
+            "exec cleanup returned an inconsistent exit status",
+        ));
+    }
+    Ok(code)
 }
 
 #[derive(Clone)]
@@ -1370,11 +1860,12 @@ impl SandboxServiceImpl {
             working_dir: (!req.workdir.is_empty()).then(|| req.workdir.clone()),
             rootfs_path: None,
             overlay_layers: None,
+            oci_spec_json: None,
         };
 
-        let container = self
+        let (container, manifest_digest) = self
             .registry
-            .create_container(zone_name, spec)
+            .create_container_attested(zone_name, spec)
             .await
             .map_err(|e| {
                 sandbox_event_builder(
@@ -1394,10 +1885,7 @@ impl SandboxServiceImpl {
                     req.image
                 )
             })?;
-        // The receipt must attest the manifest this container was built from,
-        // so read it now — a concurrent pull of the same tag after this point
-        // must not change what the receipt claims ran.
-        let manifest_digest = self.registry.image_digest(&req.image).ok();
+        // Identity comes from the same manifest read that selected the rootfs layers.
         recovery.container_id = Some(container.id);
         recovery.receipt.image.manifest_digest = manifest_digest.clone().unwrap_or_default();
         recovery.receipt.image.digest_verified =
@@ -1945,6 +2433,11 @@ fn project_enforcement_event(event: &FalseEvent) -> EnforcementEventSummary {
 /// Validate the request before touching any zone/container state.
 #[allow(clippy::result_large_err)] // `tonic::Status` is the handler's native error type.
 fn validate_sandbox_request(req: &pb::sandbox::RunSandboxRequest) -> Result<(), Status> {
+    if !req.repo_path.is_empty() {
+        return Err(Status::invalid_argument(
+            "repo_path is not supported: workspace provisioning is not implemented",
+        ));
+    }
     // Reserve most of the reply for output/evidence rather than echoed argv.
     if req.encoded_len() > rauha_common::sandbox::MAX_RESULT_BYTES / 4 {
         return Err(Status::invalid_argument(
@@ -2644,6 +3137,58 @@ mod tests {
     use super::*;
     use tonic::Code;
 
+    #[test]
+    fn exec_exit_status_preserves_failure_and_refuses_unknown_completion() {
+        use rauha_common::shim::ShimResponse;
+        let state = |status: &str, exit_code| ShimResponse::ProcessState {
+            pid: 123,
+            status: status.into(),
+            exit_code,
+            finished_at: String::new(),
+        };
+        assert_eq!(exec_exit_status(state("running", None)).unwrap(), None);
+        assert_eq!(
+            exec_exit_status(state("stopped", Some(7))).unwrap(),
+            Some(7)
+        );
+        assert!(exec_exit_status(state("stopped", None)).is_err());
+        assert!(exec_exit_status(ShimResponse::Error {
+            message: "wait status unavailable".into()
+        })
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn nonfollow_logs_deliver_content_and_close_even_without_a_client_drop() {
+        use tokio_stream::StreamExt;
+        let directory = tempfile::tempdir().unwrap();
+        let logs = directory.path().join("containers").join("exited");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("stdout.log"), b"hello\nworld\n").unwrap();
+        std::fs::write(logs.join("stderr.log"), b"warning\n").unwrap();
+        for (id, expected) in [
+            ("exited", vec!["hello", "world", "warning"]),
+            ("missing", vec![]),
+        ] {
+            let mut stream = container_log_stream(
+                id.into(),
+                directory.path().to_str().unwrap().into(),
+                false,
+                0,
+            );
+            let entries = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut entries = Vec::new();
+                while let Some(entry) = stream.next().await {
+                    entries.push(entry.unwrap().line);
+                }
+                entries
+            })
+            .await
+            .expect("non-follow logs must reach EOF independently of client disconnect");
+            assert_eq!(entries, expected);
+        }
+    }
+
     fn req(image: &str, command: Vec<&str>) -> pb::sandbox::RunSandboxRequest {
         pb::sandbox::RunSandboxRequest {
             image: image.to_string(),
@@ -2680,6 +3225,17 @@ mod tests {
     fn empty_command_is_invalid() {
         let status = validate_sandbox_request(&req("alpine", vec![])).unwrap_err();
         assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn workspace_paths_are_rejected_instead_of_silently_ignored() {
+        for path in [".", "/tmp/project", " "] {
+            let mut request = req("alpine", vec!["echo"]);
+            request.repo_path = path.into();
+            let status = validate_sandbox_request(&request).unwrap_err();
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert!(status.message().contains("workspace provisioning"));
+        }
     }
 
     #[test]

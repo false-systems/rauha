@@ -4,6 +4,7 @@
 //! BPF map helpers. It creates the enforcement seam first without moving the
 //! kernel code or changing backend behavior.
 
+use rauha_ebpf_common::InodeKey;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -118,12 +119,6 @@ impl LinuxEnforcer {
         })
     }
 
-    pub(super) fn hot_reload_policy(&self, zone_id: u32, policy: &ZonePolicy) -> Result<()> {
-        self.with_bpf("policy hot reload", |bpf| {
-            MapManager::hot_reload_policy(bpf, zone_id, policy)
-        })
-    }
-
     /// Apply zone-wide enforcement (the seam's `ZoneEnforcement`) to the kernel
     /// policy map.
     ///
@@ -158,6 +153,46 @@ impl LinuxEnforcer {
         })
     }
 
+    /// Give the trusted shim its own descriptor without changing inheritance
+    /// flags on the daemon's map or introducing a publicly discoverable pin.
+    pub(super) fn duplicate_membership_fd(&self) -> Result<std::os::fd::OwnedFd> {
+        use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+        require_runtime_setup_hooks(&self.skipped_hooks())?;
+        self.with_bpf("shim membership descriptor", |bpf| {
+            let Some(aya::maps::Map::HashMap(map)) = bpf.map("ZONE_MEMBERSHIP") else {
+                return Err(RauhaError::BackendError(
+                    "zone membership map missing or wrong type".into(),
+                ));
+            };
+            let fd =
+                unsafe { libc::fcntl(map.fd().as_fd().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+            if fd < 0 {
+                return Err(RauhaError::BackendError(format!(
+                    "duplicate membership descriptor: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // F_DUPFD_CLOEXEC returned a new descriptor owned by this value.
+            Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+        })
+    }
+
+    pub(super) fn add_child_zone_member(&self, parent: u64, child: u64) -> Result<()> {
+        self.with_bpf("container cgroup membership", |bpf| {
+            let member = MapManager::zone_member(bpf, parent)?.ok_or_else(|| {
+                RauhaError::BackendError("parent zone has no kernel membership".into())
+            })?;
+            let kind = if member.flags & rauha_ebpf_common::ZONE_FLAG_GLOBAL != 0 {
+                ZoneType::Global
+            } else if member.flags & rauha_ebpf_common::ZONE_FLAG_PRIVILEGED != 0 {
+                ZoneType::Privileged
+            } else {
+                ZoneType::NonGlobal
+            };
+            MapManager::add_zone_member(bpf, child, member.zone_id, kind)
+        })
+    }
+
     pub(super) fn zone_member_matches(&self, cgroup_id: u64, zone_id: u32) -> Result<bool> {
         let mut ebpf_guard = lock_backend(&self.ebpf, "linux_enforcer.ebpf")?;
         let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
@@ -174,19 +209,19 @@ impl LinuxEnforcer {
         })
     }
 
-    pub(super) fn insert_inodes(&self, inodes: &[u64], zone_id: u32) -> Result<Vec<u64>> {
+    pub(super) fn insert_inodes(&self, inodes: &[InodeKey], zone_id: u32) -> Result<Vec<InodeKey>> {
         self.with_bpf("rootfs inode registration", |bpf| {
             MapManager::insert_inodes(bpf, inodes, zone_id)
         })
     }
 
-    pub(super) fn remove_inodes(&self, inodes: &[u64]) -> Result<u32> {
+    pub(super) fn remove_inodes(&self, inodes: &[InodeKey]) -> Result<u32> {
         self.with_bpf("rootfs inode cleanup", |bpf| {
             MapManager::remove_inodes(bpf, inodes)
         })
     }
 
-    pub(super) fn inodes_match(&self, inodes: &[u64], zone_id: u32) -> Result<bool> {
+    pub(super) fn inodes_match(&self, inodes: &[InodeKey], zone_id: u32) -> Result<bool> {
         self.with_bpf("rootfs inode verification", |bpf| {
             for &inode in inodes {
                 if MapManager::inode_zone(bpf, inode)? != Some(zone_id) {
@@ -281,6 +316,17 @@ impl LinuxEnforcer {
             ZoneKind::Standard | ZoneKind::Isolated => ZoneType::NonGlobal,
         }
     }
+}
+
+fn require_runtime_setup_hooks(skipped: &[String]) -> Result<()> {
+    for required in ["bprm_check_security", "ptrace_access_check", "capable"] {
+        if skipped.iter().any(|hook| hook == required) {
+            return Err(RauhaError::BackendError(format!(
+                "native runtime setup requires BPF-LSM hook {required}; refusing membership authority"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for LinuxEnforcer {
@@ -506,6 +552,15 @@ fn to_enforcer_error(error: RauhaError) -> EnforcerError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_setup_refuses_missing_consumption_and_injection_guards() {
+        for hook in ["bprm_check_security", "ptrace_access_check", "capable"] {
+            assert!(super::require_runtime_setup_hooks(&[hook.into()]).is_err());
+        }
+        assert!(super::require_runtime_setup_hooks(&[]).is_ok());
+        // This hook remains governed by the existing strict/audit admission.
+        assert!(super::require_runtime_setup_hooks(&["cgroup_attach_task".into()]).is_ok());
+    }
     use super::*;
     use rauha_enforcer_api::conformance;
     use std::sync::Arc;

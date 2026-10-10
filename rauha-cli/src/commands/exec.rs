@@ -107,8 +107,7 @@ pub async fn handle_exec(args: ExecArgs) -> anyhow::Result<()> {
                 None => {}
             },
             Err(e) => {
-                eprintln!("Error: {e}");
-                break;
+                return Err(e.into());
             }
         }
     }
@@ -116,11 +115,9 @@ pub async fn handle_exec(args: ExecArgs) -> anyhow::Result<()> {
     // Drop _raw_guard before exiting so terminal state is restored.
     drop(_raw_guard);
 
-    if let Some(code) = exit_code {
-        std::process::exit(code);
-    }
-
-    Ok(())
+    let code =
+        exit_code.ok_or_else(|| anyhow::anyhow!("exec stream ended without an exit status"))?;
+    std::process::exit(code);
 }
 
 pub async fn handle_attach(args: AttachArgs) -> anyhow::Result<()> {

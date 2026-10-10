@@ -57,6 +57,154 @@ pub enum ShimRequest {
     DeleteContainer {
         id: String,
     },
+    Process {
+        id: String,
+        exec_id: String,
+        operation: ProcessOperation,
+    },
+    /// Followed by exactly one SCM_RIGHTS map descriptor on the same stream.
+    RefreshMembership,
+}
+
+#[cfg(target_os = "linux")]
+pub mod descriptor {
+    use nix::sys::socket::{
+        getsockopt, recvmsg, sendmsg, sockopt::PeerCredentials, ControlMessage,
+        ControlMessageOwned, MsgFlags,
+    };
+    use std::io::{self, IoSlice, IoSliceMut};
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+
+    fn root_peer(stream: &UnixStream) -> io::Result<()> {
+        if getsockopt(stream, PeerCredentials)?.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "membership transfer requires a root peer",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn send(stream: &UnixStream, fd: BorrowedFd<'_>) -> io::Result<()> {
+        root_peer(stream)?;
+        send_one(stream, &[fd.as_raw_fd()])
+    }
+
+    fn send_one(stream: &UnixStream, fds: &[i32]) -> io::Result<()> {
+        let bytes = sendmsg::<()>(
+            stream.as_raw_fd(),
+            &[IoSlice::new(b"M")],
+            &[ControlMessage::ScmRights(fds)],
+            MsgFlags::MSG_NOSIGNAL,
+            None,
+        )?;
+        if bytes != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "membership fd transfer incomplete",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn receive(stream: &UnixStream) -> io::Result<OwnedFd> {
+        root_peer(stream)?;
+        receive_one(stream)
+    }
+
+    fn receive_one(stream: &UnixStream) -> io::Result<OwnedFd> {
+        let mut byte = [0];
+        let mut iov = [IoSliceMut::new(&mut byte)];
+        // Linux permits at most 253 descriptors per SCM_RIGHTS message. Receive
+        // the whole set so rejecting extra descriptors also closes every one.
+        let mut ancillary = nix::cmsg_space!([i32; 253]);
+        let message = recvmsg::<()>(
+            stream.as_raw_fd(),
+            &mut iov,
+            Some(&mut ancillary),
+            MsgFlags::MSG_CMSG_CLOEXEC,
+        )?;
+        let mut descriptors = Vec::new();
+        let mut unexpected = false;
+        for control in message.cmsgs()? {
+            match control {
+                ControlMessageOwned::ScmRights(fds) => {
+                    for fd in fds {
+                        // SCM_RIGHTS transfers a new descriptor owned by this receiver.
+                        descriptors.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                    }
+                }
+                _ => unexpected = true,
+            }
+        }
+        let invalid = message.bytes != 1
+            || message
+                .flags
+                .intersects(MsgFlags::MSG_CTRUNC | MsgFlags::MSG_TRUNC)
+            || unexpected
+            || descriptors.len() != 1;
+        if invalid || byte != *b"M" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected exactly one complete membership descriptor",
+            ));
+        }
+        Ok(descriptors.pop().unwrap())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::fd::AsFd;
+        #[test]
+        fn descriptor_transfer_owns_cloexec_and_rejects_multiple() {
+            let (left, right) = UnixStream::pair().unwrap();
+            let file = std::fs::File::open("/dev/null").unwrap();
+            send_one(&left, &[file.as_raw_fd()]).unwrap();
+            let received = receive_one(&right).unwrap();
+            assert!(
+                nix::fcntl::fcntl(received.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap()
+                    & nix::fcntl::FdFlag::FD_CLOEXEC.bits()
+                    != 0
+            );
+            assert!(received.as_raw_fd() != file.as_raw_fd());
+            send_one(
+                &left,
+                &[file.as_raw_fd(), file.as_raw_fd(), file.as_raw_fd()],
+            )
+            .unwrap();
+            assert!(receive_one(&right).is_err());
+            if !nix::unistd::geteuid().is_root() {
+                assert_eq!(
+                    send(&left, file.as_fd()).unwrap_err().kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessIo {
+    pub stdin: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub terminal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProcessOperation {
+    Create { process_json: String, io: ProcessIo },
+    Start,
+    State,
+    Signal { signal: i32, all: bool },
+    Delete,
+    Resize { rows: u16, cols: u16 },
+    CloseIo,
+    Stats,
+    UpdateResources { resources_json: String },
+    Pause { paused: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +243,22 @@ pub enum ShimResponse {
         session_id: Option<String>,
         /// Unix socket path serving the exec session I/O.
         socket_path: String,
+    },
+    ProcessState {
+        pid: u32,
+        status: String,
+        exit_code: Option<i32>,
+        finished_at: String,
+    },
+    ContainerStats {
+        cpu_usage_usec: u64,
+        cpu_user_usec: u64,
+        cpu_system_usec: u64,
+        memory_usage_bytes: u64,
+        memory_limit_bytes: u64,
+        pids_current: u64,
+        pids_limit: u64,
+        process_ids: Vec<u32>,
     },
 }
 

@@ -11,34 +11,10 @@ mod pb {
 }
 
 #[derive(Args)]
-pub struct TraceArgs {
-    #[arg(long)]
-    pub zone: String,
-}
-
-#[derive(Args)]
-pub struct TopArgs {
-    #[arg(long)]
-    pub zone: Option<String>,
-}
-
-#[derive(Args)]
 pub struct EventsArgs {
     /// Filter events by zone name.
     #[arg(long)]
     pub zone: Option<String>,
-}
-
-pub async fn handle_trace(args: TraceArgs) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "syscall tracing for zone {} is not yet implemented",
-        args.zone
-    )
-}
-
-pub async fn handle_top(_args: TopArgs) -> anyhow::Result<()> {
-    println!("Per-zone resource monitoring (not yet implemented)");
-    Ok(())
 }
 
 #[derive(Serialize)]
@@ -110,19 +86,5 @@ fn format_timestamp(ts: &str) -> String {
         format!("{secs:>6}.{ms:03}")
     } else {
         ts.to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn unimplemented_trace_returns_an_error() {
-        assert!(handle_trace(TraceArgs {
-            zone: "test".into()
-        })
-        .await
-        .is_err());
     }
 }

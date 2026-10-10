@@ -9,6 +9,7 @@ name = "containerd-shim-rauha-v2"
 path = "src/main.rs"
 
 [dependencies]
+rauha-common = { path = "../rauha-common", features = ["rpc"] }
 # Containerd shim framework
 containerd-shim = { version = "0.10", features = ["async"] }
 containerd-shim-protos = "0.10"
@@ -35,6 +36,15 @@ oci-spec.workspace = true
 # Serialization
 serde.workspace = true
 serde_json = "1"
+toml.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+libc = "0.2"
 
 [build-dependencies]
 tonic-build.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+rauha-oci = { path = "../rauha-oci" }
+nix.workspace = true

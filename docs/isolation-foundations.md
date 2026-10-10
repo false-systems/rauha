@@ -43,7 +43,7 @@ What the zone idea actually consisted of:
 | `zonecfg` contract | `ZonePolicy` TOML | shipped |
 | strict admission / `limitpriv` | `admission = "strict"` refuses unenforceable controls | shipped — stricter than zonecfg ever was |
 | `zlogin` | `rauha exec` / `attach` | shipped |
-| `prstat -Z` / DTrace / BSM | `top`, `events`, evidence schema, receipts | shipped (receipts go beyond Solaris) |
+| `prstat -Z` / DTrace / BSM | `events`, evidence schema, receipts | event/receipt surfaces shipped; no `top` or syscall trace command |
 | sparse-root read-only image | read-only rootfs + `writable_paths` | shipped (Landlock closes the rest: planned) |
 | exclusive-IP / VNICs | netns + veth + nftables default-deny | shipped |
 | process contracts | subreaper + pidfd + `cgroup.kill` | shipped |

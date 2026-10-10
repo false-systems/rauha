@@ -11,9 +11,7 @@ pub mod zone;
 
 /// Connect to the rauhad gRPC server.
 pub async fn connect() -> anyhow::Result<tonic::transport::Channel> {
-    let addr = std::env::var("RAUHA_ADDR").unwrap_or_else(|_| "http://[::1]:9876".into());
-    let channel = tonic::transport::Channel::from_shared(addr)?
-        .connect()
-        .await?;
-    Ok(channel)
+    let addr =
+        std::env::var("RAUHA_ADDR").unwrap_or_else(|_| rauha_common::rpc::DEFAULT_ADDRESS.into());
+    rauha_common::rpc::connect(&addr).await
 }

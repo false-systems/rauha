@@ -37,7 +37,7 @@ flowchart TB
     backend --> linux
 
     evidence["rauha-evidence\ncanonical event schema · redaction · projections"]
-    surfaces["logs · trace · events · sandbox result envelope"]
+    surfaces["logs · events · sandbox result envelope"]
     sinks["JSON / console / watch API / OTLP"]
 
     ring --> evidence
@@ -59,7 +59,7 @@ flowchart TB
 | `rauha-evidence` | Evidence-grade observability schema, projections, and sinks (does not enforce) |
 | `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd's Task API to `rauhad` for Kubernetes |
 | `rauha-ebpf` / `rauha-ebpf-common` | In-repo Linux eBPF LSM programs and shared `repr(C)` types (separate build) |
-| `xtask` | Build helper for eBPF artifacts |
+| `xtask` | Rust build, integration/security gate and probe tooling |
 
 ## One shim per zone, not per container
 
@@ -73,7 +73,7 @@ from containerd's one-shim-per-container model.
 A zone is not just a namespace and not just a cgroup. It is Rauha's unit of
 execution, policy, isolation, observability, and enforcement, tying together:
 cgroups, namespaces, rootfs/filesystem view, network namespace + bridge + rules,
-runtime metadata, policy, the audit stream, and optional kernel enforcement.
+runtime metadata, policy, the audit stream, and required Linux kernel enforcement.
 
 User-visible zone IDs are UUIDs (persisted in redb, the source of truth on crash
 recovery); kernel-side they compact to `u32` BPF map keys. On startup `rauhad`
@@ -83,10 +83,10 @@ map state — then cleans up orphaned kernel state.
 ## Control surface
 
 The CLI is a thin client of the daemon's gRPC API (`RAUHA_ADDR`, default
-`http://[::1]:9876`).
+`/run/rauha/rauhad.sock`). This is a private Unix socket, not a TCP listener.
 
 ```sh
-rauha sandbox --image python:3.12 --repo-path . -- pytest   # task-level
+rauha sandbox --image alpine:latest -- /bin/echo hello   # task-level
 rauha zone create --name frontend --policy policies/standard.toml
 rauha zone list
 rauha zone verify frontend --json       # boundary self-check
@@ -94,15 +94,14 @@ rauha image pull alpine:latest
 rauha run --zone frontend alpine:latest /bin/echo hello
 rauha ps --zone frontend
 rauha exec <container-id> -- /bin/sh    # exec in a running container
-rauha attach <container-id>             # attach to a running container
 rauha logs <container-id>               # stream stdout/stderr
 rauha events                            # live zone + enforcement events
-rauha trace --zone frontend             # per-zone syscall trace (unimplemented)
-rauha top                               # per-zone resource usage
 rauha policy show --zone frontend
 rauha stop <container-id> && rauha delete <container-id>
 rauha zone delete --name frontend --force
 ```
 
-`trace`, `top`, `events`, `logs`, `exec`, `attach`, and `setup` are streaming or
-interactive and do not take `--json`; every other read command does.
+`logs`, `exec` and `attach` do not take `--json`; `events --json` emits NDJSON.
+Existing-container attach remains unsupported by the zone shim; use `exec`
+for a new session. Placeholder `trace` and `top` commands have been removed.
+See the [capability reference](rauha-product-abilities.md) for policy and storage limits.

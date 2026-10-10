@@ -16,7 +16,11 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 oci-spec = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true }
+rauha-ebpf-common = { workspace = true }
 nix = { workspace = true }
 libc = "0.2"
+tempfile = "3"

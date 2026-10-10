@@ -9,8 +9,13 @@
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, check_cross_zone_task_access, count_decision, ZONE_POLICY};
-use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, POLICY_FLAG_ALLOW_PTRACE, PROG_PTRACE_CHECK, HOOK_PTRACE_CHECK};
+use crate::{
+    check_cross_zone_task_access, count_decision, lookup_caller_zone, read_task_cgroup_id,
+    ZONE_MEMBERSHIP, ZONE_POLICY,
+};
+use rauha_ebpf_common::{
+    HOOK_PTRACE_CHECK, POLICY_FLAG_ALLOW_PTRACE, PROG_PTRACE_CHECK, ZONE_FLAG_GLOBAL,
+};
 
 /// Called from the ptrace_access_check LSM hook.
 ///
@@ -39,6 +44,17 @@ fn try_ptrace_check(ctx: &LsmContext) -> Result<i32, i64> {
 
     if caller.flags & ZONE_FLAG_GLOBAL != 0 {
         return Ok(0);
+    }
+
+    let target: u64 = unsafe { ctx.arg(0) };
+    if target != 0 {
+        let target_cgroup = unsafe { read_task_cgroup_id(target)? };
+        if unsafe { ZONE_MEMBERSHIP.get(&target_cgroup) }
+            .is_some_and(|info| info.flags & rauha_ebpf_common::ZONE_FLAG_RUNTIME_SETUP != 0)
+        {
+            crate::emit_deny_event(HOOK_PTRACE_CHECK, caller.zone_id, 0, 0);
+            return Ok(-1);
+        }
     }
 
     if let Some(policy) = unsafe { ZONE_POLICY.get(&caller.zone_id) } {

@@ -55,13 +55,115 @@ pub struct RuntimeProcess {
     runtime_root: PathBuf,
     id: String,
     cleaned: bool,
+    exit_code: Option<i32>,
+    is_init: bool,
+    #[cfg(target_os = "linux")]
+    io: Option<crate::process_io::IoSession>,
     #[cfg(target_os = "linux")]
     captures: Vec<crate::output::Capture>,
     #[cfg(target_os = "linux")]
-    broker: Option<std::thread::JoinHandle<()>>,
+    broker: Option<crate::broker::Broker>,
+    #[cfg(target_os = "linux")]
+    exec_cgroup: Option<crate::exec_cgroup::ExecCgroup>,
 }
 
 impl RuntimeProcess {
+    pub fn termination_handle(&self) -> anyhow::Result<std::fs::File> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(std::fs::File::from(self.pidfd.try_clone()?))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            anyhow::bail!("pidfd signaling requires Linux")
+        }
+    }
+    pub fn signal_all(&self, signal: i32) -> anyhow::Result<()> {
+        anyhow::ensure!(self.is_init, "all-process signaling requires the init task");
+        let output = runtime_command(&self.runtime_root)
+            .args(["kill", "--all", &self.id, &signal.to_string()])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "crun kill failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    pub fn set_paused(&self, paused: bool) -> anyhow::Result<()> {
+        let output = runtime_command(&self.runtime_root)
+            .args([if paused { "pause" } else { "resume" }, &self.id])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "crun pause/resume failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    pub fn update_resources(&self, resources: &str, bundle: &Path) -> anyhow::Result<()> {
+        let value: serde_json::Value = serde_json::from_str(resources)?;
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("config.json"))?)?;
+        if let Some(devices) = value.get("devices") {
+            anyhow::ensure!(
+                Some(devices) == spec.pointer("/linux/resources/devices"),
+                "resource updates cannot change zone device admission"
+            );
+        }
+        let path = bundle.join("resources.json");
+        std::fs::write(&path, serde_json::to_vec(&value)?)?;
+        let output = runtime_command(&self.runtime_root)
+            .arg("update")
+            .arg("--resources")
+            .arg(path)
+            .arg(&self.id)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "crun resource update failed; container remains paused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    pub fn close_stdin(&self) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(io) = &self.io {
+            io.close_stdin();
+        }
+        Ok(())
+    }
+
+    pub fn resize(&self, rows: u16, cols: u16) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.io
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("process has no terminal"))?
+                .resize(rows, cols)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (rows, cols);
+            anyhow::bail!("terminal resize requires Linux")
+        }
+    }
+
+    pub fn start(&self) -> anyhow::Result<()> {
+        let output = runtime_command(&self.runtime_root)
+            .args(["start", &self.id])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "crun start failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(())
+    }
+
     pub fn signal(&self, signal: i32) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -88,7 +190,10 @@ impl RuntimeProcess {
     }
 
     /// Return the workload exit code once init exits and clean its runtime state.
-    pub fn try_wait(&mut self) -> Option<i32> {
+    pub fn try_wait(&mut self) -> anyhow::Result<Option<i32>> {
+        if self.exit_code.is_some() {
+            return Ok(self.exit_code);
+        }
         #[cfg(target_os = "linux")]
         {
             let mut pollfd = libc::pollfd {
@@ -96,23 +201,48 @@ impl RuntimeProcess {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            if unsafe { libc::poll(&mut pollfd, 1, 0) } <= 0 {
-                return None;
+            let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(None);
+                }
+                return Err(error.into());
             }
+            if ready == 0 {
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                pollfd.revents & libc::POLLNVAL == 0,
+                "invalid process descriptor"
+            );
             let mut status = 0;
             let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+            if waited == 0 {
+                return Ok(None);
+            }
+            if waited < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(None);
+                }
+                return Err(anyhow::anyhow!("workload exit status unavailable: {error}"));
+            }
             let exit_code = if waited == self.pid && libc::WIFEXITED(status) {
                 libc::WEXITSTATUS(status)
             } else if waited == self.pid && libc::WIFSIGNALED(status) {
                 128 + libc::WTERMSIG(status)
             } else {
-                125
+                return Err(anyhow::anyhow!(
+                    "runtime returned a nonterminal process status"
+                ));
             };
-            self.delete();
-            Some(exit_code)
+            self.exit_code = Some(exit_code);
+            self.captures.clear();
+            Ok(Some(exit_code))
         }
         #[cfg(not(target_os = "linux"))]
-        None
+        Ok(None)
     }
 
     /// Wait up to `grace` for init to exit, then SIGKILL it and wait again.
@@ -120,61 +250,69 @@ impl RuntimeProcess {
     /// Init is PID 1 of its own pid namespace, where a signal with default
     /// disposition (SIGTERM to `sleep`, say) is silently discarded — so a
     /// delivered stop signal proves nothing until the pidfd reports exit.
-    pub fn wait_or_kill(&mut self, grace: Duration) -> i32 {
-        if let Some(exit_code) = self.wait_until(Instant::now() + grace) {
-            return exit_code;
+    pub fn wait_or_kill(&mut self, grace: Duration) -> anyhow::Result<i32> {
+        if let Some(exit_code) = self.wait_until(Instant::now() + grace)? {
+            return Ok(exit_code);
         }
         let _ = self.signal(9);
         let exit_code = self
-            .wait_until(Instant::now() + Duration::from_secs(5))
-            .unwrap_or(128 + 9);
-        self.delete();
-        exit_code
+            .wait_until(Instant::now() + Duration::from_secs(5))?
+            .ok_or_else(|| anyhow::anyhow!("container {} has not exited after SIGKILL", self.id))?;
+        Ok(exit_code)
     }
 
-    fn wait_until(&mut self, deadline: Instant) -> Option<i32> {
+    fn wait_until(&mut self, deadline: Instant) -> anyhow::Result<Option<i32>> {
         loop {
-            if let Some(exit_code) = self.try_wait() {
-                return Some(exit_code);
+            if let Some(exit_code) = self.try_wait()? {
+                return Ok(Some(exit_code));
             }
             if Instant::now() >= deadline {
-                return None;
+                return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    pub fn stop_and_delete(&mut self) {
-        self.wait_or_kill(Duration::ZERO);
+    pub fn stop_and_delete(&mut self) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(group) = &self.exec_cgroup {
+            group.terminate()?;
+        }
+        self.wait_or_kill(Duration::ZERO)?;
+        self.delete()
     }
 
-    fn delete(&mut self) {
-        if self.cleaned {
-            return;
+    fn delete(&mut self) -> anyhow::Result<()> {
+        if self.is_init && !self.cleaned {
+            let output = runtime_command(&self.runtime_root)
+                .args(["delete", "--force", &self.id])
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "crun delete failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
-        let _ = runtime_command(&self.runtime_root)
-            .args(["delete", "--force", &self.id])
-            .status();
         self.cleaned = true;
         #[cfg(target_os = "linux")]
         {
             self.captures.clear();
-            if let Some(broker) = self.broker.take() {
-                let deadline = Instant::now() + Duration::from_secs(1);
-                while !broker.is_finished() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                if broker.is_finished() {
-                    let _ = broker.join();
-                }
-                // An unfinished broker retains its incomplete marker.
+            if let Some(io) = &mut self.io {
+                io.finish()?;
             }
+            self.io.take();
+            self.broker.take();
+            if let Some(group) = &mut self.exec_cgroup {
+                group.cleanup()?;
+            }
+            self.exec_cgroup.take();
         }
+        Ok(())
     }
 }
 
-/// Start an OCI bundle with crun while the shim remains its foreground supervisor.
-pub fn start_with_crun(
+/// Create an OCI init process; it remains suspended until `RuntimeProcess::start`.
+pub fn create_with_crun(
     zone_name: &str,
     container_id: &str,
     spec_json: &str,
@@ -185,142 +323,268 @@ pub fn start_with_crun(
         let _ = (zone_name, container_id, spec_json, rootfs_root);
         anyhow::bail!("crun execution is only supported on Linux")
     }
-
     #[cfg(target_os = "linux")]
     {
-        // Fail fast if the OCI runtime is missing; runtime_command resolves
-        // the same path when building each crun invocation.
         crun_path()?;
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-
         let bundle = rootfs_root.join("containers").join(container_id);
-        if !bundle.join("merged").is_dir() && !bundle.join("rootfs").is_dir() {
-            anyhow::bail!("rootfs not found for container {container_id}");
-        }
-
+        anyhow::ensure!(
+            bundle.join("merged").is_dir() || bundle.join("rootfs").is_dir(),
+            "container rootfs is missing"
+        );
         let runtime_root = rootfs_root.join("runtime");
         std::fs::create_dir_all(&runtime_root)?;
-        std::fs::write(bundle.join("config.json"), spec_json)?;
-
+        let mut spec: serde_json::Value = serde_json::from_str(spec_json)?;
+        spec["linux"]["cgroupsPath"] =
+            format!("/rauha.slice/zone-{zone_name}/{container_id}").into();
+        std::fs::write(bundle.join("config.json"), serde_json::to_vec(&spec)?)?;
         let pid_file = bundle.join("init.pid");
         let _ = std::fs::remove_file(&pid_file);
-        // Container logs are workload output: root-only, like the rest of
-        // the container's runtime state. World-readable logs under
-        // /run/rauha would let any local user read a workload's activity
-        // (flagged in the #73 review). DirBuilder's mode applies to every
-        // directory it creates on the recursive path, so the whole chain
-        // down to containers/{id} is 0700.
         let log_dir = run_dir().join("containers").join(container_id);
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .recursive(true)
-                .create(&log_dir)?;
-        }
-
-        // If the spec brokers syscalls (seccomp SCMP_ACT_NOTIFY with a
-        // listener path), start the broker thread before crun starts the
-        // container — crun's listener helper connects there at start.
-        // Every broker decision is appended to broker.log next to the
-        // container's stdout/stderr logs.
-        let broker = if let Some(listener_path) = broker_listener_path(spec_json) {
-            let decision_log = log_dir.join("broker.log");
-            Some(std::thread::spawn(move || {
-                if let Err(error) = crate::broker::serve(&listener_path, &decision_log) {
-                    // The broker failing after judgments is survivable —
-                    // brokered calls then hang or EPERM — but say so.
-                    tracing::error!(%error, "seccomp broker exited with error");
-                }
-            }))
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&log_dir)?;
+        let mut captures = Vec::new();
+        let mut imported_io = if spec["annotations"]["io.rauha.containerd.io"] == "fifo" {
+            let stream = |name: &str| {
+                spec["annotations"][format!("io.rauha.containerd.{name}")]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            Some(crate::process_io::PreparedIo::new(
+                &rauha_common::shim::ProcessIo {
+                    stdin: stream("stdin"),
+                    stdout: stream("stdout"),
+                    stderr: stream("stderr"),
+                    terminal: spec["process"]["terminal"].as_bool().unwrap_or(false),
+                },
+                &bundle,
+            )?)
         } else {
             None
         };
-
-        let limit = crate::output::max_bytes()?;
-        let (stdout_capture, stdout) =
-            crate::output::Capture::start(&log_dir.join("stdout.log"), limit)?;
-        let (stderr_capture, stderr) =
-            crate::output::Capture::start(&log_dir.join("stderr.log"), limit)?;
-        let status = runtime_command(&runtime_root)
-            .args(crun_create_args(&bundle, &pid_file, container_id))
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(OwnedFd::from(stdout)))
-            .stderr(Stdio::from(OwnedFd::from(stderr)))
-            .status()?;
-        if !status.success() {
-            let error = std::fs::read_to_string(log_dir.join("stderr.log")).unwrap_or_default();
-            let _ = runtime_command(&runtime_root)
-                .args(["delete", "--force", container_id])
-                .status();
-            anyhow::bail!("crun create failed: {}", error.trim());
+        let (stdin, stdout, stderr) = if let Some(io) = imported_io.as_mut() {
+            (
+                std::mem::replace(&mut io.stdin, Stdio::null()),
+                std::mem::replace(&mut io.stdout, Stdio::null()),
+                std::mem::replace(&mut io.stderr, Stdio::null()),
+            )
+        } else {
+            let limit = crate::output::max_bytes()?;
+            let (out_capture, out) =
+                crate::output::Capture::start(&log_dir.join("stdout.log"), limit)?;
+            let (err_capture, err) =
+                crate::output::Capture::start(&log_dir.join("stderr.log"), limit)?;
+            captures.extend([out_capture, err_capture]);
+            (
+                Stdio::null(),
+                Stdio::from(OwnedFd::from(out)),
+                Stdio::from(OwnedFd::from(err)),
+            )
+        };
+        let args = crun_create_args(&bundle, &pid_file, container_id);
+        let broker = broker_listener_path(spec_json)
+            .map(|path| crate::broker::Broker::start(&path, &log_dir.join("broker.log")))
+            .transpose()?;
+        let runtime_log = tempfile::NamedTempFile::new_in(&bundle)?;
+        let mut command = runtime_command(&runtime_root);
+        command.arg("--log").arg(runtime_log.path());
+        command.args(&args[..args.len() - 1]);
+        if let Some(path) = imported_io.as_ref().and_then(|io| io.console_path()) {
+            command.arg("--console-socket").arg(path);
         }
-
-        let pid = match std::fs::read_to_string(&pid_file)
-            .and_then(|pid| pid.trim().parse::<u32>().map_err(std::io::Error::other))
-        {
-            Ok(pid) => pid,
+        command
+            .arg(container_id)
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr);
+        let creation = (|| -> anyhow::Result<(OwnedFd, u32)> {
+            let status = command.status()?;
+            if !status.success() {
+                use std::io::Read;
+                let mut diagnostic = String::new();
+                std::fs::File::open(runtime_log.path())?
+                    .take(64 * 1024)
+                    .read_to_string(&mut diagnostic)?;
+                anyhow::bail!(
+                    "crun create rejected OCI version {} ({status}): {}",
+                    spec["ociVersion"],
+                    diagnostic.trim()
+                );
+            }
+            if let Some(io) = imported_io.as_mut() {
+                io.receive_console()?;
+            }
+            read_pidfd(&pid_file)
+        })();
+        let (pidfd, pid) = match creation {
+            Ok(process) => process,
             Err(error) => {
-                let _ = runtime_command(&runtime_root)
+                let cleanup = runtime_command(&runtime_root)
                     .args(["delete", "--force", container_id])
-                    .status();
-                return Err(error.into());
+                    .output()?;
+                anyhow::ensure!(
+                    cleanup.status.success(),
+                    "{error}; runtime cleanup failed: {}",
+                    String::from_utf8_lossy(&cleanup.stderr)
+                );
+                return Err(error);
             }
         };
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if pidfd < 0 {
-            let error = std::io::Error::last_os_error();
-            let _ = runtime_command(&runtime_root)
-                .args(["delete", "--force", container_id])
-                .status();
-            return Err(error.into());
-        }
-        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
-
-        let cgroup = format!("/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs");
-        if let Err(error) = std::fs::write(&cgroup, pid.to_string()) {
-            let _ = runtime_command(&runtime_root)
-                .args(["delete", "--force", container_id])
-                .status();
-            anyhow::bail!("failed to enroll OCI init in {cgroup}: {error}");
-        }
-
-        let output = match runtime_command(&runtime_root)
-            .args(["start", container_id])
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = runtime_command(&runtime_root)
-                    .args(["delete", "--force", container_id])
-                    .status();
-                return Err(error.into());
-            }
-        };
-        if !output.status.success() {
-            let _ = runtime_command(&runtime_root)
-                .args(["delete", "--force", container_id])
-                .status();
-            anyhow::bail!(
-                "crun start failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
         Ok((
             RuntimeProcess {
                 pidfd,
                 pid: pid as libc::pid_t,
                 runtime_root,
-                id: container_id.to_string(),
+                id: container_id.to_owned(),
                 cleaned: false,
-                captures: vec![stdout_capture, stderr_capture],
+                exit_code: None,
+                is_init: true,
+                io: imported_io.as_mut().map(|io| io.take_session()),
+                captures,
                 broker,
+                exec_cgroup: None,
             },
             pid,
         ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_pidfd(path: &Path) -> anyhow::Result<(OwnedFd, u32)> {
+    let pid = std::fs::read_to_string(path)?.trim().parse::<u32>()?;
+    anyhow::ensure!(pid > 0, "runtime returned invalid PID");
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok((unsafe { OwnedFd::from_raw_fd(fd as i32) }, pid))
+}
+
+pub fn exec_with_crun(
+    container_id: &str,
+    exec_id: &str,
+    process_json: &str,
+    io: &rauha_common::shim::ProcessIo,
+    rootfs_root: &Path,
+) -> anyhow::Result<(RuntimeProcess, u32)> {
+    let (runtime, pid, _) =
+        exec_with_console(container_id, exec_id, process_json, io, rootfs_root, false)?;
+    Ok((runtime, pid))
+}
+
+pub fn exec_with_console(
+    container_id: &str,
+    exec_id: &str,
+    process_json: &str,
+    io: &rauha_common::shim::ProcessIo,
+    rootfs_root: &Path,
+    direct: bool,
+) -> anyhow::Result<(RuntimeProcess, u32, Option<std::fs::File>)> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (container_id, exec_id, process_json, io, rootfs_root, direct);
+        anyhow::bail!("crun exec requires Linux")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let bundle = rootfs_root.join("containers").join(container_id);
+        let runtime_root = rootfs_root.join("runtime");
+        let process_file = bundle.join(format!("exec-{exec_id}.json"));
+        let pid_file = bundle.join(format!("exec-{exec_id}.pid"));
+        std::fs::write(&process_file, process_json)?;
+        let mut io = crate::process_io::PreparedIo::new(io, &bundle)?;
+        let runtime_log = tempfile::NamedTempFile::new_in(&bundle)?;
+        let mut exec_cgroup =
+            crate::exec_cgroup::ExecCgroup::create(&bundle, container_id, exec_id)?;
+        let mut command = runtime_command(&runtime_root);
+        command
+            .arg("--log")
+            .arg(runtime_log.path())
+            .arg("exec")
+            .arg("--detach")
+            .arg("--cgroup")
+            .arg(exec_cgroup.name())
+            .arg("--process")
+            .arg(&process_file)
+            .arg("--pid-file")
+            .arg(&pid_file);
+        if let Some(path) = io.console_path() {
+            command.arg("--console-socket").arg(path);
+        }
+        let output = command
+            .arg(container_id)
+            .stdin(std::mem::replace(&mut io.stdin, Stdio::null()))
+            .stdout(std::mem::replace(&mut io.stdout, Stdio::null()))
+            .stderr(std::mem::replace(&mut io.stderr, Stdio::null()))
+            .status();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                exec_cgroup.terminate()?;
+                exec_cgroup.cleanup()?;
+                return Err(error.into());
+            }
+        };
+        if !output.success() {
+            exec_cgroup.terminate()?;
+            use std::io::Read;
+            let mut diagnostic = String::new();
+            std::fs::File::open(runtime_log.path())?
+                .take(64 * 1024)
+                .read_to_string(&mut diagnostic)?;
+            exec_cgroup.cleanup()?;
+            anyhow::bail!("crun exec failed ({output}): {}", diagnostic.trim());
+        }
+        let (pidfd, pid) = match read_pidfd(&pid_file) {
+            Ok(process) => process,
+            Err(error) => {
+                exec_cgroup.terminate()?;
+                exec_cgroup.cleanup()?;
+                return Err(error);
+            }
+        };
+        let mut process = RuntimeProcess {
+            pidfd,
+            pid: pid as libc::pid_t,
+            runtime_root,
+            id: container_id.to_owned(),
+            cleaned: false,
+            exit_code: None,
+            is_init: false,
+            io: None,
+            captures: Vec::new(),
+            broker: None,
+            exec_cgroup: Some(exec_cgroup),
+        };
+        if let Err(error) = process
+            .exec_cgroup
+            .as_ref()
+            .unwrap()
+            .verify_workload_boundary()
+        {
+            process.stop_and_delete()?;
+            return Err(error);
+        }
+        let console = if direct {
+            io.receive_direct_console().map(Some)
+        } else {
+            io.receive_console().map(|()| None)
+        };
+        let console = match console {
+            Ok(console) => console,
+            Err(error) => {
+                process.stop_and_delete()?;
+                return Err(error);
+            }
+        };
+        process.io = Some(io.take_session());
+        Ok((process, pid, console))
     }
 }
 
@@ -348,7 +612,7 @@ fn runtime_command(runtime_root: &Path) -> Command {
     command
         .arg("--root")
         .arg(runtime_root)
-        .arg("--cgroup-manager=disabled");
+        .arg("--cgroup-manager=cgroupfs");
     command
 }
 
@@ -364,179 +628,51 @@ fn crun_create_args(bundle: &Path, pid_file: &Path, container_id: &str) -> Vec<O
     ]
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ProcessSecurity {
-    bounding: u64,
-    effective: u64,
-    inheritable: u64,
-    permitted: u64,
-    ambient: u64,
-    no_new_privileges: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl ProcessSecurity {
-    pub(crate) fn from_process(process: &oci_spec::runtime::Process) -> anyhow::Result<Self> {
-        let capabilities = process
-            .capabilities()
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("process.capabilities is required"))?;
-
-        Ok(Self {
-            bounding: capability_mask(capabilities.bounding().as_ref())?,
-            effective: capability_mask(capabilities.effective().as_ref())?,
-            inheritable: capability_mask(capabilities.inheritable().as_ref())?,
-            permitted: capability_mask(capabilities.permitted().as_ref())?,
-            ambient: capability_mask(capabilities.ambient().as_ref())?,
-            no_new_privileges: process.no_new_privileges().unwrap_or(false),
-        })
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn capability_mask(capabilities: Option<&oci_spec::runtime::Capabilities>) -> anyhow::Result<u64> {
-    capabilities
-        .into_iter()
-        .flatten()
-        .try_fold(0u64, |mask, capability| {
-            let name = capability.to_string();
-            let bit = rauha_common::zone::linux_capability_bit(&name)
-                .ok_or_else(|| anyhow::anyhow!("unsupported OCI capability: {name}"))?;
-            Ok(mask | (1u64 << bit))
-        })
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn apply_process_security(
-    security: ProcessSecurity,
-    cap_last_cap: u32,
-) -> anyhow::Result<()> {
-    #[repr(C)]
-    struct UserCapHeader {
-        version: u32,
-        pid: i32,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct UserCapData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-
-    for capability in 0..=cap_last_cap {
-        if security.bounding & (1u64 << capability) == 0 {
-            let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-    }
-
-    let header = UserCapHeader {
-        version: 0x2008_0522,
-        pid: 0,
-    };
-    let data = [
-        UserCapData {
-            effective: security.effective as u32,
-            permitted: security.permitted as u32,
-            inheritable: security.inheritable as u32,
-        },
-        UserCapData {
-            effective: (security.effective >> 32) as u32,
-            permitted: (security.permitted >> 32) as u32,
-            inheritable: (security.inheritable >> 32) as u32,
-        },
-    ];
-    let rc = unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-
-    let rc = unsafe {
-        libc::prctl(
-            libc::PR_CAP_AMBIENT,
-            libc::PR_CAP_AMBIENT_CLEAR_ALL,
-            0,
-            0,
-            0,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    for capability in 0..=cap_last_cap {
-        if security.ambient & (1u64 << capability) != 0 {
-            let rc = unsafe {
-                libc::prctl(
-                    libc::PR_CAP_AMBIENT,
-                    libc::PR_CAP_AMBIENT_RAISE,
-                    capability,
-                    0,
-                    0,
-                )
-            };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-    }
-
-    if security.no_new_privileges {
-        let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    Ok(())
-}
-
-/// fork(2)-equivalent clone3 used only by interactive exec.
-#[cfg(target_os = "linux")]
-pub(crate) fn clone_process(flags: u64) -> nix::Result<nix::unistd::ForkResult> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct CloneArgs {
-        flags: u64,
-        pidfd: u64,
-        child_tid: u64,
-        parent_tid: u64,
-        exit_signal: u64,
-        stack: u64,
-        stack_size: u64,
-        tls: u64,
-        set_tid: u64,
-        set_tid_size: u64,
-        cgroup: u64,
-    }
-
-    let args = CloneArgs {
-        flags,
-        exit_signal: libc::SIGCHLD as u64,
-        ..Default::default()
-    };
-    let pid = unsafe {
-        libc::syscall(
-            libc::SYS_clone3,
-            &args as *const CloneArgs,
-            std::mem::size_of::<CloneArgs>(),
-        )
-    };
-    if pid < 0 {
-        Err(nix::errno::Errno::last())
-    } else if pid == 0 {
-        Ok(nix::unistd::ForkResult::Child)
-    } else {
-        Ok(nix::unistd::ForkResult::Parent {
-            child: nix::unistd::Pid::from_raw(pid as i32),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::zombie_processes)] // RuntimeProcess deliberately owns waitpid in the first branch.
+    fn process_wait_preserves_exit_status_and_refuses_missing_status() {
+        use super::*;
+        for already_reaped in [false, true] {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "exit 7"])
+                .spawn()
+                .unwrap();
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+            assert!(fd >= 0);
+            let mut process = RuntimeProcess {
+                pidfd: unsafe { OwnedFd::from_raw_fd(fd as i32) },
+                pid: child.id() as i32,
+                runtime_root: PathBuf::new(),
+                id: "test".into(),
+                cleaned: false,
+                exit_code: None,
+                is_init: false,
+                io: None,
+                captures: Vec::new(),
+                broker: None,
+                exec_cgroup: None,
+            };
+            if already_reaped {
+                assert_eq!(child.wait().unwrap().code(), Some(7));
+                assert!(process
+                    .try_wait()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exit status unavailable"));
+            } else {
+                assert_eq!(
+                    process
+                        .wait_until(Instant::now() + Duration::from_secs(5))
+                        .unwrap(),
+                    Some(7)
+                );
+                assert_eq!(process.try_wait().unwrap(), Some(7));
+            }
+        }
+    }
     use super::crun_create_args;
     use std::path::Path;
 
@@ -590,34 +726,5 @@ mod tests {
             "container log file must be root-only"
         );
         std::fs::remove_dir_all(&base).ok();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn empty_oci_capabilities_mean_zero_process_capabilities() {
-        use super::ProcessSecurity;
-        use oci_spec::runtime::{Capabilities, LinuxCapabilitiesBuilder, ProcessBuilder};
-
-        let capabilities = LinuxCapabilitiesBuilder::default()
-            .bounding(Capabilities::default())
-            .effective(Capabilities::default())
-            .inheritable(Capabilities::default())
-            .permitted(Capabilities::default())
-            .ambient(Capabilities::default())
-            .build()
-            .unwrap();
-        let process = ProcessBuilder::default()
-            .capabilities(capabilities)
-            .no_new_privileges(true)
-            .build()
-            .unwrap();
-
-        assert_eq!(
-            ProcessSecurity::from_process(&process).unwrap(),
-            ProcessSecurity {
-                no_new_privileges: true,
-                ..Default::default()
-            }
-        );
     }
 }

@@ -1,5 +1,10 @@
 # Risk Assessment: Four Critiques, Researched
 
+> Historical research, not current capability guidance. The tables below describe
+> the August snapshot and include removed components. See the
+> [current capability reference](rauha-product-abilities.md) and
+> [October deep audit](deep-audit-2026-10-10.md) before acting on these findings.
+
 Research snapshot: 2026-08-27. Each of the four risk critiques was investigated
 against the actual code and CI, with file:line evidence. Verdicts: **confirmed**,
 **sharpened** (worse than stated), **softened** (engineering moved past the

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+rpc = ["dep:tonic", "dep:tokio", "dep:tower", "dep:hyper-util"]
+
 [dependencies]
 rauha-enforcer-api = { path = "../rauha-enforcer-api" }
 serde = { workspace = true }
@@ -14,6 +17,13 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 postcard = { workspace = true }
 tracing = { workspace = true }
+tonic = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"

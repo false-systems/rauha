@@ -15,6 +15,10 @@ const CONTAINERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("con
 /// redb is pure Rust, zero C deps — aligns with Rauha's dependency philosophy.
 pub struct MetadataStore {
     pub(super) db: Arc<Database>,
+    #[cfg(test)]
+    pub(crate) fail_next_zone_write: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_next_container_write: std::sync::atomic::AtomicBool,
 }
 
 impl MetadataStore {
@@ -55,12 +59,27 @@ impl MetadataStore {
             .commit()
             .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            #[cfg(test)]
+            fail_next_zone_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_container_write: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     // --- Zone operations ---
 
     pub fn put_zone(&self, zone: &Zone) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_zone_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RauhaError::MetadataError(
+                "injected zone write failure".into(),
+            ));
+        }
         let data =
             postcard::to_allocvec(zone).map_err(|e| RauhaError::MetadataError(e.to_string()))?;
         let write_txn = self
@@ -159,6 +178,15 @@ impl MetadataStore {
     // --- Container operations ---
 
     pub fn put_container(&self, container: &Container) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_container_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RauhaError::MetadataError(
+                "injected container write failure".into(),
+            ));
+        }
         let data = postcard::to_allocvec(container)
             .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
         let key = container.id.to_string();

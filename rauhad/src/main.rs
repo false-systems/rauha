@@ -1,6 +1,7 @@
 mod backend;
 mod broker_events;
 mod config;
+mod listener;
 mod logging;
 mod logs;
 mod metadata;
@@ -11,7 +12,6 @@ mod server;
 mod testutil;
 mod zone;
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -44,6 +44,9 @@ async fn main() -> anyhow::Result<()> {
     let root = std::env::var("RAUHA_ROOT").unwrap_or_else(|_| DEFAULT_ROOT.into());
     let root_path = PathBuf::from(&root);
     let daemon_config = Arc::new(config::DaemonConfig::load(&root)?);
+    // Acquire exclusive control before touching metadata or live enforcement.
+    let addr = &daemon_config.server.addr;
+    let (listener, _socket_guard) = listener::bind(std::path::Path::new(addr))?;
     let platform = if cfg!(target_os = "linux") {
         "linux"
     } else {
@@ -149,7 +152,6 @@ async fn main() -> anyhow::Result<()> {
     let sandbox_svc =
         server::SandboxServiceImpl::new(registry.clone(), None, receipt_signer.clone());
 
-    let addr: SocketAddr = daemon_config.server.addr.parse()?;
     sandbox_svc.recover_tasks().await?;
     tracing::info!(%addr, "listening on gRPC");
     RuntimeEventBuilder::new(
@@ -189,7 +191,10 @@ async fn main() -> anyhow::Result<()> {
         .add_service(ContainerServiceServer::new(container_svc))
         .add_service(ImageServiceServer::new(image_svc))
         .add_service(SandboxServiceServer::new(sandbox_svc.clone()))
-        .serve_with_shutdown(addr, shutdown)
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::UnixListenerStream::new(listener),
+            shutdown,
+        )
         .await;
 
     sandbox_svc.drain_tasks().await;

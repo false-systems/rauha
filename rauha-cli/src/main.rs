@@ -47,10 +47,6 @@ enum Commands {
         #[command(subcommand)]
         action: commands::policy::PolicyAction,
     },
-    /// Trace syscalls in a zone
-    Trace(commands::trace::TraceArgs),
-    /// Show per-zone resource usage
-    Top(commands::trace::TopArgs),
     /// Stream zone events
     Events(commands::trace::EventsArgs),
     /// Stream container logs
@@ -65,7 +61,7 @@ enum Commands {
 fn is_streaming_command(cmd: &Commands) -> bool {
     matches!(
         cmd,
-        Commands::Top(_) | Commands::Logs(_) | Commands::Exec(_) | Commands::Attach(_)
+        Commands::Logs(_) | Commands::Exec(_) | Commands::Attach(_)
     )
 }
 
@@ -89,7 +85,7 @@ async fn main() {
     // line-delimited machine output contract.
     if out == OutputMode::Json && is_streaming_command(&cli.command) {
         commands::output::print_error(
-            "--json is not supported for streaming/interactive commands (top, logs, exec, attach)",
+            "--json is not supported for streaming/interactive commands (logs, exec, attach)",
         );
         std::process::exit(1);
     }
@@ -105,8 +101,6 @@ async fn main() {
         Commands::Delete(args) => commands::run::handle_delete(args, out).await,
         Commands::Image(action) => commands::image::handle(action, out).await,
         Commands::Policy { action } => commands::policy::handle(action, out).await,
-        Commands::Trace(args) => commands::trace::handle_trace(args).await,
-        Commands::Top(args) => commands::trace::handle_top(args).await,
         Commands::Events(args) => commands::trace::handle_events(args, out).await,
         Commands::Logs(args) => commands::logs::handle_logs(args).await,
         Commands::Exec(args) => commands::exec::handle_exec(args).await,
@@ -120,5 +114,17 @@ async fn main() {
             eprintln!("Error: {e}");
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_event_surface_excludes_placeholders() {
+        assert!(Cli::try_parse_from(["rauha", "events", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["rauha", "trace", "--zone", "test"]).is_err());
+        assert!(Cli::try_parse_from(["rauha", "top"]).is_err());
     }
 }

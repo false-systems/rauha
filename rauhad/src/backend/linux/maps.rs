@@ -22,6 +22,15 @@ fn map_key_missing(error: &MapError) -> bool {
 
 pub struct MapManager;
 
+fn ensure_inode_owner(inode: InodeKey, owner: Option<u32>, zone_id: u32) -> Result<()> {
+    if let Some(owner) = owner.filter(|owner| *owner != zone_id) {
+        return Err(RauhaError::BackendError(format!(
+            "inode {inode:?} belongs to zone {owner}, not {zone_id}"
+        )));
+    }
+    Ok(())
+}
+
 impl MapManager {
     /// Read a cgroup's kernel membership entry.
     pub fn zone_member(bpf: &Ebpf, cgroup_id: u64) -> Result<Option<ZoneInfoKernel>> {
@@ -188,8 +197,12 @@ impl MapManager {
     }
 
     /// Track an inode as belonging to a zone.
-    pub fn set_inode_zone(bpf: &mut Ebpf, inode: u64, zone_id: u32) -> Result<()> {
-        let mut map: AyaHashMap<_, u64, u32> =
+    pub fn set_inode_zone(bpf: &mut Ebpf, inode: InodeKey, zone_id: u32) -> Result<()> {
+        if let Some(owner) = Self::inode_zone(bpf, inode)? {
+            ensure_inode_owner(inode, Some(owner), zone_id)?;
+            return Ok(());
+        }
+        let mut map: AyaHashMap<_, InodeKey, u32> =
             AyaHashMap::try_from(bpf.map_mut("INODE_ZONE_MAP").ok_or_else(|| {
                 RauhaError::EbpfError {
                     message: "INODE_ZONE_MAP map not found".into(),
@@ -210,8 +223,8 @@ impl MapManager {
         Ok(())
     }
 
-    pub fn inode_zone(bpf: &Ebpf, inode: u64) -> Result<Option<u32>> {
-        let map: AyaHashMap<_, u64, u32> =
+    pub fn inode_zone(bpf: &Ebpf, inode: InodeKey) -> Result<Option<u32>> {
+        let map: AyaHashMap<_, InodeKey, u32> =
             AyaHashMap::try_from(bpf.map("INODE_ZONE_MAP").ok_or_else(|| {
                 RauhaError::EbpfError {
                     message: "INODE_ZONE_MAP map not found".into(),
@@ -234,8 +247,8 @@ impl MapManager {
     }
 
     /// Remove an inode from zone tracking.
-    pub fn remove_inode_zone(bpf: &mut Ebpf, inode: u64) -> Result<()> {
-        let mut map: AyaHashMap<_, u64, u32> =
+    pub fn remove_inode_zone(bpf: &mut Ebpf, inode: InodeKey) -> Result<()> {
+        let mut map: AyaHashMap<_, InodeKey, u32> =
             AyaHashMap::try_from(bpf.map_mut("INODE_ZONE_MAP").ok_or_else(|| {
                 RauhaError::EbpfError {
                     message: "INODE_ZONE_MAP map not found".into(),
@@ -250,7 +263,7 @@ impl MapManager {
         match map.remove(&inode) {
             Ok(()) => Ok(()),
             Err(e) if map_key_missing(&e) => {
-                tracing::debug!(inode, "inode ownership entry already removed");
+                tracing::debug!(?inode, "inode ownership entry already removed");
                 Ok(())
             }
             Err(e) => Err(RauhaError::EbpfError {
@@ -268,11 +281,20 @@ impl MapManager {
     /// Returns the list of successfully inserted inodes (not the full input).
     /// Callers should store only this list for cleanup — not the original
     /// input — to avoid removing entries that were never inserted.
-    pub fn insert_inodes(bpf: &mut Ebpf, inodes: &[u64], zone_id: u32) -> Result<Vec<u64>> {
+    pub fn insert_inodes(
+        bpf: &mut Ebpf,
+        inodes: &[InodeKey],
+        zone_id: u32,
+    ) -> Result<Vec<InodeKey>> {
+        // Preflight under the enforcer lock: audit admission must not reassign
+        // an object already owned by a different zone.
+        for &inode in inodes {
+            ensure_inode_owner(inode, Self::inode_zone(bpf, inode)?, zone_id)?;
+        }
         let mut inserted = Vec::with_capacity(inodes.len());
         for &ino in inodes {
             if let Err(e) = Self::set_inode_zone(bpf, ino, zone_id) {
-                tracing::debug!(ino, zone_id, %e, "failed to register inode");
+                tracing::debug!(?ino, zone_id, %e, "failed to register inode");
                 continue;
             }
             inserted.push(ino);
@@ -287,7 +309,7 @@ impl MapManager {
     }
 
     /// Remove a batch of inodes from the INODE_ZONE_MAP.
-    pub fn remove_inodes(bpf: &mut Ebpf, inodes: &[u64]) -> Result<u32> {
+    pub fn remove_inodes(bpf: &mut Ebpf, inodes: &[InodeKey]) -> Result<u32> {
         let mut count = 0u32;
         for &ino in inodes {
             Self::remove_inode_zone(bpf, ino)?;
@@ -352,14 +374,6 @@ impl MapManager {
             }),
         }
     }
-
-    /// Atomically update a zone's policy (hot reload).
-    /// BPF HashMap::insert is atomic — the kernel sees either the old or new value, never partial.
-    pub fn hot_reload_policy(bpf: &mut Ebpf, zone_id: u32, policy: &ZonePolicy) -> Result<()> {
-        Self::set_zone_policy(bpf, zone_id, policy)?;
-        tracing::info!(zone_id, "hot-reloaded zone policy in BPF map");
-        Ok(())
-    }
 }
 
 /// Collect all inode numbers from a directory tree.
@@ -385,7 +399,10 @@ impl MapManager {
 /// eBPF is defense-in-depth.
 ///
 /// Returns the collected inodes (capped at `max_inodes`).
-pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> Result<Vec<u64>> {
+pub fn collect_rootfs_inodes(
+    rootfs_path: &std::path::Path,
+    max_inodes: u32,
+) -> Result<Vec<InodeKey>> {
     use std::collections::HashSet;
     use std::os::unix::fs::MetadataExt;
 
@@ -419,9 +436,13 @@ pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> 
                     ),
                 })?;
 
-            inodes.push(meta.ino());
+            let key = InodeKey {
+                device: ((libc::major(meta.dev()) as u64) << 20) | libc::minor(meta.dev()) as u64,
+                inode: meta.ino(),
+            };
+            inodes.push(key);
 
-            if meta.is_dir() && visited_dirs.insert(meta.ino()) {
+            if meta.is_dir() && visited_dirs.insert(key) {
                 stack.push(entry.path());
             }
         }
@@ -467,6 +488,35 @@ fn policy_to_kernel(policy: &ZonePolicy) -> Result<ZonePolicyKernel> {
 mod tests {
     use super::*;
     use rauha_common::zone::{NetworkMode, ZonePolicy};
+
+    #[test]
+    fn inode_registration_cannot_replace_another_zone_owner() {
+        let inode = InodeKey {
+            device: 3,
+            inode: 7,
+        };
+        assert!(ensure_inode_owner(inode, None, 1).is_ok());
+        assert!(ensure_inode_owner(inode, Some(1), 1).is_ok());
+        assert!(ensure_inode_owner(inode, Some(2), 1).is_err());
+    }
+
+    #[test]
+    fn collected_inode_device_matches_kernel_dev_t_layout() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"data").unwrap();
+        let metadata = file.metadata().unwrap();
+        let inodes = collect_rootfs_inodes(root.path(), 1).unwrap();
+        assert_eq!(
+            inodes,
+            vec![InodeKey {
+                device: ((libc::major(metadata.dev()) as u64) << 20)
+                    | libc::minor(metadata.dev()) as u64,
+                inode: metadata.ino(),
+            }]
+        );
+    }
 
     fn default_policy_with_caps(caps: Vec<&str>) -> ZonePolicy {
         let mut p = ZonePolicy::default();

@@ -208,6 +208,7 @@ mod tests {
             working_dir: working_dir.map(String::from),
             rootfs_path: None,
             overlay_layers: None,
+            oci_spec_json: None,
         }
     }
 

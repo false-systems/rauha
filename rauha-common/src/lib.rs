@@ -2,6 +2,8 @@ pub mod backend;
 pub mod container;
 pub mod error;
 pub mod observability;
+#[cfg(feature = "rpc")]
+pub mod rpc;
 pub mod run;
 pub mod sandbox;
 pub mod shim;

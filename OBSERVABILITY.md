@@ -1,14 +1,14 @@
 # Rauha Evidence Surface
 
-Ownership reading for this PR: Syva is the eBPF LSM enforcer. `rauha-evidence`
-is Rauha's evidence/observability surface. It consumes raw Syva/backend records
+The in-repo Linux backend currently provides eBPF LSM enforcement. `rauha-evidence`
+is Rauha's evidence/observability surface. It consumes raw backend records
 plus Rauha lifecycle events and owns schema, projections, and sinks. It does not
 enforce policy.
 
 For the current structured runtime event contract and audit inventory, see:
 
 - [`docs/observability-contract.md`](docs/observability-contract.md)
-- [`docs/observability-audit.md`](docs/observability-audit.md)
+- [Historical observability audit](docs/archive/observability-audit.md)
 
 ## Data Path
 

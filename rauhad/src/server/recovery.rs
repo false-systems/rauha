@@ -84,12 +84,16 @@ impl SandboxServiceImpl {
                         .capture_issues
                         .push("output.unavailable_after_interruption".into());
                 }
-                let mut payload = record.receipt.clone();
+                let payload = record.receipt.clone();
                 #[cfg(target_os = "linux")]
-                if let Some(run) = &mut run {
-                    run.finish(Some("daemon_interrupted"))?;
-                    payload.journal = Some(run.commitment()?);
-                }
+                let payload = {
+                    let mut payload = payload;
+                    if let Some(run) = &mut run {
+                        run.finish(Some("daemon_interrupted"))?;
+                        payload.journal = Some(run.commitment()?);
+                    }
+                    payload
+                };
                 let result = seal_bounded_result(result, payload, &self.receipt_signer)
                     .map_err(anyhow::Error::msg)?;
                 self.registry
@@ -104,6 +108,8 @@ impl SandboxServiceImpl {
             if let Some(run) = &mut run {
                 run.seal_result(&result)?;
             }
+            #[cfg(not(target_os = "linux"))]
+            let _ = result;
             // A committed result is immutable, even if recovery crashes again
             // during cleanup. The record remains until cleanup succeeds.
             self.cleanup_recovered_task(&record).await?;

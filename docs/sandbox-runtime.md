@@ -2,15 +2,17 @@
 
 Rauha's primary product shape is an agent sandbox runtime.
 
-The target command is:
+Run a command provided by an image:
 
 ```bash
-rauha sandbox --image python:3.12 --repo-path . --env RUST_LOG=debug -- pytest tests/
+rauha sandbox --image alpine:latest -- /bin/echo hello
 ```
 
 ## Current State
 
 API/CLI contract and runtime execution are implemented.
+Workspace provisioning is not: nonempty `repo_path` / `--repo-path` is rejected,
+not mounted. Bake the required inputs into the image for now.
 
 What exists today:
 
@@ -33,8 +35,7 @@ use task timeouts to bound execution. Forced daemon termination uses recovery.
 
 ## Result Contract
 
-`rauha-common/src/sandbox.rs` defines the portable result shape for future
-sandbox execution:
+`rauha-common/src/sandbox.rs` defines the result shape for sandbox execution:
 
 ```json
 {

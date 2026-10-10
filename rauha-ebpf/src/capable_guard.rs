@@ -9,8 +9,8 @@
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, count_decision, emit_deny_event, ZONE_POLICY};
-use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_CAPABLE, HOOK_CAPABLE};
+use crate::{count_decision, emit_deny_event, lookup_caller_zone, ZONE_POLICY};
+use rauha_ebpf_common::{HOOK_CAPABLE, PROG_CAPABLE, ZONE_FLAG_GLOBAL};
 
 /// Called from the capable LSM hook.
 ///
@@ -46,6 +46,10 @@ fn try_capable(ctx: &LsmContext) -> Result<i32, i64> {
     if cap < 0 || cap > 63 {
         emit_deny_event(HOOK_CAPABLE, caller.zone_id, 0, cap as u64);
         return Ok(-1);
+    }
+
+    if rauha_ebpf_common::runtime_setup_allows_cap(caller.flags, cap) {
+        return Ok(0);
     }
 
     // Check if this capability is permitted by the zone's policy.

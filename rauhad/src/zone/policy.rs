@@ -29,10 +29,17 @@ pub fn policy_to_toml(name: &str, zone_type: ZoneType, policy: &ZonePolicy) -> S
         ZoneType::Privileged => "privileged",
     };
 
-    let net_mode = match policy.network.mode {
+    let net_mode = match &policy.network.mode {
         rauha_common::zone::NetworkMode::Isolated => "isolated",
         rauha_common::zone::NetworkMode::Bridged => "bridged",
         rauha_common::zone::NetworkMode::Host => "host",
+        rauha_common::zone::NetworkMode::External { .. } => "external",
+    };
+    let namespace = match &policy.network.mode {
+        rauha_common::zone::NetworkMode::External { namespace } => {
+            format!("namespace = {}\n", toml::Value::String(namespace.clone()))
+        }
+        _ => String::new(),
     };
 
     let admission_mode = match policy.admission {
@@ -93,7 +100,7 @@ pids_max = {pids}
 
 [network]
 mode = "{net_mode}"
-allowed_zones = [{allowed_zones}]
+{namespace}allowed_zones = [{allowed_zones}]
 allowed_egress = [{allowed_egress}]
 allowed_ingress = [{allowed_ingress}]
 

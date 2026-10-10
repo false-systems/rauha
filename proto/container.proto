@@ -4,8 +4,20 @@ package rauha.container.v1;
 
 service ContainerService {
     rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse);
+    rpc ImportContainer(ImportContainerRequest) returns (CreateContainerResponse);
     rpc StartContainer(StartContainerRequest) returns (StartContainerResponse);
     rpc StopContainer(StopContainerRequest) returns (StopContainerResponse);
+    rpc SignalContainer(SignalContainerRequest) returns (SignalContainerResponse);
+    rpc CreateExec(CreateExecRequest) returns (ProcessInfo);
+    rpc StartExec(ProcessRequest) returns (ProcessInfo);
+    rpc GetExec(ProcessRequest) returns (ProcessInfo);
+    rpc DeleteExec(ProcessRequest) returns (ProcessInfo);
+    rpc SignalProcess(SignalProcessRequest) returns (ProcessInfo);
+    rpc ResizeProcess(ResizeProcessRequest) returns (ProcessInfo);
+    rpc CloseProcessIo(ProcessRequest) returns (ProcessInfo);
+    rpc ContainerStats(GetContainerRequest) returns (ContainerStatsResponse);
+    rpc UpdateContainerResources(UpdateContainerResourcesRequest) returns (UpdateContainerResourcesResponse);
+    rpc SetContainerPaused(SetContainerPausedRequest) returns (SetContainerPausedResponse);
     rpc DeleteContainer(DeleteContainerRequest) returns (DeleteContainerResponse);
     rpc GetContainer(GetContainerRequest) returns (GetContainerResponse);
     rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
@@ -28,13 +40,56 @@ message CreateContainerResponse {
     string container_id = 1;
     string name = 2;
     string state = 3;
+    uint32 pid = 4;
+}
+
+// Local privileged callers only; the rootfs is already mounted by containerd.
+message ImportContainerRequest {
+    string zone_name = 1;
+    string name = 2;
+    string rootfs = 3;
+    string spec_json = 4;
 }
 
 message StartContainerRequest {
     string container_id = 1;
 }
 
-message StartContainerResponse {}
+message StartContainerResponse { uint32 pid = 1; }
+
+message SignalContainerRequest {
+    string container_id = 1;
+    uint32 signal = 2;
+}
+message SignalContainerResponse {}
+
+message ProcessRequest { string container_id = 1; string exec_id = 2; }
+message ProcessInfo { uint32 pid = 1; string state = 2; optional int32 exit_code = 3; string finished_at = 4; }
+message CreateExecRequest {
+    string container_id = 1;
+    string exec_id = 2;
+    string process_json = 3;
+    string stdin = 4;
+    string stdout = 5;
+    string stderr = 6;
+    bool terminal = 7;
+}
+message SignalProcessRequest { string container_id = 1; string exec_id = 2; uint32 signal = 3; bool all = 4; }
+message ResizeProcessRequest { string container_id = 1; string exec_id = 2; uint32 rows = 3; uint32 cols = 4; }
+message ContainerStatsResponse {
+    uint64 cpu_usage_usec = 1;
+    uint64 cpu_user_usec = 2;
+    uint64 cpu_system_usec = 3;
+    uint64 memory_usage_bytes = 4;
+    uint64 memory_limit_bytes = 5;
+    uint64 pids_current = 6;
+    uint64 pids_limit = 7;
+    repeated uint32 process_ids = 8;
+}
+message UpdateContainerResourcesRequest { string container_id = 1; string resources_json = 2; }
+message UpdateContainerResourcesResponse {}
+message SetContainerPausedRequest { string container_id = 1; bool paused = 2; }
+message SetContainerPausedResponse {}
 
 message StopContainerRequest {
     string container_id = 1;
@@ -76,6 +131,8 @@ message ContainerInfo {
     uint32 pid = 7;
     string created_at = 8;
     string started_at = 9;
+    optional int32 exit_code = 10;
+    string finished_at = 11;
 }
 
 message ExecInContainerRequest {

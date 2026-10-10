@@ -78,22 +78,6 @@ impl EbpfManager {
 
         let pin_path = PathBuf::from(bpf_pin_dir);
 
-        // Remove any stale pinned maps from a previous run (crash recovery).
-        // EbpfLoader::map_pin_path() reuses existing pins, which would leave
-        // stale zone_id entries from the old run. Since recover_zone()
-        // repopulates all maps from redb, starting fresh is correct.
-        if pin_path.exists() {
-            for entry in fs::read_dir(&pin_path).into_iter().flatten().flatten() {
-                let _ = fs::remove_file(entry.path());
-            }
-            tracing::debug!("cleared stale BPF pin files from previous run");
-        }
-
-        fs::create_dir_all(&pin_path).map_err(|e| RauhaError::EbpfError {
-            message: format!("failed to create BPF pin directory: {e}"),
-            hint: "run rauhad as root with BPF filesystem mounted".into(),
-        })?;
-
         let btf = Btf::from_sys_fs().map_err(|e| RauhaError::EbpfError {
             message: format!("failed to load BTF from sysfs: {e}"),
             hint: "kernel must have CONFIG_DEBUG_INFO_BTF=y".into(),
@@ -142,6 +126,10 @@ impl EbpfManager {
             message: format!("failed to read eBPF object: {e}"),
             hint: format!("check permissions on {}", ebpf_obj_path.display()),
         })?;
+
+        // Startup freezes live zones before this point. Never reuse old map
+        // layouts or zone IDs; recovery rebuilds them before thawing workloads.
+        reset_map_pins(&pin_path)?;
 
         let mut loader = EbpfLoader::new();
         loader.btf(Some(&btf)).map_pin_path(&pin_path);
@@ -509,6 +497,26 @@ impl EbpfManager {
     }
 }
 
+fn reset_map_pins(pin_path: &Path) -> Result<()> {
+    fs::create_dir_all(pin_path).map_err(|e| RauhaError::EbpfError {
+        message: format!("failed to create BPF pin directory: {e}"),
+        hint: "run rauhad as root with BPF filesystem mounted".into(),
+    })?;
+    for name in MAP_NAMES {
+        match fs::remove_file(pin_path.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(RauhaError::EbpfError {
+                    message: format!("failed to remove stale BPF map {name}: {error}"),
+                    hint: "keep workloads frozen; repair pin permissions before restarting".into(),
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct ProgramStatus {
     pub name: String,
@@ -615,6 +623,21 @@ fn read_proc_self_cgroup_id() -> std::result::Result<u64, String> {
 mod tests {
     use super::read_compiled_offsets;
     use rauha_ebpf_common::offsets::{object_sha256, offsets_sidecar_path};
+
+    #[test]
+    fn stale_map_reset_preserves_unrelated_entries_and_propagates_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("INODE_ZONE_MAP"), b"old 8-byte ABI").unwrap();
+        std::fs::write(dir.path().join("unrelated"), b"keep").unwrap();
+        super::reset_map_pins(dir.path()).unwrap();
+        assert!(!dir.path().join("INODE_ZONE_MAP").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("unrelated")).unwrap(),
+            b"keep"
+        );
+        std::fs::create_dir(dir.path().join("INODE_ZONE_MAP")).unwrap();
+        assert!(super::reset_map_pins(dir.path()).is_err());
+    }
 
     #[test]
     fn offsets_sidecar_uses_object_file_name() {

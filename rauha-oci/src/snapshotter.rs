@@ -6,7 +6,7 @@
 //!
 //! Directory layout:
 //! ```text
-//! images/{safe_name}/layers/{0,1,...}/   — shared read-only, extracted once
+//! snapshots-v2/{layer-chain-digest}/    — shared flattened tree, extracted once
 //! containers/{id}/upper/                 — per-container writable layer
 //! containers/{id}/work/                  — overlayfs work directory
 //! containers/{id}/merged/                — union mount point (the rootfs)
@@ -30,82 +30,48 @@ impl OverlayfsSnapshotter {
         }
     }
 
-    /// Prepare per-layer directories for an image.
+    /// Prepare one immutable snapshot for an ordered image layer chain.
     ///
-    /// Each OCI layer is extracted into its own numbered directory under
-    /// `images/{safe_name}/layers/`. Returns the list of layer paths in order
-    /// (bottom to top). Idempotent: skips layers that already have a
-    /// `.complete` marker.
+    /// Flatten the ordered layers once, then use the immutable tree as one
+    /// overlay lowerdir. Whiteouts operate on the preceding layers, not on
+    /// empty independent directories. Publication is serialized across processes.
     pub fn prepare_layers(
         &self,
-        image_safe_name: &str,
+        _image_safe_name: &str,
         layer_digests: &[String],
         content_root: &Path,
     ) -> Result<Vec<PathBuf>> {
-        let layers_dir = self
-            .root
-            .join("images")
-            .join(image_safe_name)
-            .join("layers");
-        std::fs::create_dir_all(&layers_dir).map_err(|e| RauhaError::RootfsError {
-            message: format!("failed to create layers dir: {e}"),
-        })?;
-
-        let mut layer_paths = Vec::with_capacity(layer_digests.len());
-
-        for (i, digest_str) in layer_digests.iter().enumerate() {
-            // Key by digest (truncated to 12 chars for readability) instead of
-            // index, so reordering layers in a manifest doesn't re-extract.
-            let digest_key = if let Some(hex) = digest_str.strip_prefix("sha256:") {
-                &hex[..hex.len().min(12)]
-            } else {
-                &digest_str[..digest_str.len().min(12)]
-            };
-            let layer_dir = layers_dir.join(digest_key);
-            let marker = layers_dir.join(format!("{digest_key}.complete"));
-
-            if marker.exists() {
-                tracing::debug!(layer = i, digest = %digest_key, "layer already extracted");
-                layer_paths.push(layer_dir);
-                continue;
-            }
-
-            // Extract layer from content store blob.
-            let digest = crate::content::Digest::parse(digest_str).ok_or_else(|| {
-                RauhaError::RootfsError {
-                    message: format!("invalid layer digest: {digest_str}"),
-                }
-            })?;
-
-            let blob_path = content_root.join("blobs").join("sha256").join(digest.hex());
-
-            // Clean up partial extraction.
-            if layer_dir.exists() {
-                let _ = std::fs::remove_dir_all(&layer_dir);
-            }
-            std::fs::create_dir_all(&layer_dir).map_err(|e| RauhaError::RootfsError {
-                message: format!("failed to create layer dir {digest_key}: {e}"),
-            })?;
-
-            tracing::info!(layer = i, digest = %digest, "extracting layer");
-
-            let file = std::fs::File::open(&blob_path).map_err(|e| RauhaError::RootfsError {
-                message: format!("failed to open layer blob {digest}: {e}"),
-            })?;
-
-            let decoder = flate2::read::GzDecoder::new(file);
-            let mut archive = tar::Archive::new(decoder);
-            crate::image::unpack_layer(&mut archive, &layer_dir)?;
-
-            // Write completion marker.
-            std::fs::write(&marker, b"").map_err(|e| RauhaError::RootfsError {
-                message: format!("failed to write layer marker: {e}"),
-            })?;
-
-            layer_paths.push(layer_dir);
+        let digests = layer_digests
+            .iter()
+            .map(|value| {
+                crate::content::Digest::parse(value).ok_or_else(|| RauhaError::RootfsError {
+                    message: format!("invalid layer digest: {value}"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let key = crate::content::Digest::from_data(layer_digests.join("\n").as_bytes());
+        let directory = self.root.join("snapshots-v2");
+        std::fs::create_dir_all(&directory)?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join(format!("{}.lock", key.hex())))?;
+        lock.lock()?;
+        let published = directory.join(key.hex());
+        if published.is_dir() {
+            return Ok(vec![published]);
         }
-
-        Ok(layer_paths)
+        let staging = tempfile::tempdir_in(&directory)?;
+        for digest in digests {
+            let blob = content_root.join("blobs/sha256").join(digest.hex());
+            crate::image::unpack_layer_file(&blob, staging.path())?;
+        }
+        sync_tree(staging.path())?;
+        std::fs::rename(staging.path(), &published)?;
+        std::fs::File::open(&directory)?.sync_all()?;
+        Ok(vec![published])
     }
 
     /// Mount an overlayfs for a container, returning the merged rootfs path.
@@ -158,9 +124,14 @@ impl OverlayfsSnapshotter {
         {
             use nix::mount::{umount2, MntFlags};
             if merged.exists() {
-                umount2(&merged, MntFlags::MNT_DETACH).map_err(|e| RauhaError::RootfsError {
-                    message: format!("failed to unmount overlay: {e}"),
-                })?;
+                match umount2(&merged, MntFlags::MNT_DETACH) {
+                    Ok(()) | Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT) => {}
+                    Err(e) => {
+                        return Err(RauhaError::RootfsError {
+                            message: format!("failed to unmount overlay: {e}"),
+                        })
+                    }
+                }
             }
         }
 
@@ -171,6 +142,41 @@ impl OverlayfsSnapshotter {
         }
 
         Ok(())
+    }
+
+    /// Only called after the executor is stopped; failures retain metadata for retry.
+    pub fn remove_container(&self, container_root: &Path) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        match std::fs::read_dir(container_root.join("namespaces")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if !matches!(entry.file_name().to_str(), Some("ipc" | "uts" | "pid"))
+                        || entry.file_type()?.is_symlink()
+                    {
+                        return Err(RauhaError::RootfsError {
+                            message: "unexpected namespace mount entry".into(),
+                        });
+                    }
+                    match nix::mount::umount2(&entry.path(), nix::mount::MntFlags::empty()) {
+                        Ok(()) | Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT) => {}
+                        Err(error) => {
+                            return Err(RauhaError::RootfsError {
+                                message: format!("cannot unmount namespace pin: {error}"),
+                            })
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.unmount_overlay(container_root)?;
+        match std::fs::remove_dir_all(container_root) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Perform the actual overlayfs mount on Linux.
@@ -252,10 +258,40 @@ impl OverlayfsSnapshotter {
     }
 }
 
+/// Persist file contents before publishing the directory that marks completion.
+fn sync_tree(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            sync_tree(&entry.path())?;
+        } else if kind.is_file() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(entry.path())?
+                .sync_all()?;
+        }
+    }
+    std::fs::File::open(path)?.sync_all()
+}
+
 /// Recursively copy a directory tree, merging into the destination.
 /// Cross-platform: used by the snapshotter on non-Linux and by the
 /// daemon's writable-path copy-up on Linux.
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    if !std::fs::symlink_metadata(src)?.is_dir() {
+        return Err(RauhaError::RootfsError {
+            message: format!("copy source is not a real directory: {}", src.display()),
+        });
+    }
+    match std::fs::symlink_metadata(dst) {
+        Ok(metadata) if !metadata.is_dir() => std::fs::remove_file(dst)?,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     std::fs::create_dir_all(dst).map_err(|e| RauhaError::RootfsError {
         message: format!("failed to create dir {}: {e}", dst.display()),
     })?;
@@ -279,7 +315,7 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                     message: format!("failed to read symlink {}: {e}", src_path.display()),
                 })?;
             // Remove existing target if it exists (we're merging layers).
-            let _ = std::fs::remove_file(&dst_path);
+            remove_destination(&dst_path)?;
             std::os::unix::fs::symlink(&link_target, &dst_path).map_err(|e| {
                 RauhaError::RootfsError {
                     message: format!(
@@ -291,24 +327,107 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             })?;
         } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
+        } else if meta.is_file() {
+            let mut source = std::fs::File::open(&src_path)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(dst)?;
+            std::io::copy(&mut source, &mut temporary)?;
+            temporary.as_file().set_permissions(meta.permissions())?;
+            remove_destination(&dst_path)?;
+            temporary.persist(&dst_path).map_err(|error| error.error)?;
         } else {
-            std::fs::copy(&src_path, &dst_path).map_err(|e| RauhaError::RootfsError {
-                message: format!(
-                    "failed to copy {} -> {}: {e}",
-                    src_path.display(),
-                    dst_path.display()
-                ),
-            })?;
+            return Err(RauhaError::RootfsError {
+                message: format!("refusing to copy special file {}", src_path.display()),
+            });
         }
     }
 
     Ok(())
 }
 
+fn remove_destination(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rauha_common::error::RauhaError;
+
+    #[test]
+    fn copy_replaces_destination_links_without_modifying_their_targets() {
+        use std::{fs, os::unix::fs::symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"unchanged").unwrap();
+        fs::write(src.join("nested/sentinel"), b"new").unwrap();
+        fs::write(src.join("leaf"), b"new").unwrap();
+        fs::write(src.join("hardlink"), b"new").unwrap();
+        symlink(&outside, dst.join("nested")).unwrap();
+        symlink(outside.join("sentinel"), dst.join("leaf")).unwrap();
+        fs::hard_link(outside.join("sentinel"), dst.join("hardlink")).unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
+        assert_eq!(fs::read(dst.join("nested/sentinel")).unwrap(), b"new");
+        assert_eq!(fs::read(dst.join("leaf")).unwrap(), b"new");
+        assert_eq!(fs::read(dst.join("hardlink")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn whiteouts_and_concurrent_publication_preserve_the_final_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = dir.path().join("content");
+        let store = crate::content::ContentStore::new(&content).unwrap();
+        let lower = store
+            .put_blob(&crate::image::tests::make_tar_gz(&[
+                ("removed", b"old"),
+                ("opaque/old", b"old"),
+                ("replaced", b"old"),
+            ]))
+            .unwrap();
+        let upper = store
+            .put_blob(&crate::image::tests::make_tar_gz(&[
+                ("replaced", b"new"),
+                ("opaque/new", b"new"),
+                (".wh.removed", b""),
+                ("opaque/.wh..wh..opq", b""),
+                (".wh.replaced", b""),
+            ]))
+            .unwrap();
+        let digests = vec![lower.to_string(), upper.to_string()];
+        std::thread::scope(|scope| {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let barrier = barrier.clone();
+                let content = &content;
+                let digests = &digests;
+                let root = dir.path();
+                workers.push(scope.spawn(move || {
+                    barrier.wait();
+                    OverlayfsSnapshotter::new(root)
+                        .prepare_layers("test", digests, content)
+                        .unwrap()
+                }));
+            }
+            let paths: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+            assert!(paths.windows(2).all(|pair| pair[0] == pair[1]));
+            let root = &paths[0][0];
+            assert!(!root.join("removed").exists());
+            assert!(!root.join("opaque/old").exists());
+            assert_eq!(std::fs::read(root.join("opaque/new")).unwrap(), b"new");
+            assert_eq!(std::fs::read(root.join("replaced")).unwrap(), b"new");
+        });
+    }
 
     fn is_unprivileged_mount_error(err: &RauhaError) -> bool {
         matches!(
@@ -368,9 +487,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.len(), 1);
         assert!(paths[0].join("a.txt").exists());
-        assert!(paths[1].join("b.txt").exists());
+        assert!(paths[0].join("b.txt").exists());
     }
 
     #[test]
@@ -403,9 +522,8 @@ mod tests {
         assert!(container_root.join("work").exists());
         assert!(merged.exists());
 
-        // On non-Linux (test environment), the fallback copy should have files.
-        #[cfg(not(target_os = "linux"))]
         assert!(merged.join("file.txt").exists());
+        snap.remove_container(&container_root).unwrap();
     }
 
     #[test]
@@ -421,5 +539,60 @@ mod tests {
             Err(err) if cfg!(target_os = "linux") && is_unprivileged_mount_error(&err) => {}
             Err(err) => panic!("unmount_overlay failed: {err}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root and overlayfs; invoked by the privileged Linux gate"]
+    fn live_overlay_preserves_whiteouts_and_container_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = dir.path().join("content");
+        let store = crate::content::ContentStore::new(&content).unwrap();
+        let lower = store
+            .put_blob(&crate::image::tests::make_tar_gz(&[
+                ("removed", b"old"),
+                ("opaque/old", b"old"),
+                ("replaced", b"old"),
+            ]))
+            .unwrap();
+        let upper = store
+            .put_blob(&crate::image::tests::make_tar_gz(&[
+                ("replaced", b"new"),
+                ("opaque/new", b"new"),
+                (".wh.removed", b""),
+                ("opaque/.wh..wh..opq", b""),
+                (".wh.replaced", b""),
+            ]))
+            .unwrap();
+        let snap = OverlayfsSnapshotter::new(dir.path());
+        let layers = snap
+            .prepare_layers("", &[lower.to_string(), upper.to_string()], &content)
+            .unwrap();
+        let container = dir.path().join("container");
+        let merged = snap.mount_overlay("probe", &layers, &container).unwrap();
+        let namespaces = container.join("namespaces");
+        std::fs::create_dir(&namespaces).unwrap();
+        let ipc = namespaces.join("ipc");
+        std::fs::File::create(&ipc).unwrap();
+        if let Err(error) = nix::mount::mount(
+            Some("/proc/self/ns/ipc"),
+            &ipc,
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            snap.remove_container(&container).unwrap();
+            panic!("could not bind namespace pin: {error}");
+        }
+        let removed = merged.join("removed").exists();
+        let opaque_old = merged.join("opaque/old").exists();
+        let opaque_new = std::fs::read(merged.join("opaque/new"));
+        let replaced = std::fs::read(merged.join("replaced"));
+        snap.remove_container(&container).unwrap();
+        assert!(!removed && !opaque_old);
+        assert_eq!(opaque_new.unwrap(), b"new");
+        assert_eq!(replaced.unwrap(), b"new");
+        assert!(!container.exists());
+        assert!(layers[0].is_dir());
     }
 }

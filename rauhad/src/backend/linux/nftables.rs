@@ -19,6 +19,118 @@ const TABLE_NAME: &str = "rauha";
 const TABLE_FAMILY: &str = "inet";
 const BRIDGE_FAMILY: &str = "bridge";
 
+fn external_chain_rules(chain: &str, policy: &NetworkPolicy) -> Result<Vec<String>> {
+    let mut rules = vec![format!(
+        "type filter hook {chain} priority filter; policy drop;"
+    )];
+    if chain == "forward" {
+        return Ok(rules);
+    }
+    rules.push(format!(
+        "{}ifname \"lo\" accept",
+        if chain == "input" { "i" } else { "o" }
+    ));
+    rules.push("ct state established,related accept".into());
+    rules.push("icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept".into());
+    rules.extend(if chain == "input" {
+        endpoint_rules("saddr", &policy.allowed_ingress)?
+    } else {
+        endpoint_rules("daddr", &policy.allowed_egress)?
+    });
+    Ok(rules)
+}
+
+fn external_nft(namespace: &std::path::Path) -> Command {
+    let mut command = Command::new("nsenter");
+    command
+        .arg(format!("--net={}", namespace.display()))
+        .arg("nft");
+    command
+}
+
+pub fn apply_external_rules(namespace: &std::path::Path, policy: &NetworkPolicy) -> Result<()> {
+    if !policy.allowed_zones.is_empty() {
+        return Err(RauhaError::InvalidPolicy(
+            "external namespaces require explicit ingress/egress CIDRs".into(),
+        ));
+    }
+    let exists = external_nft(namespace)
+        .args(["list", "table", "inet", "rauha"])
+        .output()
+        .map_err(|e| RauhaError::BackendError(format!("inspect external network filtering: {e}")))?
+        .status
+        .success();
+    let mut script = if exists {
+        "delete table inet rauha\n".into()
+    } else {
+        String::new()
+    };
+    script.push_str("add table inet rauha\n");
+    for chain in ["input", "output", "forward"] {
+        let rules = external_chain_rules(chain, policy)?;
+        script.push_str(&format!(
+            "add chain inet rauha {chain} {{ {} }}\n",
+            rules[0]
+        ));
+        for rule in &rules[1..] {
+            script.push_str(&format!("add rule inet rauha {chain} {rule}\n"));
+        }
+    }
+    let mut child = external_nft(namespace)
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            RauhaError::BackendError(format!("install external network filtering: {e}"))
+        })?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .map_err(|e| RauhaError::BackendError(format!("write external network filtering: {e}")))?;
+    let output = child.wait_with_output().map_err(|e| {
+        RauhaError::BackendError(format!("wait for external network filtering: {e}"))
+    })?;
+    if !output.status.success() {
+        return Err(RauhaError::BackendError(format!(
+            "external network filtering: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+pub fn external_rules_exist(namespace: &std::path::Path, policy: &NetworkPolicy) -> bool {
+    ["input", "output", "forward"].iter().all(|chain| {
+        external_nft(namespace)
+            .args(["list", "chain", "inet", "rauha", chain])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && external_chain_rules(chain, policy).is_ok_and(|rules| {
+                        nft_chain_rules(&output.stdout, chain) == canonical_rules(rules)
+                    })
+            })
+    })
+}
+
+fn canonical_rules(rules: Vec<String>) -> Vec<String> {
+    rules
+        .into_iter()
+        .map(|rule| {
+            if rule.starts_with("ip ") {
+                rule.replace("/32 ", " ")
+            } else if rule.starts_with("ip6 ") {
+                rule.replace("/128 ", " ")
+            } else {
+                rule
+            }
+        })
+        .collect()
+}
+
 /// Ensure the rauha nftables table and NAT masquerade chain exist.
 /// Called once during LinuxBackend::new(). The bridge name comes from
 /// daemon config (default `rauha0`).
@@ -223,15 +335,17 @@ pub fn zone_rules_exist(zone_name: &str, veth_name: &str, policy: &NetworkPolicy
     bridge_chain.is_ok_and(|output| {
         output.status.success()
             && nft_chain_rules(&output.stdout, &chain_name)
-                == bridge_zone_chain_rules(veth_name, policy)
+                == canonical_rules(bridge_zone_chain_rules(veth_name, policy))
     }) && bridge_input_chain.is_ok_and(|output| {
         output.status.success()
-            && bridge_input_chain_rules(policy)
-                .is_ok_and(|rules| nft_chain_rules(&output.stdout, &input_chain_name) == rules)
+            && bridge_input_chain_rules(policy).is_ok_and(|rules| {
+                nft_chain_rules(&output.stdout, &input_chain_name) == canonical_rules(rules)
+            })
     }) && bridge_output_chain.is_ok_and(|output| {
         output.status.success()
-            && bridge_output_chain_rules(policy)
-                .is_ok_and(|rules| nft_chain_rules(&output.stdout, &output_chain_name) == rules)
+            && bridge_output_chain_rules(policy).is_ok_and(|rules| {
+                nft_chain_rules(&output.stdout, &output_chain_name) == canonical_rules(rules)
+            })
     }) && bridge_forward.is_ok_and(|output| forward_has_jumps(&output, veth_name, &chain_name))
         && bridge_input
             .is_ok_and(|output| chain_has_jump(&output, "iifname", veth_name, &input_chain_name))
@@ -486,6 +600,46 @@ fn run_nft_script(script: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_network_rules_keep_deny_defaults_and_explicit_targets() {
+        let policy = NetworkPolicy {
+            allowed_egress: vec!["10.0.0.1:443".into()],
+            ..Default::default()
+        };
+        let output = external_chain_rules("output", &policy).unwrap();
+        assert!(output[0].ends_with("policy drop;"));
+        assert!(output.contains(&"ip daddr 10.0.0.1/32 tcp dport 443 accept".into()));
+        assert_eq!(external_chain_rules("forward", &policy).unwrap().len(), 1);
+        assert!(!external_chain_rules("input", &policy)
+            .unwrap()
+            .iter()
+            .any(|rule| rule.contains("10.0.0.1")));
+    }
+
+    #[test]
+    #[ignore = "run as root inside an isolated network namespace"]
+    fn live_external_network_filter_roundtrip() {
+        use std::os::unix::fs::MetadataExt;
+        let own = std::fs::metadata("/proc/self/ns/net").unwrap();
+        let host = std::fs::metadata("/proc/1/ns/net").unwrap();
+        assert_ne!(
+            (own.dev(), own.ino()),
+            (host.dev(), host.ino()),
+            "refusing to modify the host network namespace"
+        );
+        let namespace = std::path::Path::new("/proc/self/ns/net");
+        let mut policy = NetworkPolicy {
+            allowed_egress: vec!["10.0.0.1:443".into()],
+            ..Default::default()
+        };
+        apply_external_rules(namespace, &policy).unwrap();
+        assert!(external_rules_exist(namespace, &policy));
+        policy.allowed_egress.clear();
+        assert!(!external_rules_exist(namespace, &policy));
+        apply_external_rules(namespace, &policy).unwrap();
+        assert!(external_rules_exist(namespace, &policy));
+    }
 
     #[test]
     fn zone_chain_name_format() {

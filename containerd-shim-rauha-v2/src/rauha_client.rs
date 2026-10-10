@@ -27,9 +27,7 @@ pub struct RauhaClient {
 
 impl RauhaClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        let channel = Channel::from_shared(endpoint.to_string())
-            .context("invalid rauhad endpoint")?
-            .connect()
+        let channel = rauha_common::rpc::connect(endpoint)
             .await
             .context("failed to connect to rauhad")?;
 
@@ -41,6 +39,7 @@ impl RauhaClient {
 
     /// Default endpoint from env or fallback.
     pub fn endpoint() -> String {
-        std::env::var("RAUHA_ADDR").unwrap_or_else(|_| "http://[::1]:9876".to_string())
+        std::env::var("RAUHA_ADDR")
+            .unwrap_or_else(|_| rauha_common::rpc::DEFAULT_ADDRESS.to_string())
     }
 }

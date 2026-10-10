@@ -31,6 +31,18 @@ pub struct OffsetManifest {
 
 pub const OFFSET_DEFS: &[OffsetDef] = &[
     OffsetDef {
+        type_name: "inode",
+        field_names: &["i_sb"],
+        rust_const: "INODE_I_SB",
+        manifest_key: "INODE_I_SB_OFFSET",
+    },
+    OffsetDef {
+        type_name: "super_block",
+        field_names: &["s_dev"],
+        rust_const: "SUPER_BLOCK_S_DEV",
+        manifest_key: "SUPER_BLOCK_S_DEV_OFFSET",
+    },
+    OffsetDef {
         type_name: "task_struct",
         field_names: &["cgroups"],
         rust_const: "TASK_CGROUPS",

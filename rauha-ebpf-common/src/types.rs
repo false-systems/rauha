@@ -14,6 +14,17 @@ pub const MAX_CGROUPS: u32 = 65536;
 /// Covers most container rootfs scenarios (Alpine ~800, Ubuntu ~35K).
 pub const MAX_INODES: u32 = 262_144;
 
+/// Kernel dev_t (major << 20 | minor) plus inode, never a bare inode number.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InodeKey {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[cfg(feature = "userspace")]
+unsafe impl aya::Pod for InodeKey {}
+
 /// Value in the ZONE_MEMBERSHIP map. Keyed by cgroup_id (u64).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +61,14 @@ pub struct ZoneCommKey {
 // Flag constants for ZoneInfoKernel.flags
 pub const ZONE_FLAG_PRIVILEGED: u32 = 1 << 0;
 pub const ZONE_FLAG_GLOBAL: u32 = 1 << 1;
+/// Private, single-use crun exec setup; bprm consumes this before image execution.
+pub const ZONE_FLAG_RUNTIME_SETUP: u32 = 1 << 2;
+
+/// Namespace, credentials, filesystem and rlimit setup only; never module/BPF/network administration.
+#[inline(always)]
+pub fn runtime_setup_allows_cap(flags: u32, cap: i32) -> bool {
+    flags & ZONE_FLAG_RUNTIME_SETUP != 0 && matches!(cap, 0..=8 | 18 | 19 | 21 | 23 | 24 | 27 | 31)
+}
 
 // Flag constants for ZonePolicyKernel.flags
 pub const POLICY_FLAG_ALLOW_PTRACE: u32 = 1 << 0;
@@ -269,7 +288,44 @@ unsafe impl aya::Pod for EnforcementEvent {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_setup_caps_require_private_flag_and_exclude_host_administration() {
+        for cap in [0, 1, 6, 7, 8, 18, 19, 21, 23, 24, 27, 31] {
+            assert!(super::runtime_setup_allows_cap(
+                super::ZONE_FLAG_RUNTIME_SETUP,
+                cap
+            ));
+            assert!(!super::runtime_setup_allows_cap(0, cap));
+        }
+        for cap in [-1, 9, 12, 16, 17, 22, 25, 32, 33, 38, 39, 40, 64] {
+            assert!(!super::runtime_setup_allows_cap(
+                super::ZONE_FLAG_RUNTIME_SETUP,
+                cap
+            ));
+        }
+        assert!(!super::runtime_setup_allows_cap(
+            super::ZONE_FLAG_PRIVILEGED | super::ZONE_FLAG_GLOBAL,
+            21
+        ));
+    }
     use super::*;
+
+    #[test]
+    fn inode_key_abi_qualifies_identical_inodes_by_filesystem() {
+        assert_eq!(core::mem::size_of::<InodeKey>(), 16);
+        assert_eq!(core::mem::offset_of!(InodeKey, device), 0);
+        assert_eq!(core::mem::offset_of!(InodeKey, inode), 8);
+        assert_ne!(
+            InodeKey {
+                device: 1,
+                inode: 7
+            },
+            InodeKey {
+                device: 2,
+                inode: 7
+            }
+        );
+    }
     use core::mem::size_of;
 
     #[test]

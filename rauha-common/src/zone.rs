@@ -110,11 +110,15 @@ impl Default for ResourcePolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkMode {
     Isolated,
     Bridged,
     Host,
+    /// A privileged orchestrator owns the network; Rauha pins and filters it.
+    External {
+        namespace: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,7 +174,23 @@ impl NetworkEndpoint {
     }
 
     pub fn network(self) -> String {
-        format!("{}/{}", self.address, self.prefix_len)
+        let address = match self.address {
+            IpAddr::V4(address) => IpAddr::V4(
+                (u32::from(address)
+                    & u32::MAX
+                        .checked_shl(32 - u32::from(self.prefix_len))
+                        .unwrap_or(0))
+                .into(),
+            ),
+            IpAddr::V6(address) => IpAddr::V6(
+                (u128::from(address)
+                    & u128::MAX
+                        .checked_shl(128 - u32::from(self.prefix_len))
+                        .unwrap_or(0))
+                .into(),
+            ),
+        };
+        format!("{address}/{}", self.prefix_len)
     }
 }
 
@@ -393,6 +413,7 @@ pub struct PolicyFileResources {
 #[serde(deny_unknown_fields)]
 pub struct PolicyFileNetwork {
     pub mode: Option<String>,
+    pub namespace: Option<String>,
     pub allowed_zones: Option<Vec<String>>,
     pub allowed_egress: Option<Vec<String>>,
     pub allowed_ingress: Option<Vec<String>>,
@@ -503,6 +524,13 @@ impl ZonePolicy {
     /// arise from unknown capability names.
     pub fn to_enforcement(&self) -> crate::error::Result<rauha_enforcer_api::ZoneEnforcement> {
         let caps_mask = capabilities_to_mask(&self.capabilities.allowed)?;
+        if matches!(self.network.mode, NetworkMode::External { .. })
+            && caps_mask & ((1 << 12) | (1 << 21)) != 0
+        {
+            return Err(crate::error::RauhaError::InvalidPolicy(
+                "external network filtering requires denying NET_ADMIN and SYS_ADMIN".into(),
+            ));
+        }
 
         // ptrace is gated on the SYS_PTRACE capability being granted, accepting
         // both the canonical and short capability spellings.
@@ -590,12 +618,30 @@ impl PolicyFile {
                     Some("isolated") | None => NetworkMode::Isolated,
                     Some("bridged") => NetworkMode::Bridged,
                     Some("host") => NetworkMode::Host,
+                    Some("external") => {
+                        let namespace = n.namespace.as_deref().filter(|path| {
+                            std::path::Path::new(path).is_absolute() && !path.contains('\0')
+                        }).ok_or_else(|| crate::error::RauhaError::InvalidPolicy(
+                            "external network mode requires an absolute namespace path".into()
+                        ))?;
+                        NetworkMode::External { namespace: namespace.into() }
+                    }
                     Some(other) => {
                         return Err(crate::error::RauhaError::InvalidPolicy(format!(
                             "unknown network mode: {other}"
                         )))
                     }
                 };
+                if !matches!(mode, NetworkMode::External { .. }) && n.namespace.is_some() {
+                    return Err(crate::error::RauhaError::InvalidPolicy(
+                        "network.namespace is only valid for external mode".into()
+                    ));
+                }
+                if matches!(mode, NetworkMode::External { .. }) && n.allowed_zones.as_ref().is_some_and(|zones| !zones.is_empty()) {
+                    return Err(crate::error::RauhaError::InvalidPolicy(
+                        "external network policy uses explicit ingress/egress CIDRs, not zone names".into()
+                    ));
+                }
                 let allowed_egress = n.allowed_egress.clone().unwrap_or_default();
                 let allowed_ingress = n.allowed_ingress.clone().unwrap_or_default();
                 for target in allowed_egress.iter().chain(&allowed_ingress) {
@@ -614,6 +660,17 @@ impl PolicyFile {
             })
             .transpose()?
             .unwrap_or_default();
+
+        if matches!(network.mode, NetworkMode::External { .. })
+            && capabilities
+                .allowed
+                .iter()
+                .any(|cap| matches!(linux_capability_bit(cap), Some(12) | Some(21)))
+        {
+            return Err(crate::error::RauhaError::InvalidPolicy(
+                "external network namespaces cannot grant NET_ADMIN or SYS_ADMIN; their filters must remain controlled by Rauha".into()
+            ));
+        }
 
         let filesystem = self
             .filesystem
@@ -692,6 +749,30 @@ fn parse_memory_size(s: &str) -> crate::error::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_network_requires_a_path_and_cannot_grant_filter_control() {
+        let parse = |network: &str, capabilities: &str| {
+            let text = format!("[zone]\nname = 'pod'\ntype = 'non-global'\n[network]\n{network}\n[capabilities]\nallowed = [{capabilities}]\n");
+            toml::from_str::<PolicyFile>(&text)
+                .unwrap()
+                .to_zone_policy("/tmp/rauha")
+        };
+        assert!(parse("mode = 'external'", "").is_err());
+        assert!(parse("mode = 'external'\nnamespace = 'relative'", "").is_err());
+        assert!(parse(
+            "mode = 'external'\nnamespace = '/run/netns/pod'",
+            "'NET_ADMIN'"
+        )
+        .is_err());
+        assert!(parse(
+            "mode = 'external'\nnamespace = '/run/netns/pod'",
+            "'SYS_ADMIN'"
+        )
+        .is_err());
+        assert!(parse("mode = 'isolated'\nnamespace = '/run/netns/pod'", "").is_err());
+        assert!(parse("mode = 'external'\nnamespace = '/run/netns/pod'", "").is_ok());
+    }
 
     #[test]
     fn test_parse_memory_size() {

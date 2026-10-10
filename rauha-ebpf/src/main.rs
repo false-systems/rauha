@@ -7,7 +7,7 @@ use aya_ebpf::{
     programs::LsmContext,
 };
 use rauha_ebpf_common::{
-    EnforcementCounters, EnforcementEvent, SelfTestResult, ZoneCommKey, ZoneInfoKernel,
+    EnforcementCounters, EnforcementEvent, InodeKey, SelfTestResult, ZoneCommKey, ZoneInfoKernel,
     ZonePolicyKernel, DECISION_DENY, DECISION_ERROR, ENFORCEMENT_COUNTER_ENTRIES, MAX_CGROUPS,
     MAX_INODES, MAX_ZONES,
 };
@@ -28,9 +28,9 @@ static ZONE_MEMBERSHIP: HashMap<u64, ZoneInfoKernel> = HashMap::with_max_entries
 #[map]
 static ZONE_POLICY: HashMap<u32, ZonePolicyKernel> = HashMap::with_max_entries(MAX_ZONES, 0);
 
-/// Maps inode → zone_id. Tracks which zone owns which files.
+/// Maps (kernel device, inode) → zone_id. Tracks filesystem-qualified ownership.
 #[map]
-static INODE_ZONE_MAP: HashMap<u64, u32> = HashMap::with_max_entries(MAX_INODES, 0);
+static INODE_ZONE_MAP: HashMap<InodeKey, u32> = HashMap::with_max_entries(MAX_INODES, 0);
 
 /// Maps (src_zone, dst_zone) → u8. If entry exists, cross-zone communication is allowed.
 #[map]
@@ -129,11 +129,9 @@ unsafe fn lookup_task_zone(task_ptr: u64) -> Option<ZoneInfoKernel> {
     ZONE_MEMBERSHIP.get(&cgroup_id).copied()
 }
 
-/// Read inode number from a `struct file *` pointer.
-///
-/// Traverses: file->f_inode->i_ino
+/// Read the inode and its superblock's kernel dev_t from a `struct file *`.
 #[inline(always)]
-unsafe fn read_file_ino(file_ptr: u64) -> Result<u64, i64> {
+unsafe fn read_file_ino(file_ptr: u64) -> Result<InodeKey, i64> {
     if file_ptr == 0 {
         return Err(-1);
     }
@@ -143,7 +141,17 @@ unsafe fn read_file_ino(file_ptr: u64) -> Result<u64, i64> {
         return Err(-1);
     }
 
-    read_kernel_u64(inode_ptr, offsets::INODE_I_INO)
+    let superblock = read_kernel_u64(inode_ptr, offsets::INODE_I_SB)?;
+    if superblock == 0 {
+        return Err(-1);
+    }
+    let device: u32 = aya_ebpf::helpers::bpf_probe_read_kernel(
+        (superblock + offsets::SUPER_BLOCK_S_DEV as u64) as *const u32,
+    )?;
+    Ok(InodeKey {
+        device: device as u64,
+        inode: read_kernel_u64(inode_ptr, offsets::INODE_I_INO)?,
+    })
 }
 
 /// Check if cross-zone access from src to dst is allowed.
@@ -236,6 +244,11 @@ fn check_cross_zone_task_access(ctx: &LsmContext, hook: u8) -> Result<i32, i64> 
             return Ok(-1);
         }
     };
+
+    if target.flags & rauha_ebpf_common::ZONE_FLAG_RUNTIME_SETUP != 0 {
+        emit_deny_event(hook, caller.zone_id, target.zone_id, 0);
+        return Ok(-1);
+    }
 
     if is_cross_zone_allowed(caller.zone_id, target.zone_id) {
         return Ok(0);

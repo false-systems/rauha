@@ -10,7 +10,6 @@
 //! defaults. A missing file is not an error. `RAUHA_ROOT` stays an env var —
 //! the config file is discovered *via* the root, so it cannot define it.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use rauha_common::error::{RauhaError, Result};
@@ -41,7 +40,7 @@ pub struct DaemonConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// gRPC listen address.
+    /// Absolute path to the root-only gRPC Unix socket. TCP is not supported.
     #[serde(default = "default_server_addr")]
     pub addr: String,
 }
@@ -55,7 +54,7 @@ impl Default for ServerConfig {
 }
 
 fn default_server_addr() -> String {
-    "[::1]:9876".into()
+    rauha_common::rpc::DEFAULT_ADDRESS.into()
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -210,10 +209,9 @@ fn default_policy_max_bytes() -> usize {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
-    /// Writable paths that are always considered safe (virtual/ephemeral
-    /// filesystems). Overriding this widens what `filesystem.writable_paths`
-    /// admits without Landlock backing — strict admission still reports it
-    /// in `zone verify` degradations.
+    /// Reserved roots excluded from `filesystem.writable_paths` (legacy name).
+    /// Removing a root explicitly permits policies to request writable paths
+    /// there; it does not mount host paths into a container.
     #[serde(default = "default_safe_writable_roots")]
     pub safe_writable_roots: Vec<String>,
 }
@@ -321,12 +319,12 @@ impl DaemonConfig {
 
     /// Reject values that cannot work before anything depends on them.
     fn validate(&self) -> Result<()> {
-        let _: SocketAddr = self.server.addr.parse().map_err(|_| {
-            RauhaError::InvalidInput(format!(
-                "server.addr {:?} is not a valid socket address",
-                self.server.addr
-            ))
-        })?;
+        if !Path::new(&self.server.addr).is_absolute() {
+            return Err(RauhaError::InvalidInput(
+                "server.addr must be an absolute Unix socket path; unauthenticated TCP is disabled"
+                    .into(),
+            ));
+        }
         let _ = self.subnet_octets()?;
         for ns in &self.network.dns_fallback {
             ns.parse::<std::net::IpAddr>().map_err(|_| {
@@ -447,7 +445,7 @@ mod tests {
     fn defaults_parse_and_validate() {
         let c = DaemonConfig::default();
         c.validate().unwrap();
-        assert_eq!(c.server.addr, "[::1]:9876");
+        assert_eq!(c.server.addr, rauha_common::rpc::DEFAULT_ADDRESS);
         assert_eq!(c.network.subnet, "10.89.0.0/16");
         assert_eq!(c.network.bridge, "rauha0");
         assert_eq!(c.executor.crun, "auto");
@@ -490,7 +488,7 @@ mod tests {
         .unwrap();
         let c = DaemonConfig::load(dir.to_str().unwrap()).unwrap();
         assert_eq!(c.network.subnet, "172.30.0.0/24");
-        assert_eq!(c.server.addr, "[::1]:9876"); // untouched section keeps default
+        assert_eq!(c.server.addr, rauha_common::rpc::DEFAULT_ADDRESS); // untouched section keeps default
         std::fs::remove_dir_all(&dir).ok();
     }
 

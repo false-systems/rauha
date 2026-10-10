@@ -82,6 +82,12 @@ impl CgroupManager {
             return Ok(()); // Already gone, idempotent.
         }
 
+        for (_, child) in self.container_cgroups(zone_name)? {
+            fs::remove_dir(&child).map_err(|e| RauhaError::CgroupError {
+                message: format!("failed to remove child cgroup {}: {e}", child.display()),
+                hint: "stop all container processes and retry".into(),
+            })?;
+        }
         fs::remove_dir(&path).map_err(|e| RauhaError::CgroupError {
             message: format!("failed to remove cgroup {}: {e}", path.display()),
             hint: "ensure no processes remain in the zone (check cgroup.procs)".into(),
@@ -127,6 +133,58 @@ impl CgroupManager {
         Ok(())
     }
 
+    /// Suspend survivors before loading fresh maps; only successful recovery thaws them.
+    pub fn freeze_existing_zones(&self) -> Result<()> {
+        let mut zones = Vec::new();
+        for entry in fs::read_dir(&self.slice_path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| RauhaError::BackendError("cgroup name is not UTF-8".into()))?;
+            if let Some(zone) = name.strip_prefix("zone-") {
+                zones.push(zone.to_owned());
+            }
+        }
+        // Request all freezes even if one fails; never leave later zones running
+        // solely because an earlier cgroup could not acknowledge suspension.
+        let mut failed = None;
+        for zone in &zones {
+            if let Err(error) = write_cgroup_file(&self.zone_path(zone), "cgroup.freeze", "1") {
+                failed.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        for zone in zones {
+            self.set_frozen(&zone, true)?;
+        }
+        Ok(())
+    }
+
+    /// Freeze or thaw the complete zone subtree and wait for kernel acknowledgement.
+    pub fn set_frozen(&self, zone_name: &str, frozen: bool) -> Result<()> {
+        let path = self.zone_path(zone_name);
+        write_cgroup_file(&path, "cgroup.freeze", if frozen { "1" } else { "0" })?;
+        for _ in 0..500 {
+            let events = fs::read_to_string(path.join("cgroup.events"))?;
+            if events
+                .lines()
+                .any(|line| line == if frozen { "frozen 1" } else { "frozen 0" })
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Err(RauhaError::BackendError(format!(
+            "zone {zone_name} did not acknowledge frozen={frozen}"
+        )))
+    }
+
     /// Read runtime stats from a zone's cgroup.
     pub fn read_stats(&self, zone_name: &str, zone_id: uuid::Uuid) -> Result<ZoneStats> {
         let path = self.zone_path(zone_name);
@@ -167,12 +225,35 @@ impl CgroupManager {
     }
 
     pub fn zone_has_processes(&self, zone_name: &str) -> Result<bool> {
-        let path = self.zone_path(zone_name).join("cgroup.procs");
+        let path = self.zone_path(zone_name).join("cgroup.events");
         let processes = fs::read_to_string(&path).map_err(|e| RauhaError::CgroupError {
             message: format!("failed to read {}: {e}", path.display()),
             hint: "retain kernel membership until cgroup state is readable".into(),
         })?;
-        Ok(!processes.trim().is_empty())
+        Ok(processes.lines().any(|line| line == "populated 1"))
+    }
+
+    /// Children first, so teardown never removes a parent before its descendants.
+    pub fn container_cgroups(&self, zone_name: &str) -> Result<Vec<(u64, PathBuf)>> {
+        fn visit(path: &Path, children: &mut Vec<(u64, PathBuf)>) -> std::io::Result<()> {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    visit(&entry.path(), children)?;
+                    children.push((entry.metadata()?.ino(), entry.path()));
+                }
+            }
+            Ok(())
+        }
+        let mut children = Vec::new();
+        let path = self.zone_path(zone_name);
+        if path.exists() {
+            visit(&path, &mut children).map_err(|e| RauhaError::CgroupError {
+                message: format!("cannot enumerate container cgroups: {e}"),
+                hint: "retain enforcement and retry".into(),
+            })?;
+        }
+        Ok(children)
     }
 
     /// Kill every process in a zone and wait until the cgroup is empty.
@@ -202,15 +283,19 @@ impl CgroupManager {
             if !native_kill {
                 // cgroup.kill arrived in Linux 5.14. Re-read while draining so
                 // children forked during teardown cannot escape the snapshot.
-                let procs_path = path.join("cgroup.procs");
-                let procs =
-                    fs::read_to_string(&procs_path).map_err(|e| RauhaError::CgroupError {
-                        message: format!("failed to read {}: {e}", procs_path.display()),
-                        hint: "retain zone enforcement and retry teardown".into(),
-                    })?;
-                for pid in procs.lines().filter_map(|pid| pid.parse::<i32>().ok()) {
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
+                let mut groups = self.container_cgroups(zone_name)?;
+                groups.push((0, path.clone()));
+                for (_, group) in groups {
+                    let procs_path = group.join("cgroup.procs");
+                    let procs =
+                        fs::read_to_string(&procs_path).map_err(|e| RauhaError::CgroupError {
+                            message: format!("failed to read {}: {e}", procs_path.display()),
+                            hint: "retain zone enforcement and retry teardown".into(),
+                        })?;
+                    for pid in procs.lines().filter_map(|pid| pid.parse::<i32>().ok()) {
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
                     }
                 }
             }
@@ -223,7 +308,7 @@ impl CgroupManager {
         })
     }
 
-    fn zone_path(&self, zone_name: &str) -> PathBuf {
+    pub(super) fn zone_path(&self, zone_name: &str) -> PathBuf {
         self.slice_path.join(format!("zone-{zone_name}"))
     }
 
@@ -288,6 +373,65 @@ fn read_cpu_usage(cgroup_path: &Path) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn teardown_enumerates_nested_container_groups_children_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CgroupManager {
+            slice_path: dir.path().to_owned(),
+        };
+        let child = manager.zone_path("test").join("container");
+        let nested = child.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(child.join("cgroup.procs"), "").unwrap();
+        let groups = manager.container_cgroups("test").unwrap();
+        assert_eq!(
+            groups.iter().map(|(_, path)| path).collect::<Vec<_>>(),
+            vec![&nested, &child]
+        );
+        assert!(groups
+            .iter()
+            .all(|(id, path)| *id == fs::metadata(path).unwrap().ino()));
+    }
+
+    #[test]
+    fn startup_requests_every_zone_freeze_and_does_not_thaw_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CgroupManager {
+            slice_path: dir.path().to_owned(),
+        };
+        for zone in ["a", "b", "c"] {
+            fs::create_dir(manager.zone_path(zone)).unwrap();
+            fs::write(
+                manager.zone_path(zone).join("cgroup.events"),
+                "populated 1\nfrozen 1\n",
+            )
+            .unwrap();
+            fs::write(manager.zone_path(zone).join("cgroup.freeze"), "0").unwrap();
+        }
+        fs::create_dir(dir.path().join("unrelated")).unwrap();
+        manager.freeze_existing_zones().unwrap();
+        for zone in ["a", "b", "c"] {
+            assert_eq!(
+                fs::read_to_string(manager.zone_path(zone).join("cgroup.freeze")).unwrap(),
+                "1"
+            );
+        }
+        assert!(!dir.path().join("unrelated/cgroup.freeze").exists());
+        let broken = manager.zone_path("b").join("cgroup.freeze");
+        fs::remove_file(&broken).unwrap();
+        fs::create_dir(&broken).unwrap();
+        for zone in ["a", "c"] {
+            fs::write(manager.zone_path(zone).join("cgroup.freeze"), "0").unwrap();
+        }
+        assert!(manager.freeze_existing_zones().is_err());
+        for zone in ["a", "c"] {
+            assert_eq!(
+                fs::read_to_string(manager.zone_path(zone).join("cgroup.freeze")).unwrap(),
+                "1"
+            );
+        }
+    }
 
     #[test]
     fn test_shares_to_weight() {

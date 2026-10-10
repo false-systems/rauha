@@ -29,7 +29,7 @@ boundary stopped. Docker runs the process. Rauha operates the work.
 One command, one result:
 
 ```sh
-rauha sandbox --image python:3.12 --repo-path . -- pytest tests/
+rauha sandbox --image alpine:latest -- /bin/echo hello
 ```
 
 ```json
@@ -55,6 +55,9 @@ rauha sandbox --image python:3.12 --repo-path . -- pytest tests/
   "receipt": { "sha256": "…", "…": "signed, verified by the CLI" }
 }
 ```
+
+The command runs inside the image. Host checkouts are not mounted: `--repo-path`
+is rejected until workspace provisioning is implemented.
 
 The daemon allocates a zone for the task, starts the container, waits, captures
 stdout/stderr/exit code, collects lifecycle and enforcement events, signs a
@@ -149,9 +152,9 @@ the market survey and hardening roadmap are in
   come back through one watch API and one stable event schema
   ([`rauha-evidence`](docs/observability.md)). Isolation you cannot observe is
   isolation you cannot trust.
-- **Crash recovery keeps the boundary.** Kill the daemon mid-task; on restart
-  the same workload keeps its cgroup, kernel membership, and file ownership —
-  probed on every Linux release.
+- **Crash recovery reconciles the boundary.** Ordinary containers can keep their
+  executor while the daemon rebuilds enforcement state. Interrupted sandbox tasks
+  are stopped and receive an uncertain result, never command replay.
 - **Same model on your laptop and your cluster.** Linux builds zones from
   cgroups, namespaces, and an OCI rootfs, with Rauha's own eBPF-LSM programs
   enforcing in the kernel.
@@ -171,7 +174,7 @@ rauha (CLI) ──gRPC──▶ rauhad ──spawns──▶ rauha-shim (one per
 ```
 
 **The daemon is platform-agnostic on purpose.** `rauhad` is one async
-daemon (tokio, gRPC on `[::1]:9876`) behind a single `IsolationBackend`
+daemon (tokio, gRPC over `/run/rauha/rauhad.sock`) behind a single `IsolationBackend`
 trait; the `rauha` CLI and `containerd-shim-rauha-v2` are thin clients.
 Zone metadata lives in redb and is the source of truth on restart: on
 boot the daemon reconciles — reloads every zone, rebuilds kernel state
@@ -179,10 +182,9 @@ boot the daemon reconciles — reloads every zone, rebuilds kernel state
 
 **One shim per zone, not per container.** The zone — not the container —
 is the isolation boundary; containers in a zone share namespaces, and
-the sync, fork-safe `rauha-shim` supervises all of them (crun builds
-each container; the shim holds pidfds, exec/attach IPC, logs, and the
-syscall broker). Deliberately synchronous where it forks: `fork()` in a
-multithreaded async runtime is UB, so the shim is not one.
+`rauha-shim` supervises all of them (crun builds each container; the shim
+holds pidfds, exec/attach IPC, logs, and the syscall broker). Its request loop
+is synchronous; bounded I/O and broker workers run on separate threads.
 
 **Enrollment before execution — the security invariant.** crun builds
 the container (namespaces, mounts, capabilities) and *parks* init on its
@@ -247,15 +249,19 @@ through the trait is in progress.
   can `chroot`/`chdir` the shared filesystem between suspension and
   judgment — the open stays confined to a subtree of the container rootfs,
   which is the zone boundary.
-- **Three policy controls are unsupported on Linux today** and strict admission
-  refuses them: `filesystem.writable_paths`, `devices.allowed`, `syscalls.deny`.
-  The roadmap closes them with Landlock, cgroup device BPF, and seccomp.
+- **Creation-time controls are not live-reloadable.** Capabilities,
+  filesystem shape, devices and seccomp rules require deleting the zone's
+  containers before changing policy. Empty zones can switch isolated/bridged
+  network policy; host/external identity transitions or a different external
+  namespace require recreating the zone itself. Writable paths must be normalized absolute
+  paths outside reserved system roots; device admission accepts only the five
+  standard character devices listed in [the capability reference](docs/rauha-product-abilities.md).
+  `syscalls.deny` is enforced by OCI seccomp rules.
 - **Sandbox event capture is best-effort** — enforcement events ride a
   daemon-wide broadcast and can be absent or partial; they are not an
-  audit-complete log. Decisions and deny events are also recorded durably
-  (container logs, the broker's decision log), but until broadcast drops are
-  counted, the streamed picture cannot claim completeness — counting them is
-  on the roadmap.
+  audit-complete log. Broadcast lag is counted in task results, and broker
+  decisions have a bounded file-backed log; neither makes kernel event capture
+  complete. Kernel ring-buffer losses remain a separate limitation.
 - **A sandbox, not a hardware boundary** — BPF-LSM is OS-level isolation and is
   additive-only: it can deny, but cannot override SELinux/AppArmor. Covert
   channels through shared kernel resources are out of scope.
@@ -283,6 +289,9 @@ there — there is no non-Linux backend.
   it.
 
 Root directory: `/var/lib/rauha` (override with `RAUHA_ROOT`).
+The control socket is root-only; `RAUHA_ADDR` accepts an absolute Unix socket
+path, not a TCP URL. Its parent directory must be owned by the daemon user and
+private (0700). See [upgrade notes](docs/rauha-product-abilities.md#upgrade-notes).
 
 ## Build, test, and verify
 
@@ -290,13 +299,14 @@ Root directory: `/var/lib/rauha` (override with `RAUHA_ROOT`).
 cargo build                          # all workspace crates
 cargo test                           # all unit tests
 cargo xtask build-ebpf --release     # eBPF object + offsets sidecar for this kernel
-RUST_LOG=rauhad=debug cargo run --bin rauhad   # daemon on [::1]:9876
+RUST_LOG=rauhad=debug cargo run --bin rauhad   # root; private Unix socket
 ```
 
 Three layers of verification, each independent of the source:
 
-- **Oracle** (`eval/oracle`, 55 numbered gRPC cases against a running daemon):
-  `RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test`
+- **Oracle** (`eval/oracle`, 55 numbered gRPC cases): `cargo xtask linux-gate`
+  runs the unchanged TCP oracle in an isolated network namespace with a
+  test-only Unix-socket proxy, never a host-exposed daemon listener.
 - **Linux integration and security gate** (`tests/integration/`,
   `tests/security/linux-gate.sh`; root + BPF-LSM kernel): lifecycle, isolation,
   networking, crash recovery, and adversarial host-impact probes. On GitHub the
@@ -317,7 +327,7 @@ In order:
    workspace, credential/egress broker, witness/receipt.
 4. The `rauha run` experience: copy-on-write workspace, code diff plus
    behavioural diff, accept or discard.
-5. Close the unsupported Linux controls (Landlock, cgroup device BPF, seccomp)
+5. Expand policy controls beyond the currently admitted filesystem/device subset.
    and adopt the new mount API for rootfs assembly.
 6. Signed execution receipts as an in-toto predicate; an external
    kernel-enforcement backend through `rauha-enforcer-api`.

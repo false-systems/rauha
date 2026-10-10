@@ -9,8 +9,8 @@
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, count_decision, emit_deny_event};
-use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_SOCKET_CONNECT, HOOK_SOCKET_CONNECT};
+use crate::{count_decision, emit_deny_event, lookup_caller_zone};
+use rauha_ebpf_common::{HOOK_SOCKET_CONNECT, PROG_SOCKET_CONNECT, ZONE_FLAG_GLOBAL};
 
 /// Called from the socket_connect LSM hook.
 ///

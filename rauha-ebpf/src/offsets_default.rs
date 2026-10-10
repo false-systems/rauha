@@ -9,5 +9,8 @@ pub const CGROUP_KN: usize = 256;
 pub const KERNFS_NODE_ID: usize = 96;
 pub const FILE_F_INODE: usize = 32;
 pub const INODE_I_INO: usize = 64;
+// Source-check placeholders only; production requires generated offsets.
+pub const INODE_I_SB: usize = 40;
+pub const SUPER_BLOCK_S_DEV: usize = 16;
 // linux_binprm renamed 'file' to 'executable' in recent kernels.
 pub const BPRM_FILE: usize = 48;

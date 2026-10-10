@@ -60,6 +60,17 @@ fn validate_zone_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn creation_policy_changed(old: &ZonePolicy, new: &ZonePolicy) -> bool {
+    old.capabilities.allowed != new.capabilities.allowed
+        || old.network.mode != new.network.mode
+        || old.filesystem.root != new.filesystem.root
+        || old.filesystem.shared_layers != new.filesystem.shared_layers
+        || old.filesystem.writable_paths != new.filesystem.writable_paths
+        || old.devices.allowed != new.devices.allowed
+        || old.syscalls.deny != new.syscalls.deny
+        || old.syscalls.broker != new.syscalls.broker
+}
+
 impl ZoneRegistry {
     pub fn metadata(&self) -> &MetadataStore {
         &self.metadata
@@ -462,13 +473,8 @@ impl ZoneRegistry {
         self.metadata.list_zones()
     }
 
-    pub fn image_digest(&self, reference: &str) -> Result<String> {
-        self.image_service
-            .inspect_full(reference)
-            .map(|image| image.digest)
-    }
-
     pub async fn apply_policy(&self, zone_name: &str, policy: ZonePolicy) -> Result<()> {
+        let _mutation = self.zone_mutation_lock.lock().await;
         self.event(
             event_name::POLICY_APPLY_STARTED,
             EventKind::Policy,
@@ -478,10 +484,36 @@ impl ZoneRegistry {
         .emit();
 
         let mut zone = self.get_zone(zone_name).await?;
-        let handles = self.handles.read().await;
+        let handles = self.handles.write().await;
         let handle = handles
             .get(zone_name)
             .ok_or_else(|| RauhaError::ZoneNotFound(zone_name.into()))?;
+
+        let previous = zone.policy.clone();
+        // Isolated and bridged zones share the same netns/veth; only filtering
+        // changes. Host and externally supplied namespaces require recreation.
+        if previous.network.mode != policy.network.mode
+            && !matches!(
+                (&previous.network.mode, &policy.network.mode),
+                (
+                    rauha_common::zone::NetworkMode::Isolated,
+                    rauha_common::zone::NetworkMode::Bridged
+                ) | (
+                    rauha_common::zone::NetworkMode::Bridged,
+                    rauha_common::zone::NetworkMode::Isolated
+                )
+            )
+        {
+            return Err(RauhaError::InvalidPolicy(
+                "host and external network namespace identity cannot change after zone creation; recreate the zone".into(),
+            ));
+        }
+        if !self.metadata.list_containers(Some(&zone.id))?.is_empty()
+            && creation_policy_changed(&previous, &policy)
+        {
+            return Err(RauhaError::InvalidPolicy("capabilities, network mode, filesystem, devices and syscall settings cannot change while containers exist; recreate them first".into()));
+        }
+        self.backend.set_zone_frozen(handle, true)?;
 
         // If the zone was deleted concurrently, the backend call may fail.
         // Treat "zone not found" backend errors as ZoneNotFound, not Internal.
@@ -502,6 +534,9 @@ impl ZoneRegistry {
                 return Err(err);
             }
             Err(e) => {
+                // No thaw unless every old control has been restored.
+                self.backend.enforce_policy(handle, &previous)?;
+                self.backend.set_zone_frozen(handle, false)?;
                 self.event(
                     event_name::POLICY_APPLY_FAILED,
                     EventKind::Policy,
@@ -518,7 +553,12 @@ impl ZoneRegistry {
 
         zone.policy = policy;
         zone.updated_at = Utc::now();
-        self.metadata.put_zone(&zone)?;
+        if let Err(error) = self.metadata.put_zone(&zone) {
+            self.backend.enforce_policy(handle, &previous)?;
+            self.backend.set_zone_frozen(handle, false)?;
+            return Err(error);
+        }
+        self.backend.set_zone_frozen(handle, false)?;
 
         tracing::info!(zone = zone_name, "policy updated");
         self.event(
@@ -537,7 +577,22 @@ impl ZoneRegistry {
         zone_name: &str,
         spec: ContainerSpec,
     ) -> Result<Container> {
+        self.create_container_attested(zone_name, spec)
+            .await
+            .map(|(container, _)| container)
+    }
+
+    pub async fn create_container_attested(
+        &self,
+        zone_name: &str,
+        spec: ContainerSpec,
+    ) -> Result<(Container, Option<String>)> {
         let zone = self.get_zone(zone_name).await?;
+        // Keep deletion and policy mutation outside preparation and publication.
+        let handles = self.handles.read().await;
+        let handle = handles
+            .get(zone_name)
+            .ok_or_else(|| RauhaError::ZoneNotFound(zone_name.into()))?;
 
         // Prepare rootfs from image if one is specified.
         // Uses spawn_blocking because layer extraction does heavy I/O.
@@ -545,50 +600,40 @@ impl ZoneRegistry {
         // On Linux, extract per-layer directories for overlayfs (O(1) mount).
         // On other platforms, fall back to full rootfs copy.
         let mut spec = spec;
+        let mut manifest_digest = None;
         if !spec.image.is_empty() {
             let image_svc = self.image_service.clone();
             let image_ref = spec.image.clone();
-            #[cfg(target_os = "linux")]
             {
                 let zone_root = self.root_path();
                 let zone_name_owned = zone_name.to_string();
-                let layers = tokio::task::spawn_blocking(move || {
-                    let safe_name = image_svc.image_safe_name(&image_ref)?;
-                    let (digests, content_root) = image_svc.layer_digests(&image_ref)?;
+                let (digest, layers) = tokio::task::spawn_blocking(move || {
+                    let (digest, digests, content_root) = image_svc.layer_digests(&image_ref)?;
 
                     let zone_data = std::path::PathBuf::from(&zone_root)
                         .join("zones")
                         .join(&zone_name_owned);
                     let snapshotter = rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_data);
-                    let layer_paths =
-                        snapshotter.prepare_layers(&safe_name, &digests, &content_root)?;
+                    let layer_paths = snapshotter.prepare_layers("", &digests, &content_root)?;
 
                     // Skip prepare_base_rootfs — overlayfs mounts the per-layer
                     // directories directly. The merged rootfs would be redundant.
-                    Ok::<_, RauhaError>(layer_paths)
+                    Ok::<_, RauhaError>((digest, layer_paths))
                 })
                 .await
                 .map_err(|e| RauhaError::BackendError(format!("rootfs task panicked: {e}")))??;
 
-                spec.overlay_layers = Some(layers);
-            }
-
-            #[cfg(not(target_os = "linux"))]
-            {
-                let base =
-                    tokio::task::spawn_blocking(move || image_svc.prepare_base_rootfs(&image_ref))
-                        .await
-                        .map_err(|e| {
-                            RauhaError::BackendError(format!("rootfs task panicked: {e}"))
-                        })??;
-                spec.rootfs_path = Some(base);
+                manifest_digest = Some(digest);
+                #[cfg(target_os = "linux")]
+                {
+                    spec.overlay_layers = Some(layers);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    spec.rootfs_path = layers.first().cloned();
+                }
             }
         }
-
-        let handles = self.handles.read().await;
-        let handle = handles
-            .get(zone_name)
-            .ok_or_else(|| RauhaError::ZoneNotFound(zone_name.into()))?;
 
         let container_handle = self.backend.create_container(handle, &spec)?;
 
@@ -606,7 +651,17 @@ impl ZoneRegistry {
             exit_code: None,
         };
 
-        self.metadata.put_container(&container)?;
+        if let Err(error) = self.metadata.put_container(&container) {
+            if let Err(cleanup) = self.backend.delete_container(zone_name, &container.id) {
+                // Preserve a retry target if a transient metadata failure cleared.
+                self.metadata.put_container(&container)?;
+                return Err(RauhaError::BackendError(format!(
+                    "container {} metadata failed: {error}; cleanup must be retried: {cleanup}",
+                    container.id
+                )));
+            }
+            return Err(error);
+        }
 
         // Cache container handle for start/stop operations.
         self.container_handles
@@ -615,7 +670,7 @@ impl ZoneRegistry {
             .insert(container_handle.id, container_handle);
 
         tracing::info!(container = %container.id, zone = zone_name, "container created");
-        Ok(container)
+        Ok((container, manifest_digest))
     }
 
     /// Start a previously created container.
@@ -706,13 +761,23 @@ impl ZoneRegistry {
             rauha_common::shim::ShimResponse::State {
                 status, exit_code, ..
             } => {
-                if status == "stopped"
-                    && (container.state != ContainerState::Stopped
-                        || container.exit_code != exit_code)
-                {
+                let state = match status.as_str() {
+                    "created" => ContainerState::Created,
+                    "running" => ContainerState::Running,
+                    "paused" => ContainerState::Paused,
+                    "stopped" => ContainerState::Stopped,
+                    _ => {
+                        return Err(RauhaError::BackendError(format!(
+                            "unknown runtime state: {status}"
+                        )))
+                    }
+                };
+                if container.state != state || container.exit_code != exit_code {
                     let mut updated = container;
-                    updated.state = ContainerState::Stopped;
-                    updated.finished_at.get_or_insert_with(Utc::now);
+                    updated.state = state;
+                    if state == ContainerState::Stopped {
+                        updated.finished_at.get_or_insert_with(Utc::now);
+                    }
                     updated.exit_code = exit_code;
                     self.metadata.put_container(&updated)?;
                     tracing::info!(
@@ -736,6 +801,7 @@ impl ZoneRegistry {
 
     /// Delete a container, stopping it first if needed.
     pub async fn delete_container(&self, container_id: &Uuid, force: bool) -> Result<()> {
+        let handles = self.handles.write().await;
         let container = self
             .metadata
             .get_container(container_id)?
@@ -752,34 +818,12 @@ impl ZoneRegistry {
             }
         }
 
-        // Unmount overlayfs if applicable (Linux only, no-op on other platforms).
-        #[cfg(target_os = "linux")]
-        {
-            let zone_name = self.zone_name_for_container(&container.zone_id).await;
-            if let Some(zone_name) = zone_name {
-                match self.backend.shim_request(
-                    &zone_name,
-                    &rauha_common::shim::ShimRequest::DeleteContainer {
-                        id: container_id.to_string(),
-                    },
-                )? {
-                    rauha_common::shim::ShimResponse::Ok => {}
-                    response => {
-                        return Err(RauhaError::BackendError(format!(
-                            "shim did not delete container: {response:?}"
-                        )))
-                    }
-                }
-                let zone_data = std::path::PathBuf::from(&self.root)
-                    .join("zones")
-                    .join(&zone_name);
-                let container_root = zone_data.join("containers").join(container_id.to_string());
-                let snapshotter = rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_data);
-                if let Err(e) = snapshotter.unmount_overlay(&container_root) {
-                    tracing::warn!(container = %container_id, %e, "failed to unmount overlay");
-                }
-            }
-        }
+        let zone_name = handles
+            .iter()
+            .find(|(_, handle)| handle.id == container.zone_id)
+            .map(|(name, _)| name)
+            .ok_or_else(|| RauhaError::ZoneNotFound(container.zone_id.to_string()))?;
+        self.backend.delete_container(zone_name, container_id)?;
 
         self.remove_container_logs(container_id)?;
         self.container_handles.write().await.remove(container_id);
@@ -992,22 +1036,59 @@ mod tests {
     use super::*;
     use rauha_common::backend::IsolationBackend;
     use rauha_common::container::{ContainerHandle, ContainerSpec};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[test]
+    fn creation_time_policy_changes_cannot_be_hot_reloaded() {
+        let original = ZonePolicy::default();
+        let mut update = original.clone();
+        update.resources.memory_limit *= 2;
+        assert!(!creation_policy_changed(&original, &update));
+        update.syscalls.deny.push("getpid".into());
+        assert!(creation_policy_changed(&original, &update));
+        update = original.clone();
+        update.network.mode = NetworkMode::Host;
+        assert!(creation_policy_changed(&original, &update));
+    }
 
     /// Minimal mock backend for testing registry logic.
     struct MockBackend {
         next_id: AtomicU64,
-        destroy_failures: AtomicU64,
+        destroy_failures: AtomicBool,
         destroy_attempts: AtomicU64,
+        delete_fails: AtomicBool,
+        delete_attempts: AtomicU64,
+        policy_calls: Mutex<Vec<String>>,
+        policy_failures: AtomicBool,
+        restore_fails: AtomicBool,
+        freeze_fails: AtomicBool,
+        frozen: AtomicBool,
+        effective_pids: AtomicU64,
+        policy_barrier: Mutex<
+            Option<(
+                std::sync::mpsc::SyncSender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
     }
 
     impl MockBackend {
         fn new() -> Self {
             Self {
                 next_id: AtomicU64::new(1),
-                destroy_failures: AtomicU64::new(0),
+                destroy_failures: AtomicBool::new(false),
                 destroy_attempts: AtomicU64::new(0),
+                delete_fails: AtomicBool::new(false),
+                delete_attempts: AtomicU64::new(0),
+                policy_calls: Mutex::new(Vec::new()),
+                policy_failures: AtomicBool::new(false),
+                restore_fails: AtomicBool::new(false),
+                freeze_fails: AtomicBool::new(false),
+                frozen: AtomicBool::new(false),
+                effective_pids: AtomicU64::new(0),
+                policy_barrier: Mutex::new(None),
             }
         }
     }
@@ -1035,21 +1116,58 @@ mod tests {
 
         fn destroy_zone(&self, _zone: &ZoneHandle) -> Result<()> {
             self.destroy_attempts.fetch_add(1, Ordering::SeqCst);
-            if self
-                .destroy_failures
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
+            if self.destroy_failures.swap(false, Ordering::SeqCst) {
                 return Err(RauhaError::BackendError("injected teardown failure".into()));
             }
             Ok(())
         }
 
-        fn enforce_policy(&self, _zone: &ZoneHandle, _policy: &ZonePolicy) -> Result<()> {
+        fn enforce_policy(&self, _zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
+            self.policy_calls
+                .lock()
+                .unwrap()
+                .push(format!("enforce:{}", policy.resources.pids_max));
+            if self.restore_fails.load(Ordering::SeqCst) {
+                return Err(RauhaError::BackendError(
+                    "injected restoration failure".into(),
+                ));
+            }
+            self.effective_pids
+                .store(policy.resources.pids_max, Ordering::SeqCst);
             Ok(())
         }
 
-        fn hot_reload_policy(&self, _zone: &ZoneHandle, _policy: &ZonePolicy) -> Result<()> {
+        fn hot_reload_policy(&self, _zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
+            assert!(self.frozen.load(Ordering::SeqCst));
+            self.policy_calls
+                .lock()
+                .unwrap()
+                .push(format!("apply:{}", policy.resources.pids_max));
+            self.effective_pids
+                .store(policy.resources.pids_max, Ordering::SeqCst);
+            if let Some((entered, release)) = self.policy_barrier.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            if self.policy_failures.swap(false, Ordering::SeqCst) {
+                return Err(RauhaError::BackendError(
+                    "injected partial policy failure".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn set_zone_frozen(&self, _zone: &ZoneHandle, frozen: bool) -> Result<()> {
+            self.policy_calls
+                .lock()
+                .unwrap()
+                .push(if frozen { "freeze" } else { "thaw" }.into());
+            if frozen && self.freeze_fails.load(Ordering::SeqCst) {
+                return Err(RauhaError::BackendError("injected freeze failure".into()));
+            }
+            self.frozen.store(frozen, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1072,6 +1190,16 @@ mod tests {
         }
 
         fn stop_container(&self, _container: &ContainerHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete_container(&self, _zone_name: &str, _container_id: &Uuid) -> Result<()> {
+            self.delete_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.delete_fails.load(Ordering::SeqCst) {
+                return Err(RauhaError::BackendError(
+                    "injected resource cleanup failure".into(),
+                ));
+            }
             Ok(())
         }
 
@@ -1189,6 +1317,7 @@ mod tests {
             working_dir: None,
             rootfs_path: None,
             overlay_layers: None,
+            oci_spec_json: None,
         }
     }
 
@@ -1206,9 +1335,11 @@ mod tests {
             (cfg!(target_os = "linux"), false),
             (cfg!(target_os = "linux"), true),
         ] {
+            #[cfg(not(target_os = "linux"))]
+            let _ = damaged;
             let tmp = TempDir::new().unwrap();
             let backend = Arc::new(MockBackend::new());
-            backend.destroy_failures.store(1, Ordering::SeqCst);
+            backend.destroy_failures.store(true, Ordering::SeqCst);
             let reg = Arc::new(test_registry_with_backend(&tmp, backend.clone()));
             let zone = reg
                 .create_zone("durable-task", ZoneType::NonGlobal, ZonePolicy::default())
@@ -1406,7 +1537,7 @@ mod tests {
     async fn failed_zone_teardown_preserves_state_for_retry() {
         let tmp = TempDir::new().unwrap();
         let backend = Arc::new(MockBackend::new());
-        backend.destroy_failures.store(1, Ordering::SeqCst);
+        backend.destroy_failures.store(true, Ordering::SeqCst);
         let reg = test_registry_with_backend(&tmp, backend.clone());
         reg.create_zone("retry", ZoneType::NonGlobal, ZonePolicy::default())
             .await
@@ -1767,6 +1898,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_zone_can_switch_filtering_without_replacing_its_network_identity() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+        let zone = reg
+            .create_zone("filter-mode", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        for mode in [
+            rauha_common::zone::NetworkMode::Bridged,
+            rauha_common::zone::NetworkMode::Isolated,
+        ] {
+            let mut policy = zone.policy.clone();
+            policy.network.mode = mode.clone();
+            reg.apply_policy("filter-mode", policy).await.unwrap();
+            let updated = reg.get_zone("filter-mode").await.unwrap();
+            assert_eq!(updated.id, zone.id);
+            assert_eq!(updated.policy.network.mode, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_zone_network_identity_cannot_be_hot_reloaded() {
+        use rauha_common::zone::NetworkMode;
+        for (old, new) in [
+            (NetworkMode::Isolated, NetworkMode::Host),
+            (
+                NetworkMode::External {
+                    namespace: "/run/netns/a".into(),
+                },
+                NetworkMode::External {
+                    namespace: "/run/netns/b".into(),
+                },
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let reg = test_registry(&tmp);
+            let mut policy = ZonePolicy::default();
+            policy.network.mode = old.clone();
+            reg.create_zone("network", ZoneType::NonGlobal, policy.clone())
+                .await
+                .unwrap();
+            policy.network.mode = new;
+            assert!(matches!(
+                reg.apply_policy("network", policy).await,
+                Err(RauhaError::InvalidPolicy(_))
+            ));
+            assert_eq!(
+                reg.get_zone("network").await.unwrap().policy.network.mode,
+                old
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn apply_policy_updates_metadata() {
         let tmp = TempDir::new().unwrap();
         let reg = test_registry(&tmp);
@@ -1782,6 +1967,200 @@ mod tests {
 
         let zone = reg.get_zone("pol").await.unwrap();
         assert_eq!(zone.policy.resources.pids_max, 999);
+    }
+
+    #[tokio::test]
+    async fn policy_failures_restore_before_thaw_or_leave_execution_frozen() {
+        for (fail_metadata, fail_restore) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let tmp = TempDir::new().unwrap();
+            let backend = Arc::new(MockBackend::new());
+            let reg = test_registry_with_backend(&tmp, backend.clone());
+            let old = ZonePolicy::default();
+            reg.create_zone("rollback", ZoneType::NonGlobal, old.clone())
+                .await
+                .unwrap();
+            backend.policy_calls.lock().unwrap().clear();
+            backend.restore_fails.store(fail_restore, Ordering::SeqCst);
+            if fail_metadata {
+                reg.metadata
+                    .fail_next_zone_write
+                    .store(true, Ordering::SeqCst);
+            } else {
+                backend.policy_failures.store(true, Ordering::SeqCst);
+            }
+            let mut new = old.clone();
+            new.resources.pids_max = 999;
+            assert!(reg.apply_policy("rollback", new).await.is_err());
+            assert_eq!(
+                reg.get_zone("rollback")
+                    .await
+                    .unwrap()
+                    .policy
+                    .resources
+                    .pids_max,
+                old.resources.pids_max
+            );
+            assert_eq!(backend.frozen.load(Ordering::SeqCst), fail_restore);
+            let mut expected = vec![
+                "freeze".into(),
+                "apply:999".into(),
+                format!("enforce:{}", old.resources.pids_max),
+            ];
+            if !fail_restore {
+                expected.push("thaw".into());
+                assert_eq!(
+                    backend.effective_pids.load(Ordering::SeqCst),
+                    old.resources.pids_max
+                );
+            }
+            assert_eq!(*backend.policy_calls.lock().unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_container_cleanup_retains_metadata_for_retry() {
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(MockBackend::new());
+        let reg = test_registry_with_backend(&tmp, backend.clone());
+        reg.create_zone("cleanup", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        let container = reg
+            .create_container("cleanup", make_spec("held"))
+            .await
+            .unwrap();
+        backend.delete_fails.store(true, Ordering::SeqCst);
+        assert!(reg.delete_container(&container.id, true).await.is_err());
+        assert!(reg.metadata.get_container(&container.id).unwrap().is_some());
+        assert!(reg
+            .container_handles
+            .read()
+            .await
+            .contains_key(&container.id));
+        backend.delete_fails.store(false, Ordering::SeqCst);
+        reg.delete_container(&container.id, true).await.unwrap();
+        assert!(reg.metadata.get_container(&container.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_create_persistence_cleans_executor_or_retains_retry_metadata() {
+        for cleanup_fails in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let backend = Arc::new(MockBackend::new());
+            let reg = test_registry_with_backend(&tmp, backend.clone());
+            reg.create_zone("cleanup", ZoneType::NonGlobal, ZonePolicy::default())
+                .await
+                .unwrap();
+            backend.delete_fails.store(cleanup_fails, Ordering::SeqCst);
+            reg.metadata
+                .fail_next_container_write
+                .store(true, Ordering::SeqCst);
+            assert!(reg
+                .create_container("cleanup", make_spec("failed"))
+                .await
+                .is_err());
+            assert_eq!(backend.delete_attempts.load(Ordering::SeqCst), 1);
+            let retained = reg.metadata.list_containers(None).unwrap();
+            assert_eq!(retained.len(), usize::from(cleanup_fails));
+            if cleanup_fails {
+                backend.delete_fails.store(false, Ordering::SeqCst);
+                reg.delete_container(&retained[0].id, true).await.unwrap();
+                assert!(reg.metadata.list_containers(None).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_update_requires_successful_freeze_and_no_creation_time_changes() {
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(MockBackend::new());
+        let reg = test_registry_with_backend(&tmp, backend.clone());
+        let old = ZonePolicy::default();
+        reg.create_zone("admission", ZoneType::NonGlobal, old.clone())
+            .await
+            .unwrap();
+        backend.policy_calls.lock().unwrap().clear();
+        backend.freeze_fails.store(true, Ordering::SeqCst);
+        let mut update = old.clone();
+        update.resources.pids_max = 999;
+        assert!(reg.apply_policy("admission", update.clone()).await.is_err());
+        assert_eq!(*backend.policy_calls.lock().unwrap(), ["freeze"]);
+        assert_eq!(
+            reg.get_zone("admission")
+                .await
+                .unwrap()
+                .policy
+                .resources
+                .pids_max,
+            old.resources.pids_max
+        );
+
+        backend.freeze_fails.store(false, Ordering::SeqCst);
+        backend.policy_calls.lock().unwrap().clear();
+        reg.create_container("admission", make_spec("existing"))
+            .await
+            .unwrap();
+        update.syscalls.deny.push("getpid".into());
+        assert!(matches!(
+            reg.apply_policy("admission", update).await,
+            Err(RauhaError::InvalidPolicy(_))
+        ));
+        assert!(backend.policy_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn policy_update_excludes_creation_deletion_and_other_updates() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(MockBackend::new());
+        let reg = Arc::new(test_registry_with_backend(&tmp, backend.clone()));
+        reg.create_zone("serialized", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        backend.policy_calls.lock().unwrap().clear();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *backend.policy_barrier.lock().unwrap() = Some((entered_tx, release_rx));
+        let r = reg.clone();
+        let applying = tokio::spawn(async move {
+            let mut policy = ZonePolicy::default();
+            policy.resources.pids_max = 999;
+            r.apply_policy("serialized", policy).await
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut creating = Box::pin(reg.create_container("serialized", make_spec("waiting")));
+        let mut deleting = Box::pin(reg.delete_zone("serialized", true));
+        let mut updating = Box::pin(reg.apply_policy("serialized", ZonePolicy::default()));
+        assert!(poll_fn(|cx| Poll::Ready(creating.as_mut().poll(cx).is_pending())).await);
+        assert!(poll_fn(|cx| Poll::Ready(deleting.as_mut().poll(cx).is_pending())).await);
+        assert!(poll_fn(|cx| Poll::Ready(updating.as_mut().poll(cx).is_pending())).await);
+        assert!(backend.frozen.load(Ordering::SeqCst));
+        assert_ne!(
+            reg.metadata
+                .get_zone("serialized")
+                .unwrap()
+                .unwrap()
+                .policy
+                .resources
+                .pids_max,
+            999
+        );
+        drop(deleting);
+        drop(updating);
+        release_tx.send(()).unwrap();
+        applying.await.unwrap().unwrap();
+        creating.await.unwrap();
+        assert!(!backend.frozen.load(Ordering::SeqCst));
+        assert_eq!(
+            *backend.policy_calls.lock().unwrap(),
+            ["freeze", "apply:999", "thaw"]
+        );
     }
 
     #[tokio::test]

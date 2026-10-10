@@ -8,6 +8,7 @@
 //! Architecturally, the kernel enforcement piece belongs behind the Syva
 //! boundary: Rauha creates zones; Syva makes the Linux kernel respect them.
 
+mod bundle;
 mod cgroup;
 mod ebpf;
 mod enforcer;
@@ -28,6 +29,7 @@ pub fn cleanup_network(bridge: &str) {
     }
 }
 
+use rauha_ebpf_common::InodeKey;
 use std::collections::{BTreeSet, HashMap};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -89,8 +91,16 @@ fn lock_backend<'a, T>(mutex: &'a Mutex<T>, name: &str) -> Result<MutexGuard<'a,
     })
 }
 
+#[derive(Clone, Default)]
+struct ContainerOwnership {
+    inodes: Vec<InodeKey>,
+    cgroup_id: Option<u64>,
+}
+
 /// Linux isolation backend using eBPF LSM + namespaces + cgroups.
 pub struct LinuxBackend {
+    // The cgroup hierarchy and host networking are global, even with a custom API socket.
+    _kernel_lock: std::fs::File,
     root: String,
     /// Linux kernel enforcement adapter.
     enforcer: LinuxEnforcer,
@@ -103,8 +113,8 @@ pub struct LinuxBackend {
     /// Maps zone name → Uuid for reverse lookups.
     zone_name_map: Mutex<HashMap<String, Uuid>>,
     /// Registered inodes per zone, for correct cleanup without re-walking.
-    /// Key is zone name, value is the inode list registered in INODE_ZONE_MAP.
-    registered_inodes: Mutex<HashMap<String, Vec<u64>>>,
+    /// Retain container identity and cgroup IDs until cleanup is confirmed.
+    registered_inodes: Mutex<HashMap<String, HashMap<Uuid, ContainerOwnership>>>,
     /// Last admitted policy per zone. Container construction must use the same
     /// capability allow-list that was installed in the kernel policy map.
     zone_policies: Mutex<HashMap<String, ZonePolicy>>,
@@ -119,7 +129,23 @@ pub struct LinuxBackend {
 
 impl LinuxBackend {
     pub fn new(root: &str, config: std::sync::Arc<crate::config::DaemonConfig>) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let kernel_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open("/run/rauha-enforcement.lock")
+            .map_err(|e| {
+                RauhaError::BackendError(format!("cannot open kernel ownership lock: {e}"))
+            })?;
+        kernel_lock.try_lock().map_err(|e| {
+            RauhaError::BackendError(format!("another daemon owns Rauha kernel enforcement: {e}"))
+        })?;
         let cgroup = CgroupManager::new()?;
+        cgroup.freeze_existing_zones()?;
         let (subnet_octets, prefix_len) = config.subnet_octets()?;
         let ip_allocator = IpAllocator::new(subnet_octets, prefix_len);
         let bridge = config.network.bridge.as_str();
@@ -148,6 +174,7 @@ impl LinuxBackend {
         nftables::ensure_nat(&subnet_cidr, bridge)?;
 
         Ok(Self {
+            _kernel_lock: kernel_lock,
             root: root.into(),
             enforcer,
             cgroup,
@@ -231,8 +258,12 @@ impl LinuxBackend {
         }
 
         let shim_bin = find_shim_binary()?;
-
-        let mut child = Command::new(&shim_bin)
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let membership = self.enforcer.duplicate_membership_fd()?;
+        let membership_fd = membership.as_raw_fd();
+        let mut command = Command::new(&shim_bin);
+        command
             .env("RAUHA_RUN_DIR", &self.config.paths.run_dir)
             .env("RAUHA_CRUN", &self.config.executor.crun)
             .env(
@@ -257,11 +288,23 @@ impl LinuxBackend {
             .arg(&socket_path)
             .arg("--rootfs-root")
             .arg(&rootfs_root)
-            .spawn()
-            .map_err(|e| RauhaError::ShimError {
-                zone: zone_name.into(),
-                message: format!("failed to spawn shim: {e}"),
-            })?;
+            .arg("--membership-fd")
+            .arg(membership_fd.to_string());
+        // Only async-signal-safe fcntl runs between fork and exec. The shim
+        // immediately restores CLOEXEC before launching any workload helper.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(membership_fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|e| RauhaError::ShimError {
+            zone: zone_name.into(),
+            message: format!("failed to spawn shim: {e}"),
+        })?;
+        drop(membership);
 
         // Dropping Child does not reap it. Every deleted temporary zone would
         // otherwise leave a zombie owned by the long-running daemon.
@@ -295,8 +338,35 @@ impl LinuxBackend {
         ShimConnection::new(self.shim_socket_path(zone_name)).send_request(request)
     }
 
+    fn refresh_shim_membership(&self, zone_name: &str) -> Result<()> {
+        use std::os::fd::AsFd;
+        let refresh = || -> anyhow::Result<()> {
+            let descriptor = self.enforcer.duplicate_membership_fd()?;
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(self.shim_socket_path(zone_name))?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            rauha_common::shim::encode_to(&mut stream, &ShimRequest::RefreshMembership)?;
+            rauha_common::shim::descriptor::send(&stream, descriptor.as_fd())?;
+            match rauha_common::shim::decode_from::<ShimResponse>(&mut stream)? {
+                ShimResponse::Ok => Ok(()),
+                response => anyhow::bail!("shim rejected membership refresh: {response:?}"),
+            }
+        };
+        refresh().map_err(|error| RauhaError::ShimError {
+            zone: zone_name.into(),
+            message: format!("membership refresh failed: {error:#}"),
+        })
+    }
+
     /// Apply nftables forward rules for a zone based on its network policy.
     fn apply_nftables_for_zone(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
+        if matches!(policy.network.mode, NetworkMode::External { .. }) {
+            return nftables::apply_external_rules(
+                &namespace::netns_path(&zone.name, &self.config.paths.netns_dir),
+                &policy.network,
+            );
+        }
         let veth_name = network::veth_host_name_for(&zone.name);
 
         match nftables::apply_zone_rules(&zone.name, &veth_name, &policy.network) {
@@ -328,23 +398,56 @@ impl LinuxBackend {
     }
 
     fn restore_rootfs_inodes(&self, zone_name: &str, zone_id: u32) -> Result<()> {
-        let expected = collect_zone_rootfs_inodes(&self.root, zone_name)?;
-        if expected.is_empty() && self.cgroup.zone_has_processes(zone_name)? {
+        let expected = collect_container_rootfs_inodes(&self.root, zone_name)?;
+        if expected.values().all(Vec::is_empty) && self.cgroup.zone_has_processes(zone_name)? {
             return Err(RauhaError::BackendError(
                 "live recovered zone has no discoverable rootfs inodes".into(),
             ));
         }
-        let inserted = self.enforcer.insert_inodes(&expected, zone_id)?;
-        lock_backend(&self.registered_inodes, "registered_inodes")?
-            .insert(zone_name.to_string(), inserted.clone());
-        if inserted.len() != expected.len() {
-            return Err(RauhaError::BackendError(format!(
-                "rootfs inode recovery incomplete: registered {} of {}",
-                inserted.len(),
-                expected.len()
-            )));
+        for (container, inodes) in expected {
+            let inserted = self.enforcer.insert_inodes(&inodes, zone_id)?;
+            lock_backend(&self.registered_inodes, "registered_inodes")?
+                .entry(zone_name.to_string())
+                .or_default()
+                .insert(
+                    container,
+                    ContainerOwnership {
+                        inodes: inserted.clone(),
+                        cgroup_id: container_cgroup_id(zone_name, &container)?,
+                    },
+                );
+            if inserted.len() != inodes.len() {
+                return Err(RauhaError::BackendError(format!(
+                    "rootfs inode recovery incomplete: registered {} of {}",
+                    inserted.len(),
+                    inodes.len()
+                )));
+            }
         }
         Ok(())
+    }
+
+    fn unregister_container_inodes(&self, zone_name: &str, container: &Uuid) -> Result<()> {
+        let mut registered = lock_backend(&self.registered_inodes, "registered_inodes")?;
+        if let Some(containers) = registered.get_mut(zone_name) {
+            if let Some(cgroup_id) = containers
+                .get(container)
+                .and_then(|record| record.cgroup_id)
+            {
+                self.enforcer.remove_zone_member(cgroup_id)?;
+            }
+            let unique = unshared_container_inodes(containers, container);
+            self.enforcer.remove_inodes(&unique)?;
+            containers.remove(container);
+        }
+        Ok(())
+    }
+
+    fn remove_container_storage(&self, zone_name: &str, container: &Uuid) -> Result<()> {
+        self.unregister_container_inodes(zone_name, container)?;
+        let zone_root = Path::new(&self.root).join("zones").join(zone_name);
+        rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_root)
+            .remove_container(&zone_root.join("containers").join(container.to_string()))
     }
 
     /// Sync the ZONE_ALLOWED_COMMS BPF map for defense-in-depth.
@@ -410,21 +513,21 @@ enum InodeCheckPlan {
     /// Attest this set against the kernel map; `note` explains which set
     /// (live: disk-collected; idle: recorded).
     Attest {
-        set: std::collections::BTreeSet<u64>,
+        set: std::collections::BTreeSet<InodeKey>,
         note: &'static str,
     },
 }
 
 fn inode_ownership_check_plan(
     has_processes: bool,
-    disk: std::result::Result<&[u64], &str>,
-    recorded: &[u64],
+    disk: std::result::Result<&[InodeKey], &str>,
+    recorded: &[InodeKey],
 ) -> InodeCheckPlan {
-    let recorded: std::collections::BTreeSet<u64> = recorded.iter().copied().collect();
+    let recorded: std::collections::BTreeSet<InodeKey> = recorded.iter().copied().collect();
     match disk {
         Err(e) => InodeCheckPlan::DiskError(e.to_string()),
         Ok(disk) => {
-            let disk: std::collections::BTreeSet<u64> = disk.iter().copied().collect();
+            let disk: std::collections::BTreeSet<InodeKey> = disk.iter().copied().collect();
             if has_processes {
                 if disk.is_empty() {
                     return InodeCheckPlan::FailLive;
@@ -783,25 +886,105 @@ fn writable_copy_dir(rootfs: &Path, relative: &str) -> PathBuf {
         .join(relative.replace('/', "_"))
 }
 
-fn collect_zone_rootfs_inodes(root: &str, zone_name: &str) -> Result<Vec<u64>> {
+fn remove_zone_storage(root: &str, zone_name: &str) -> Result<()> {
+    let zone = Path::new(root).join("zones").join(zone_name);
+    let snapshotter = rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone);
+    match std::fs::read_dir(zone.join("containers")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    return Err(RauhaError::BackendError(
+                        "unexpected non-directory in container storage".into(),
+                    ));
+                }
+                snapshotter.remove_container(&entry.path())?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    match std::fs::remove_dir_all(zone) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn collect_zone_rootfs_inodes(root: &str, zone_name: &str) -> Result<Vec<InodeKey>> {
+    Ok(collect_container_rootfs_inodes(root, zone_name)?
+        .into_values()
+        .flatten()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+fn container_cgroup_id(zone_name: &str, container: &Uuid) -> Result<Option<u64>> {
+    let path = Path::new("/sys/fs/cgroup/rauha.slice")
+        .join(format!("zone-{zone_name}"))
+        .join(container.to_string());
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.ino())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn unshared_container_inodes(
+    containers: &HashMap<Uuid, ContainerOwnership>,
+    deleting: &Uuid,
+) -> Vec<InodeKey> {
+    let retained: BTreeSet<_> = containers
+        .iter()
+        .filter(|(id, _)| *id != deleting)
+        .flat_map(|(_, record)| record.inodes.iter().copied())
+        .collect();
+    containers
+        .get(deleting)
+        .into_iter()
+        .flat_map(|record| record.inodes.iter())
+        .copied()
+        .filter(|key| !retained.contains(key))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn collect_container_rootfs_inodes(
+    root: &str,
+    zone_name: &str,
+) -> Result<HashMap<Uuid, Vec<InodeKey>>> {
     let containers = PathBuf::from(root)
         .join("zones")
         .join(zone_name)
         .join("containers");
     if !containers.exists() {
-        return Ok(Vec::new());
+        return Ok(HashMap::new());
     }
 
     let mut inodes = BTreeSet::new();
+    let mut collected = HashMap::new();
     let entries = std::fs::read_dir(&containers).map_err(|e| RauhaError::RootfsError {
         message: format!("failed to enumerate {}: {e}", containers.display()),
     })?;
     for entry in entries {
-        let container = entry
-            .map_err(|e| RauhaError::RootfsError {
-                message: format!("failed to enumerate {}: {e}", containers.display()),
-            })?
-            .path();
+        let entry = entry.map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to enumerate {}: {e}", containers.display()),
+        })?;
+        if !entry.file_type()?.is_dir() {
+            return Err(RauhaError::RootfsError {
+                message: "unexpected non-directory in container storage".into(),
+            });
+        }
+        let id = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| Uuid::parse_str(name).ok())
+            .ok_or_else(|| RauhaError::RootfsError {
+                message: "invalid container directory identity".into(),
+            })?;
+        let container = entry.path();
         let merged = container.join("merged");
         let legacy = container.join("rootfs");
         let rootfs = if merged.is_dir() {
@@ -820,9 +1003,11 @@ fn collect_zone_rootfs_inodes(root: &str, zone_name: &str) -> Result<Vec<u64>> {
                 ),
             });
         }
-        inodes.extend(maps::collect_rootfs_inodes(&rootfs, remaining)?);
+        let container_inodes = maps::collect_rootfs_inodes(&rootfs, remaining)?;
+        inodes.extend(container_inodes.iter().copied());
+        collected.insert(id, container_inodes);
     }
-    Ok(inodes.into_iter().collect())
+    Ok(collected)
 }
 
 /// Find the rauha-shim binary.
@@ -858,6 +1043,9 @@ fn find_shim_binary() -> Result<PathBuf> {
 }
 
 impl IsolationBackend for LinuxBackend {
+    fn set_zone_frozen(&self, zone: &ZoneHandle, frozen: bool) -> Result<()> {
+        self.cgroup.set_frozen(&zone.name, frozen)
+    }
     fn shim_request(&self, zone_name: &str, request: &ShimRequest) -> Result<ShimResponse> {
         LinuxBackend::shim_request(self, zone_name, request)
     }
@@ -889,6 +1077,7 @@ impl IsolationBackend for LinuxBackend {
                 self.cgroup.create_zone_cgroup(&zone.name)?
             };
             recovered_cgroup_id = Some(cgroup_id);
+            self.cgroup.set_frozen(&zone.name, true)?;
             self.cgroup.apply_resources(&zone.name, &policy.resources)?;
 
             if let Some(ref net_state) = zone.network_state {
@@ -918,7 +1107,9 @@ impl IsolationBackend for LinuxBackend {
                 ip_marked = true;
             }
 
-            if policy.network.mode != NetworkMode::Host {
+            if matches!(policy.network.mode, NetworkMode::External { .. }) {
+                namespace::verify_imported_netns(&zone.name, &self.config.paths.netns_dir)?;
+            } else if policy.network.mode != NetworkMode::Host {
                 if !namespace::netns_exists(&zone.name, &self.config.paths.netns_dir) {
                     match namespace::create_netns(&zone.name, &self.config.paths.netns_dir) {
                         Ok(()) => self.clear_degradation(&zone.name, "netns")?,
@@ -953,6 +1144,9 @@ impl IsolationBackend for LinuxBackend {
             self.enforcer
                 .add_zone_member(cgroup_id, zone_id, zone_type)?;
             membership_installed = true;
+            for (child, _) in self.cgroup.container_cgroups(&zone.name)? {
+                self.enforcer.add_child_zone_member(cgroup_id, child)?;
+            }
             match self.restore_rootfs_inodes(&zone.name, zone_id) {
                 Ok(()) => {}
                 Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
@@ -965,6 +1159,16 @@ impl IsolationBackend for LinuxBackend {
             self.apply_nftables_for_zone(zone, policy)?;
             lock_backend(&self.zone_policies, "zone_policies")?
                 .insert(zone.name.clone(), policy.clone());
+            if self.shim_socket_path(&zone.name).exists() {
+                // A surviving shim still holds the old daemon's map. Replace
+                // that authority before any recovered workload is thawed.
+                self.refresh_shim_membership(&zone.name)?;
+            } else if self.cgroup.zone_has_processes(&zone.name)? {
+                return Err(RauhaError::ShimError {
+                    zone: zone.name.clone(),
+                    message: "live recovered zone has no shim to refresh".into(),
+                });
+            }
             Ok(())
         })();
 
@@ -979,10 +1183,17 @@ impl IsolationBackend for LinuxBackend {
                 tracing::warn!(zone = zone.name, %e, "recovery failed; drained live workloads before rolling back enforcement");
             }
             if let Some(cgroup_id) = recovered_cgroup_id {
+                for (child, _) in self.cgroup.container_cgroups(&zone.name)? {
+                    self.enforcer.remove_zone_member(child)?;
+                }
                 let _ = self.enforcer.remove_zone_member(cgroup_id);
             }
             if let Ok(mut registered) = lock_backend(&self.registered_inodes, "registered_inodes") {
-                if let Some(inodes) = registered.remove(&zone.name) {
+                if let Some(containers) = registered.remove(&zone.name) {
+                    let inodes: Vec<_> = containers
+                        .into_values()
+                        .flat_map(|record| record.inodes)
+                        .collect();
                     let _ = self.enforcer.remove_inodes(&inodes);
                 }
             }
@@ -1012,6 +1223,7 @@ impl IsolationBackend for LinuxBackend {
         let cgroup_id = recovered_cgroup_id.expect("successful recovery resolved a cgroup");
 
         tracing::info!(zone = zone.name, zone_id, cgroup_id, "zone recovered");
+        self.cgroup.set_frozen(&zone.name, false)?;
         Ok(())
     }
 
@@ -1043,6 +1255,48 @@ impl IsolationBackend for LinuxBackend {
                     }
                 }
             }
+        }
+
+        // Storage is only disposable after executor absence is established.
+        match std::fs::read_dir(Path::new(&self.root).join("zones")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    let zone_name = name.to_str().ok_or_else(|| {
+                        RauhaError::BackendError("invalid orphan zone directory name".into())
+                    })?;
+                    if known_names.contains(zone_name) || live_orphans.contains(zone_name) {
+                        continue;
+                    }
+                    if !entry.file_type()?.is_dir() {
+                        return Err(RauhaError::BackendError(
+                            "unexpected non-directory in zone storage".into(),
+                        ));
+                    }
+                    if self.cgroup.zone_cgroup_exists(zone_name)
+                        && self.cgroup.zone_has_processes(zone_name)?
+                    {
+                        continue;
+                    }
+                    if self.shim_socket_path(zone_name).exists() {
+                        match self.shim_request(zone_name, &ShimRequest::Shutdown) {
+                            Ok(ShimResponse::Ok) => {}
+                            response => {
+                                tracing::warn!(
+                                    zone = zone_name,
+                                    ?response,
+                                    "retaining orphan storage: shim shutdown unconfirmed"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    remove_zone_storage(&self.root, zone_name)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
 
         // Clean up orphaned network namespaces.
@@ -1117,7 +1371,17 @@ impl IsolationBackend for LinuxBackend {
         };
 
         // Step 2: Create network namespace + veth with IP assignment.
-        let net_state = if config.policy.network.mode != NetworkMode::Host {
+        let net_state = if let NetworkMode::External { namespace: source } =
+            &config.policy.network.mode
+        {
+            if let Err(error) =
+                namespace::import_netns(&config.name, &self.config.paths.netns_dir, source)
+            {
+                rollback_zone("external-network-namespace", None);
+                return Err(error);
+            }
+            None
+        } else if config.policy.network.mode != NetworkMode::Host {
             // Allocate an IP for this zone.
             let ip_state = match (|| -> Result<ZoneNetworkState> {
                 let mut alloc = lock_backend(&self.ip_allocator, "ip_allocator")?;
@@ -1206,6 +1470,17 @@ impl IsolationBackend for LinuxBackend {
 
     fn destroy_zone(&self, zone: &ZoneHandle) -> Result<()> {
         tracing::info!(zone = zone.name, "destroying zone");
+        let mut child_memberships: BTreeSet<u64> = self
+            .cgroup
+            .container_cgroups(&zone.name)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        if let Some(containers) =
+            lock_backend(&self.registered_inodes, "registered_inodes")?.get(&zone.name)
+        {
+            child_memberships.extend(containers.values().filter_map(|record| record.cgroup_id));
+        }
 
         // Shut down shim if running.
         if self.shim_socket_path(&zone.name).exists() {
@@ -1217,13 +1492,17 @@ impl IsolationBackend for LinuxBackend {
         // A failed teardown must leave live workloads enforced. Drain and
         // remove the cgroup before deleting any BPF membership or policy.
         self.cgroup.drain_zone(&zone.name)?;
+        for child in child_memberships {
+            self.enforcer.remove_zone_member(child)?;
+        }
         self.cgroup.destroy_zone_cgroup(&zone.name)?;
+        remove_zone_storage(&self.root, &zone.name)?;
 
         // The cgroup is now gone, so stale cleanup state cannot make a live
         // workload fail open.
         let zone_id = self.remove_zone_id(&zone.id)?;
         // Remove stored inodes from BPF map (uses stored list, no re-walk).
-        let stored_inodes = self
+        let stored_inodes: Vec<_> = self
             .registered_inodes
             .lock()
             .map_err(|_| {
@@ -1234,7 +1513,10 @@ impl IsolationBackend for LinuxBackend {
                 RauhaError::BackendError("linux backend state poisoned: registered_inodes".into())
             })?
             .remove(&zone.name)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_values()
+            .flat_map(|record| record.inodes)
+            .collect();
 
         if let Some(zone_id) = zone_id {
             if !stored_inodes.is_empty() {
@@ -1307,50 +1589,7 @@ impl IsolationBackend for LinuxBackend {
     }
 
     fn hot_reload_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
-        admit_linux_policy(
-            policy,
-            &self.enforcer.skipped_hooks(),
-            &self.config.policy.safe_writable_roots,
-        )?;
-        tracing::info!(zone = zone.name, "hot-reloading policy");
-
-        let previous = lock_backend(&self.zone_policies, "zone_policies")?
-            .get(&zone.name)
-            .cloned()
-            .ok_or_else(|| {
-                RauhaError::BackendError(format!("zone {} has no policy to reload", zone.name))
-            })?;
-        let zone_id = self.get_zone_id(&zone.id)?.ok_or_else(|| {
-            RauhaError::BackendError(format!("zone {} has no kernel identifier", zone.name))
-        })?;
-
-        let update = (|| -> Result<()> {
-            self.enforcer.hot_reload_policy(zone_id, policy)?;
-            self.sync_bpf_allowed_comms(zone_id, &policy.network)?;
-            self.apply_nftables_for_zone(zone, policy)?;
-            self.cgroup.apply_resources(&zone.name, &policy.resources)?;
-            Ok(())
-        })();
-        if let Err(error) = update {
-            if let Err(e) = self.enforcer.hot_reload_policy(zone_id, &previous) {
-                tracing::error!(%e, zone = zone.name, "failed to restore BPF policy after rejected reload");
-            }
-            if let Err(e) = self.sync_bpf_allowed_comms(zone_id, &previous.network) {
-                tracing::error!(%e, zone = zone.name, "failed to restore cross-zone permissions after rejected reload");
-            }
-            if let Err(e) = self.apply_nftables_for_zone(zone, &previous) {
-                tracing::error!(%e, zone = zone.name, "failed to restore network policy after rejected reload");
-            }
-            if let Err(e) = self.cgroup.apply_resources(&zone.name, &previous.resources) {
-                tracing::error!(%e, zone = zone.name, "failed to restore resources after rejected reload");
-            }
-            return Err(error);
-        }
-
-        lock_backend(&self.zone_policies, "zone_policies")?
-            .insert(zone.name.clone(), policy.clone());
-
-        Ok(())
+        self.enforce_policy(zone, policy)
     }
 
     fn create_container(&self, zone: &ZoneHandle, spec: &ContainerSpec) -> Result<ContainerHandle> {
@@ -1364,117 +1603,137 @@ impl IsolationBackend for LinuxBackend {
         self.ensure_shim(&zone.name)?;
 
         let container_id = Uuid::new_v4();
-        let policy = lock_backend(&self.zone_policies, "zone_policies")?
-            .get(&zone.name)
-            .cloned()
-            .ok_or_else(|| {
-                RauhaError::BackendError(format!(
-                    "zone {} has no admitted policy; refusing container creation",
-                    zone.name
-                ))
-            })?;
-        let capabilities = oci_capabilities(&policy)?;
-
-        // Prepare rootfs for this container.
-        // If overlay_layers is available, mount overlayfs (O(1) creation).
-        // Otherwise, fall back to copying the base rootfs.
-        let container_dir = PathBuf::from(&self.root)
-            .join("zones")
-            .join(&zone.name)
-            .join("containers")
-            .join(container_id.to_string());
-
-        let rootfs_dir = if let Some(ref overlay_layers) = spec.overlay_layers {
-            let snapshotter = rauha_oci::snapshotter::OverlayfsSnapshotter::new(
-                &PathBuf::from(&self.root).join("zones").join(&zone.name),
-            );
-            snapshotter.mount_overlay(&container_id.to_string(), overlay_layers, &container_dir)?
-        } else if let Some(ref base_rootfs) = spec.rootfs_path {
-            let rootfs_dir = container_dir.join("rootfs");
-            copy_dir_recursive(base_rootfs, &rootfs_dir)?;
-            rootfs_dir
-        } else {
-            let rootfs_dir = container_dir.join("rootfs");
-            std::fs::create_dir_all(&rootfs_dir).map_err(|e| RauhaError::RootfsError {
-                message: format!("failed to create rootfs dir: {e}"),
-            })?;
-            rootfs_dir
-        };
-
-        // Write resolv.conf for DNS resolution inside the container.
-        let resolv_conf_path = rootfs_dir.join("etc").join("resolv.conf");
-        if let Some(parent) = resolv_conf_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let resolv_content = crate::network::dns::generate_resolv_conf_with_fallback(
-            &self.config.network.dns_fallback,
-        );
-        if let Err(e) = std::fs::write(&resolv_conf_path, &resolv_content) {
-            tracing::warn!(%e, "failed to write resolv.conf — DNS may not work inside container");
-        }
-
-        // Generate OCI runtime spec.
-        use oci_spec::runtime::{LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType};
-        let mut namespaces = vec![
-            LinuxNamespaceBuilder::default()
-                .typ(LinuxNamespaceType::Mount)
-                .build()
-                .unwrap(),
-            LinuxNamespaceBuilder::default()
-                .typ(LinuxNamespaceType::Uts)
-                .build()
-                .unwrap(),
-            LinuxNamespaceBuilder::default()
-                .typ(LinuxNamespaceType::Ipc)
-                .build()
-                .unwrap(),
-            LinuxNamespaceBuilder::default()
-                .typ(LinuxNamespaceType::Pid)
-                .build()
-                .unwrap(),
-            LinuxNamespaceBuilder::default()
-                .typ(LinuxNamespaceType::Cgroup)
-                .build()
-                .unwrap(),
-        ];
-        if policy.network.mode != NetworkMode::Host {
-            namespaces.push(
-                LinuxNamespaceBuilder::default()
-                    .typ(LinuxNamespaceType::Network)
-                    .path(namespace::netns_path(
-                        &zone.name,
-                        &self.config.paths.netns_dir,
+        let mut shim_requested = false;
+        let creation = (|| {
+            let policy = lock_backend(&self.zone_policies, "zone_policies")?
+                .get(&zone.name)
+                .cloned()
+                .ok_or_else(|| {
+                    RauhaError::BackendError(format!(
+                        "zone {} has no admitted policy; refusing container creation",
+                        zone.name
                     ))
+                })?;
+            let capabilities = oci_capabilities(&policy)?;
+
+            // Prepare rootfs for this container.
+            // If overlay_layers is available, mount overlayfs (O(1) creation).
+            // Otherwise, fall back to copying the base rootfs.
+            let container_dir = PathBuf::from(&self.root)
+                .join("zones")
+                .join(&zone.name)
+                .join("containers")
+                .join(container_id.to_string());
+
+            let rootfs_dir = if spec.oci_spec_json.is_some() {
+                let source = spec.rootfs_path.as_ref().ok_or_else(|| {
+                    RauhaError::BackendError("imported bundle has no rootfs".into())
+                })?;
+                let merged = container_dir.join("merged");
+                std::fs::create_dir_all(&merged)
+                    .map_err(|e| RauhaError::BackendError(e.to_string()))?;
+                nix::mount::mount(
+                    Some(source.as_path()),
+                    &merged,
+                    None::<&str>,
+                    nix::mount::MsFlags::MS_BIND,
+                    None::<&str>,
+                )
+                .map_err(|e| RauhaError::RootfsError {
+                    message: format!("cannot bind containerd rootfs: {e}"),
+                })?;
+                merged
+            } else if let Some(ref overlay_layers) = spec.overlay_layers {
+                let snapshotter = rauha_oci::snapshotter::OverlayfsSnapshotter::new(
+                    &PathBuf::from(&self.root).join("zones").join(&zone.name),
+                );
+                snapshotter.mount_overlay(
+                    &container_id.to_string(),
+                    overlay_layers,
+                    &container_dir,
+                )?
+            } else if let Some(ref base_rootfs) = spec.rootfs_path {
+                let rootfs_dir = container_dir.join("rootfs");
+                copy_dir_recursive(base_rootfs, &rootfs_dir)?;
+                rootfs_dir
+            } else {
+                let rootfs_dir = container_dir.join("rootfs");
+                std::fs::create_dir_all(&rootfs_dir).map_err(|e| RauhaError::RootfsError {
+                    message: format!("failed to create rootfs dir: {e}"),
+                })?;
+                rootfs_dir
+            };
+
+            // Write resolv.conf for DNS resolution inside the container.
+            let resolv_content = crate::network::dns::generate_resolv_conf_with_fallback(
+                &self.config.network.dns_fallback,
+            );
+            if spec.oci_spec_json.is_none() {
+                rauha_oci::rootfs::write_resolv_conf(&rootfs_dir, resolv_content.as_bytes())?;
+            }
+
+            // Generate OCI runtime spec.
+            use oci_spec::runtime::{LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType};
+            let mut namespaces = vec![
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Mount)
                     .build()
                     .unwrap(),
-            );
-        }
-        let mut linux = LinuxBuilder::default()
-            .namespaces(namespaces)
-            .devices(oci_devices(&policy)?)
-            .build()
-            .map_err(|e| {
-                RauhaError::BackendError(format!("failed to build OCI Linux spec: {e}"))
-            })?;
-        // Brokered syscalls need the shim's seccomp listener socket; it
-        // lives next to the shim socket in the configured runtime dir.
-        let listener_path = if policy.syscalls.broker.is_empty() {
-            None
-        } else {
-            Some(
-                PathBuf::from(&self.config.paths.run_dir)
-                    .join(format!("broker-{container_id}.sock")),
-            )
-        };
-        if let Some(seccomp) = oci_seccomp(&policy, listener_path.as_deref())? {
-            linux.set_seccomp(Some(seccomp));
-        }
-        let mounts = oci_mounts(
-            &policy,
-            &rootfs_dir,
-            &self.config.policy.safe_writable_roots,
-        )?;
-        let runtime_spec = serde_json::to_value(
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Uts)
+                    .build()
+                    .unwrap(),
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Ipc)
+                    .build()
+                    .unwrap(),
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Pid)
+                    .build()
+                    .unwrap(),
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Cgroup)
+                    .build()
+                    .unwrap(),
+            ];
+            if policy.network.mode != NetworkMode::Host {
+                namespaces.push(
+                    LinuxNamespaceBuilder::default()
+                        .typ(LinuxNamespaceType::Network)
+                        .path(namespace::netns_path(
+                            &zone.name,
+                            &self.config.paths.netns_dir,
+                        ))
+                        .build()
+                        .unwrap(),
+                );
+            }
+            let mut linux = LinuxBuilder::default()
+                .namespaces(namespaces)
+                .devices(oci_devices(&policy)?)
+                .build()
+                .map_err(|e| {
+                    RauhaError::BackendError(format!("failed to build OCI Linux spec: {e}"))
+                })?;
+            // Brokered syscalls need the shim's seccomp listener socket; it
+            // lives next to the shim socket in the configured runtime dir.
+            let listener_path = if policy.syscalls.broker.is_empty() {
+                None
+            } else {
+                Some(
+                    PathBuf::from(&self.config.paths.run_dir)
+                        .join(format!("broker-{container_id}.sock")),
+                )
+            };
+            if let Some(seccomp) = oci_seccomp(&policy, listener_path.as_deref())? {
+                linux.set_seccomp(Some(seccomp));
+            }
+            let mounts = oci_mounts(
+                &policy,
+                &rootfs_dir,
+                &self.config.policy.safe_writable_roots,
+            )?;
+            let mut runtime_spec = serde_json::to_value(
             oci_spec::runtime::SpecBuilder::default()
                 .annotations(HashMap::from([(
                     "run.oci.seccomp_fail_unknown_syscall".to_string(),
@@ -1518,103 +1777,170 @@ impl IsolationBackend for LinuxBackend {
                 .unwrap(),
         )
         .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
-        let spec_json = serde_json::to_string(&runtime_spec)
-            .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
-
-        // Register rootfs inodes in BPF map for file isolation.
-        // Phase 1: Collect inodes from filesystem (no lock, may be slow for large rootfs).
-        // Phase 2: Insert into BPF map (short lock hold).
-        if let Some(zone_id) = self.get_zone_id(&zone.id)? {
-            let is_overlay = rootfs_dir.ends_with("merged");
-            tracing::debug!(
-                zone = zone.name,
-                path = %rootfs_dir.display(),
-                overlay = is_overlay,
-                "collecting rootfs inodes for BPF file isolation"
-            );
-
-            let registration = (|| -> Result<(Vec<u64>, usize)> {
-                let inodes =
-                    maps::collect_rootfs_inodes(&rootfs_dir, rauha_ebpf_common::MAX_INODES)?;
-                let collected = inodes.len();
-                let inserted = self.enforcer.insert_inodes(&inodes, zone_id)?;
-                Ok((inserted, collected))
-            })();
-
-            match registration {
-                Ok((inserted, collected)) => {
-                    lock_backend(&self.registered_inodes, "registered_inodes")?
-                        .entry(zone.name.clone())
-                        .or_default()
-                        .extend_from_slice(&inserted);
-                    if inserted.len() != collected {
-                        let error = RauhaError::BackendError(format!(
-                            "rootfs inode enforcement incomplete: registered {} of {collected}",
-                            inserted.len()
-                        ));
-                        if policy.admission == PolicyAdmission::Strict {
-                            return Err(error);
-                        }
-                        self.record_degradation(&zone.name, "filesystem:inode_ownership")?;
-                        tracing::warn!(%error, zone = zone.name, container = %container_id, admission = "audit", "file isolation incomplete");
-                    }
-                    tracing::info!(
-                        zone = zone.name,
-                        container = %container_id,
-                        count = inserted.len(),
-                        collected,
-                        "registered container rootfs inodes in BPF map"
-                    );
-                }
-                Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
-                Err(e) => {
-                    self.record_degradation(&zone.name, "filesystem:inode_ownership")?;
-                    tracing::warn!(
-                        %e,
-                        zone = zone.name,
-                        container = %container_id,
-                        admission = "audit",
-                        "failed to register rootfs inodes — file isolation incomplete"
-                    );
-                }
+            if let Some(imported) = &spec.oci_spec_json {
+                let mut imported: serde_json::Value =
+                    serde_json::from_str(imported).map_err(|e| {
+                        RauhaError::InvalidPolicy(format!("invalid imported OCI spec: {e}"))
+                    })?;
+                namespace::pin_pod_namespaces(
+                    &mut imported,
+                    &mut runtime_spec,
+                    &self.cgroup.zone_path(&zone.name),
+                    &container_dir,
+                )?;
+                runtime_spec = bundle::admit(&imported.to_string(), runtime_spec)?;
             }
-        } else {
-            return Err(RauhaError::BackendError(format!(
-                "zone {} has no kernel identifier; refusing container creation",
-                zone.name
-            )));
-        }
+            let spec_json = serde_json::to_string(&runtime_spec)
+                .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
 
-        // Send CreateContainer to shim.
-        let response = self.shim_request(
-            &zone.name,
-            &ShimRequest::CreateContainer {
-                id: container_id.to_string(),
-                spec_json,
-            },
-        )?;
+            // crun creates mountpoint placeholders. Collect only after that setup,
+            // while init is suspended and before it gains workload membership.
+            shim_requested = true;
+            let pid = match self.shim_request(
+                &zone.name,
+                &ShimRequest::CreateContainer {
+                    id: container_id.to_string(),
+                    spec_json,
+                },
+            )? {
+                ShimResponse::Created { pid } => pid,
+                ShimResponse::Error { message } => {
+                    return Err(RauhaError::ShimError {
+                        zone: zone.name.clone(),
+                        message,
+                    })
+                }
+                _ => {
+                    return Err(RauhaError::ShimError {
+                        zone: zone.name.clone(),
+                        message: "unexpected shim response".into(),
+                    })
+                }
+            };
 
-        match response {
-            ShimResponse::Created { pid } => Ok(ContainerHandle {
+            // Register rootfs inodes in BPF map for file isolation.
+            // Phase 1: Collect inodes from filesystem (no lock, may be slow for large rootfs).
+            // Phase 2: Insert into BPF map (short lock hold).
+            if let Some(zone_id) = self.get_zone_id(&zone.id)? {
+                let is_overlay = rootfs_dir.ends_with("merged");
+                tracing::debug!(
+                    zone = zone.name,
+                    path = %rootfs_dir.display(),
+                    overlay = is_overlay,
+                    "collecting rootfs inodes for BPF file isolation"
+                );
+
+                let registration = (|| -> Result<(Vec<InodeKey>, usize)> {
+                    let inodes =
+                        maps::collect_rootfs_inodes(&rootfs_dir, rauha_ebpf_common::MAX_INODES)?;
+                    let collected = inodes.len();
+                    let inserted = self.enforcer.insert_inodes(&inodes, zone_id)?;
+                    Ok((inserted, collected))
+                })();
+
+                match registration {
+                    Ok((inserted, collected)) => {
+                        lock_backend(&self.registered_inodes, "registered_inodes")?
+                            .entry(zone.name.clone())
+                            .or_default()
+                            .insert(
+                                container_id,
+                                ContainerOwnership {
+                                    inodes: inserted.clone(),
+                                    cgroup_id: None,
+                                },
+                            );
+                        if inserted.len() != collected {
+                            let error = RauhaError::BackendError(format!(
+                                "rootfs inode enforcement incomplete: registered {} of {collected}",
+                                inserted.len()
+                            ));
+                            if policy.admission == PolicyAdmission::Strict {
+                                return Err(error);
+                            }
+                            self.record_degradation(&zone.name, "filesystem:inode_ownership")?;
+                            tracing::warn!(%error, zone = zone.name, container = %container_id, admission = "audit", "file isolation incomplete");
+                        }
+                        tracing::info!(
+                            zone = zone.name,
+                            container = %container_id,
+                            count = inserted.len(),
+                            collected,
+                            "registered container rootfs inodes in BPF map"
+                        );
+                    }
+                    Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
+                    Err(e) => {
+                        self.record_degradation(&zone.name, "filesystem:inode_ownership")?;
+                        tracing::warn!(
+                            %e,
+                            zone = zone.name,
+                            container = %container_id,
+                            admission = "audit",
+                            "failed to register rootfs inodes — file isolation incomplete"
+                        );
+                    }
+                }
+            } else {
+                return Err(RauhaError::BackendError(format!(
+                    "zone {} has no kernel identifier; refusing container creation",
+                    zone.name
+                )));
+            }
+
+            let child_id = container_cgroup_id(&zone.name, &container_id)?.ok_or_else(|| {
+                RauhaError::BackendError("created container has no cgroup".into())
+            })?;
+            self.enforcer
+                .add_child_zone_member(zone.platform_id, child_id)?;
+            lock_backend(&self.registered_inodes, "registered_inodes")?
+                .entry(zone.name.clone())
+                .or_default()
+                .entry(container_id)
+                .or_default()
+                .cgroup_id = Some(child_id);
+            Ok(ContainerHandle {
                 id: container_id,
                 zone_id: zone.id,
                 pid,
-                platform_id: 0,
-            }),
-            ShimResponse::Ok => Ok(ContainerHandle {
-                id: container_id,
-                zone_id: zone.id,
-                pid: 0,
-                platform_id: 0,
-            }),
-            ShimResponse::Error { message } => Err(RauhaError::ShimError {
-                zone: zone.name.clone(),
-                message,
-            }),
-            _ => Err(RauhaError::ShimError {
-                zone: zone.name.clone(),
-                message: "unexpected shim response".into(),
-            }),
+                platform_id: child_id,
+            })
+        })();
+        if let Err(error) = creation {
+            let cleanup = if shim_requested {
+                self.delete_container(&zone.name, &container_id)
+            } else {
+                self.remove_container_storage(&zone.name, &container_id)
+            };
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(RauhaError::BackendError(format!(
+                    "container {container_id} creation failed: {error}; resources retained for cleanup retry: {cleanup}"
+                ))),
+            };
+        }
+        creation
+    }
+
+    fn delete_container(&self, zone_name: &str, container_id: &Uuid) -> Result<()> {
+        if let Some(child_id) = container_cgroup_id(zone_name, container_id)? {
+            lock_backend(&self.registered_inodes, "registered_inodes")?
+                .entry(zone_name.to_string())
+                .or_default()
+                .entry(*container_id)
+                .or_default()
+                .cgroup_id = Some(child_id);
+        }
+        match self.shim_request(
+            zone_name,
+            &ShimRequest::DeleteContainer {
+                id: container_id.to_string(),
+            },
+        )? {
+            ShimResponse::Ok => self.remove_container_storage(zone_name, container_id),
+            response => Err(RauhaError::BackendError(format!(
+                "shim did not confirm container deletion: {response:?}"
+            ))),
         }
     }
 
@@ -1808,7 +2134,10 @@ impl IsolationBackend for LinuxBackend {
                 let recorded = lock_backend(&self.registered_inodes, "registered_inodes")?
                     .get(&zone.name)
                     .cloned()
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .into_values()
+                    .flat_map(|record| record.inodes)
+                    .collect::<Vec<_>>();
                 match inode_ownership_check_plan(
                     has_processes,
                     disk.as_deref().map_err(|e| e.as_str()),
@@ -1828,7 +2157,7 @@ impl IsolationBackend for LinuxBackend {
                         (false, format!("failed to enumerate zone rootfs: {e}"))
                     }
                     InodeCheckPlan::Attest { set, note } => {
-                        let list: Vec<u64> = set.into_iter().collect();
+                        let list: Vec<InodeKey> = set.into_iter().collect();
                         let count = list.len();
                         match self.enforcer.inodes_match(&list, zone_id) {
                             Ok(true) => (true, format!("{count} rootfs inodes registered{note}")),
@@ -1852,7 +2181,7 @@ impl IsolationBackend for LinuxBackend {
         // Check 4: requested network isolation and its filtering rules.
         let network_mode = admitted_policy
             .as_ref()
-            .map(|policy| policy.network.mode)
+            .map(|policy| policy.network.mode.clone())
             .unwrap_or(NetworkMode::Isolated);
         let requires_netns = network_mode != NetworkMode::Host;
         let netns_ok =
@@ -1868,11 +2197,14 @@ impl IsolationBackend for LinuxBackend {
                 "network namespace missing — network not isolated".into()
             },
         });
-        let veth_ok = !requires_netns || network::veth_exists(&zone.name);
+        let external = matches!(network_mode, NetworkMode::External { .. });
+        let veth_ok = !requires_netns || external || network::veth_exists(&zone.name);
         checks.push(IsolationCheck {
             name: "network:veth".into(),
             passed: veth_ok,
-            detail: if !requires_netns {
+            detail: if external {
+                "external network links are managed by the orchestrator".into()
+            } else if !requires_netns {
                 "host network mode does not require a veth".into()
             } else if veth_ok {
                 "zone veth exists".into()
@@ -1886,7 +2218,14 @@ impl IsolationBackend for LinuxBackend {
             .as_ref()
             .map(|policy| &policy.network)
             .unwrap_or(&fallback_policy);
-        let nft_ok = nftables::zone_rules_exist(&zone.name, &veth_name, network_policy);
+        let nft_ok = if external {
+            nftables::external_rules_exist(
+                &namespace::netns_path(&zone.name, &self.config.paths.netns_dir),
+                network_policy,
+            )
+        } else {
+            nftables::zone_rules_exist(&zone.name, &veth_name, network_policy)
+        };
         checks.push(IsolationCheck {
             name: "network:nftables".into(),
             passed: nft_ok,
@@ -2048,10 +2387,12 @@ mod tests {
 
     #[test]
     fn inode_check_plan_is_lifecycle_aware() {
+        use rauha_ebpf_common::InodeKey;
         use std::collections::BTreeSet;
 
-        let set = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
-        let inodes = [10u64, 20, 30];
+        let set = |v: &[InodeKey]| v.iter().copied().collect::<BTreeSet<InodeKey>>();
+        let key = |inode| InodeKey { device: 1, inode };
+        let inodes = [key(10), key(20), key(30)];
 
         // Live zone, healthy: disk == recorded → attest the disk set.
         match inode_ownership_check_plan(true, Ok(&inodes), &inodes) {
@@ -2071,7 +2412,7 @@ mod tests {
 
         // Live zone, disk ≠ recorded → mismatch.
         assert!(matches!(
-            inode_ownership_check_plan(true, Ok(&[1, 2]), &inodes),
+            inode_ownership_check_plan(true, Ok(&[key(1), key(2)]), &inodes),
             InodeCheckPlan::Mismatch { .. }
         ));
 
@@ -2307,8 +2648,12 @@ mod tests {
     fn recovery_collects_every_container_rootfs() {
         let root = tempfile::tempdir().unwrap();
         let containers = root.path().join("zones/test/containers");
-        let first = containers.join("one/merged");
-        let second = containers.join("two/rootfs");
+        let first = containers
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("merged");
+        let second = containers
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("rootfs");
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         let first_file = first.join("first");
@@ -2317,7 +2662,66 @@ mod tests {
         std::fs::write(&second_file, b"two").unwrap();
 
         let inodes = collect_zone_rootfs_inodes(root.path().to_str().unwrap(), "test").unwrap();
-        assert!(inodes.contains(&first_file.metadata().unwrap().ino()));
-        assert!(inodes.contains(&second_file.metadata().unwrap().ino()));
+        assert!(inodes
+            .iter()
+            .any(|key| key.inode == first_file.metadata().unwrap().ino()));
+        assert!(inodes
+            .iter()
+            .any(|key| key.inode == second_file.metadata().unwrap().ino()));
+    }
+
+    #[test]
+    fn deleting_one_container_preserves_shared_keys_but_not_other_devices() {
+        use super::{unshared_container_inodes, ContainerOwnership};
+        use rauha_ebpf_common::InodeKey;
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let shared = InodeKey {
+            device: 1,
+            inode: 9,
+        };
+        let unique = InodeKey {
+            device: 2,
+            inode: 9,
+        };
+        let containers = std::collections::HashMap::from([
+            (
+                first,
+                ContainerOwnership {
+                    inodes: vec![shared, unique],
+                    cgroup_id: None,
+                },
+            ),
+            (
+                second,
+                ContainerOwnership {
+                    inodes: vec![shared],
+                    cgroup_id: None,
+                },
+            ),
+        ]);
+        assert_eq!(unshared_container_inodes(&containers, &first), vec![unique]);
+        assert!(unshared_container_inodes(&containers, &second).is_empty());
+        assert!(unshared_container_inodes(&containers, &uuid::Uuid::new_v4()).is_empty());
+    }
+
+    #[test]
+    fn stopped_zone_storage_cleanup_is_retryable_and_rejects_foreign_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let containers = root.path().join("zones/stopped/containers");
+        let container = containers.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(container.join("rootfs")).unwrap();
+        std::fs::write(container.join("rootfs/file"), b"data").unwrap();
+        let sentinel = root.path().join("outside");
+        std::fs::create_dir(&sentinel).unwrap();
+        std::fs::write(sentinel.join("keep"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&sentinel, containers.join("unexpected")).unwrap();
+        assert!(super::remove_zone_storage(root.path().to_str().unwrap(), "stopped").is_err());
+        assert!(sentinel.join("keep").exists());
+        std::fs::remove_file(containers.join("unexpected")).unwrap();
+        super::remove_zone_storage(root.path().to_str().unwrap(), "stopped").unwrap();
+        super::remove_zone_storage(root.path().to_str().unwrap(), "stopped").unwrap();
+        assert!(!containers.exists());
+        assert!(sentinel.join("keep").exists());
     }
 }

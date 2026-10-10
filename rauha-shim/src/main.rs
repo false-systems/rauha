@@ -2,7 +2,13 @@ mod attach;
 mod broker;
 mod container;
 #[cfg(target_os = "linux")]
+mod exec_cgroup;
+#[cfg(target_os = "linux")]
 mod output;
+#[cfg(target_os = "linux")]
+mod process_io;
+#[cfg(target_os = "linux")]
+mod resources;
 mod state;
 
 use std::os::unix::net::UnixListener;
@@ -31,6 +37,11 @@ struct Args {
     /// Root path for zone data (rootfs dirs, etc.).
     #[arg(long)]
     rootfs_root: PathBuf,
+
+    /// Inherited zone-membership map descriptor, supplied only by rauhad.
+    #[cfg(target_os = "linux")]
+    #[arg(long)]
+    membership_fd: i32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -39,6 +50,8 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    #[cfg(target_os = "linux")]
+    crate::exec_cgroup::install_membership_map(take_membership_fd(args.membership_fd)?)?;
 
     tracing::info!(
         zone = %args.zone_name,
@@ -57,18 +70,23 @@ fn main() -> anyhow::Result<()> {
     }
 
     let listener = UnixListener::bind(&args.socket)?;
+    listener.set_nonblocking(true)?;
     tracing::info!(socket = %args.socket.display(), "listening");
 
     let mut shim_state = ShimState::new(args.zone_name.clone(), args.rootfs_root.clone());
 
     // Main loop: accept connections, handle one request per connection.
     // rauhad opens a new connection for each request.
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
                 match shim::decode_from::<ShimRequest>(&mut stream) {
                     Ok(request) => {
-                        let response = handle_request(&mut shim_state, request);
+                        let response = if matches!(request, ShimRequest::RefreshMembership) {
+                            refresh_membership(&mut stream)
+                        } else {
+                            handle_request(&mut shim_state, request)
+                        };
                         if let Err(e) = shim::encode_to(&mut stream, &response) {
                             tracing::error!(%e, "failed to send response");
                         }
@@ -83,8 +101,14 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Reap detached execs even when no daemon RPC is arriving.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => {
                 tracing::error!(%e, "accept error");
+                return Err(e.into());
             }
         }
 
@@ -98,8 +122,82 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn take_membership_fd(fd: i32) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    anyhow::ensure!(
+        fd >= 64,
+        "membership descriptor must be a dedicated inherited fd"
+    );
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // This descriptor is transferred to us at exec and must never leak to crun
+    // or a workload. Take ownership before any subsequent fallible operation.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(owned)
+}
+
+fn refresh_membership(stream: &mut std::os::unix::net::UnixStream) -> ShimResponse {
+    #[cfg(target_os = "linux")]
+    let result = (|| -> anyhow::Result<()> {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let fd = shim::descriptor::receive(stream)?;
+        crate::exec_cgroup::install_membership_map(fd)
+    })();
+    #[cfg(not(target_os = "linux"))]
+    let result: anyhow::Result<()> = {
+        let _ = stream;
+        Err(anyhow::anyhow!("membership descriptors require Linux"))
+    };
+    match result {
+        Ok(()) => ShimResponse::Ok,
+        Err(error) => ShimResponse::Error {
+            message: format!("membership refresh failed: {error:#}"),
+        },
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn inherited_membership_fd_is_owned_and_close_on_exec() {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 64) };
+    assert!(fd >= 64);
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
+    let owned = take_membership_fd(fd).unwrap();
+    assert_ne!(
+        unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
+    drop(owned);
+    assert!(take_membership_fd(0).is_err());
+}
+
 fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
+    state.reap_children();
     match request {
+        ShimRequest::RefreshMembership => ShimResponse::Error {
+            message: "membership refresh requires its authenticated descriptor stream".into(),
+        },
+        ShimRequest::Process {
+            id,
+            exec_id,
+            operation,
+        } => match state.process_operation(&id, &exec_id, operation) {
+            Ok(response) => response,
+            Err(error) => ShimResponse::Error {
+                message: error.to_string(),
+            },
+        },
         ShimRequest::CreateContainer { id, spec_json } => {
             tracing::info!(container = %id, "creating container");
             match state.create_container(&id, &spec_json) {
@@ -134,19 +232,24 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
             },
         },
         ShimRequest::GetState { id } => match state.get_state(&id) {
-            Some((pid, status, exit_code)) => ShimResponse::State {
+            Ok(Some((pid, status, exit_code))) => ShimResponse::State {
                 pid,
                 status,
                 exit_code,
             },
-            None => ShimResponse::Error {
+            Ok(None) => ShimResponse::Error {
                 message: format!("container {id} not found"),
             },
+            Err(error) => ShimResponse::Error {
+                message: error.to_string(),
+            },
         },
-        ShimRequest::Shutdown => {
-            state.request_shutdown();
-            ShimResponse::Ok
-        }
+        ShimRequest::Shutdown => match state.request_shutdown() {
+            Ok(()) => ShimResponse::Ok,
+            Err(e) => ShimResponse::Error {
+                message: e.to_string(),
+            },
+        },
         ShimRequest::DeleteContainer { id } => match state.delete_container(&id) {
             Ok(()) => ShimResponse::Ok,
             Err(e) => ShimResponse::Error {
@@ -195,41 +298,11 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
                 };
             }
             let session_id = uuid::Uuid::new_v4().to_string();
-            let Some(spec_json) = state.spec_json(&id) else {
-                return ShimResponse::Error {
-                    message: format!("container {id} not found"),
-                };
-            };
-            let Some((init_pid, status, _)) = state.get_state(&id) else {
-                return ShimResponse::Error {
-                    message: format!("container {id} not found"),
-                };
-            };
-            if status != "running" || init_pid == 0 {
-                return ShimResponse::Error {
-                    message: format!("container {id} is not running"),
-                };
-            }
-            match attach::fork_and_exec_pty(
-                state.zone_name(),
-                &id,
-                init_pid,
-                &command,
-                &env,
-                spec_json,
-                state.rootfs_root(),
-            ) {
-                Ok((master_fd, _pid)) => {
-                    match attach::serve_attach_session(&id, &session_id, master_fd) {
-                        Ok(socket_path) => ShimResponse::ExecReady {
-                            session_id: Some(session_id),
-                            socket_path,
-                        },
-                        Err(e) => ShimResponse::Error {
-                            message: format!("failed to create attach session: {e}"),
-                        },
-                    }
-                }
+            match state.interactive_exec(&id, &session_id, &command, &env) {
+                Ok(socket_path) => ShimResponse::ExecReady {
+                    session_id: Some(session_id),
+                    socket_path,
+                },
                 Err(e) => ShimResponse::Error {
                     message: format!("exec failed: {e}"),
                 },

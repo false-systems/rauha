@@ -10,9 +10,55 @@ use rauha_ebpf_common::offsets::{
     ResolvedOffset,
 };
 
+mod checks;
+mod gate;
+mod probes;
+
 #[derive(Parser)]
 #[allow(clippy::enum_variant_names)] // Keep the established `build-*` CLI names.
 enum Cli {
+    /// Run a privileged integration scenario against RAUHA_ADDR.
+    Integration { name: String },
+    /// Build and run all privileged Linux security gates (or select a Lima VM).
+    Security,
+    /// Linux-only privileged gate, including workspace quality checks.
+    LinuxGate,
+    #[clap(hide = true)]
+    GateRuntime {
+        #[clap(long)]
+        containerd_only: bool,
+        output_test: PathBuf,
+        oracle_test: PathBuf,
+        oci_test: PathBuf,
+        containerd_test: PathBuf,
+    },
+    #[clap(hide = true)]
+    GateRuntimeInner {
+        #[clap(long)]
+        containerd_only: bool,
+        output_test: PathBuf,
+        oracle_test: PathBuf,
+        oci_test: PathBuf,
+        containerd_test: PathBuf,
+    },
+    /// Prepare or verify a workload across a daemon crash.
+    Recovery { phase: String, state: PathBuf },
+    /// Verify the crun create/enroll/start handoff.
+    OciProbe,
+    /// Measure the installed crun Wasm handler.
+    WasmProbe,
+    /// Run an isolated end-to-end demonstration.
+    Demo,
+    #[clap(hide = true)]
+    CgroupHelper { target: PathBuf },
+    #[clap(hide = true)]
+    FileOpenHelper {
+        cgroup: PathBuf,
+        own: PathBuf,
+        foreign: PathBuf,
+    },
+    #[clap(hide = true)]
+    OracleProxy { executable: PathBuf },
     /// Build the eBPF programs for rauha-ebpf.
     BuildEbpf {
         /// Build in release mode.
@@ -24,6 +70,46 @@ enum Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli {
+        Cli::Integration { name } => checks::run(&name),
+        Cli::Security => gate::dispatch(),
+        Cli::LinuxGate => gate::run(),
+        Cli::GateRuntime {
+            containerd_only,
+            output_test,
+            oracle_test,
+            oci_test,
+            containerd_test,
+        } => gate::isolated_runtime(
+            &output_test,
+            &oracle_test,
+            &oci_test,
+            &containerd_test,
+            containerd_only,
+        ),
+        Cli::GateRuntimeInner {
+            containerd_only,
+            output_test,
+            oracle_test,
+            oci_test,
+            containerd_test,
+        } => gate::runtime(
+            &output_test,
+            &oracle_test,
+            &oci_test,
+            &containerd_test,
+            containerd_only,
+        ),
+        Cli::Recovery { phase, state } => probes::recovery(&phase, &state),
+        Cli::OciProbe => probes::oci(),
+        Cli::WasmProbe => probes::wasm(),
+        Cli::Demo => gate::demo(),
+        Cli::CgroupHelper { target } => checks::cgroup_helper(&target),
+        Cli::FileOpenHelper {
+            cgroup,
+            own,
+            foreign,
+        } => checks::file_open_helper(&cgroup, &own, &foreign),
+        Cli::OracleProxy { executable } => gate::oracle_proxy(&executable),
         Cli::BuildEbpf { release } => build_ebpf(release),
     }
 }

@@ -16,20 +16,25 @@ mod container {
     tonic::include_proto!("rauha.container.v1");
 }
 
+fn test_image() -> String {
+    std::env::var("TEST_IMAGE").unwrap_or_else(|_| "alpine:latest".into())
+}
+
 async fn detached_task(script: &str) -> (String, container::ContainerInfo) {
-    let endpoint =
-        std::env::var("RAUHA_TEST_ENDPOINT").unwrap_or_else(|_| "http://[::1]:9876".into());
-    let mut client = pb::sandbox_service_client::SandboxServiceClient::connect(endpoint.clone())
+    let endpoint = std::env::var("RAUHA_TEST_ENDPOINT")
+        .unwrap_or_else(|_| rauha_common::rpc::DEFAULT_ADDRESS.into());
+    let mut client = rauha_common::rpc::connect(&endpoint)
         .await
+        .map(pb::sandbox_service_client::SandboxServiceClient::new)
         .unwrap();
-    let mut containers =
-        container::container_service_client::ContainerServiceClient::connect(endpoint)
-            .await
-            .unwrap();
+    let mut containers = rauha_common::rpc::connect(&endpoint)
+        .await
+        .map(container::container_service_client::ContainerServiceClient::new)
+        .unwrap();
     let id = format!("task-{}", uuid::Uuid::new_v4());
     let request = pb::RunSandboxRequest {
         task_id: id.clone(),
-        image: "alpine:latest".into(),
+        image: test_image(),
         command: vec!["/bin/sh".into(), "-c".into(), script.into()],
         audit: true,
         ..Default::default()
@@ -108,10 +113,11 @@ fn verify_result_receipts(result: &pb::SandboxResult) {
 #[ignore = "requires isolated Linux daemon and its log directory"]
 async fn transport_disconnect_keeps_result_retrievable() {
     let (id, _) = detached_task("echo before-interruption; sleep 2; echo after-disconnect").await;
-    let endpoint =
-        std::env::var("RAUHA_TEST_ENDPOINT").unwrap_or_else(|_| "http://[::1]:9876".into());
-    let mut client = pb::sandbox_service_client::SandboxServiceClient::connect(endpoint)
+    let endpoint = std::env::var("RAUHA_TEST_ENDPOINT")
+        .unwrap_or_else(|_| rauha_common::rpc::DEFAULT_ADDRESS.into());
+    let mut client = rauha_common::rpc::connect(&endpoint)
         .await
+        .map(pb::sandbox_service_client::SandboxServiceClient::new)
         .unwrap();
     let key = pb::SandboxResultRequest { task_id: id };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -169,11 +175,14 @@ async fn durable_recovery_verify() {
     let saved_result_path = Path::new(&state).with_extension("result");
     let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state).unwrap()).unwrap();
     let id = state["task_id"].as_str().unwrap();
-    let endpoint =
-        std::env::var("RAUHA_TEST_ENDPOINT").unwrap_or_else(|_| "http://[::1]:9876".into());
+    let endpoint = std::env::var("RAUHA_TEST_ENDPOINT")
+        .unwrap_or_else(|_| rauha_common::rpc::DEFAULT_ADDRESS.into());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut client = loop {
-        match pb::sandbox_service_client::SandboxServiceClient::connect(endpoint.clone()).await {
+        match rauha_common::rpc::connect(&endpoint)
+            .await
+            .map(pb::sandbox_service_client::SandboxServiceClient::new)
+        {
             Ok(client) => break client,
             Err(error) => assert!(
                 std::time::Instant::now() < deadline,
@@ -217,7 +226,7 @@ async fn durable_recovery_verify() {
         client
             .run_sandbox(pb::RunSandboxRequest {
                 task_id: id.into(),
-                image: "alpine:latest".into(),
+                image: test_image(),
                 command: vec!["/bin/true".into()],
                 audit: true,
                 ..Default::default()
@@ -227,8 +236,9 @@ async fn durable_recovery_verify() {
             .code(),
         Code::AlreadyExists
     );
-    let mut zones = zone::zone_service_client::ZoneServiceClient::connect(endpoint)
+    let mut zones = rauha_common::rpc::connect(&endpoint)
         .await
+        .map(zone::zone_service_client::ZoneServiceClient::new)
         .unwrap();
     assert_eq!(
         zones
@@ -302,16 +312,17 @@ async fn hostile_output_is_bounded_signed_retrievable_and_cleaned() {
     let logs = Path::new(&run_dir).join("containers");
     std::fs::create_dir_all(&logs).unwrap();
     let before = log_directories(&logs);
-    let endpoint =
-        std::env::var("RAUHA_TEST_ENDPOINT").unwrap_or_else(|_| "http://[::1]:9876".into());
-    let mut client = pb::sandbox_service_client::SandboxServiceClient::connect(endpoint.clone())
+    let endpoint = std::env::var("RAUHA_TEST_ENDPOINT")
+        .unwrap_or_else(|_| rauha_common::rpc::DEFAULT_ADDRESS.into());
+    let mut client = rauha_common::rpc::connect(&endpoint)
         .await
+        .map(pb::sandbox_service_client::SandboxServiceClient::new)
         .unwrap();
     let refused_id = format!("task-{}", uuid::Uuid::new_v4());
     let refused = pb::RunSandboxRequest {
         task_id: refused_id.clone(),
         name: format!("missing-{}", uuid::Uuid::new_v4()),
-        image: "alpine:latest".into(),
+        image: test_image(),
         command: vec!["/bin/true".into()],
         audit: true,
         ..Default::default()
@@ -346,7 +357,7 @@ async fn hostile_output_is_bounded_signed_retrievable_and_cleaned() {
     ] {
         let task_id = format!("task-{}", uuid::Uuid::new_v4());
         let request = pb::RunSandboxRequest {
-            task_id: task_id.clone(), image: "alpine:latest".into(),
+            task_id: task_id.clone(), image: test_image(),
             command: vec!["/bin/sh".into(), "-c".into(), script.into()],
             audit: true, timeout_seconds: 30, ..Default::default()
         };
@@ -404,13 +415,14 @@ async fn broker_records_are_bounded_and_live_only_until_container_deletion(
     logs: &Path,
 ) {
     let command = vec!["/bin/sh".into(), "-c".into(), "echo denied > /tmp/denied; i=0; while [ \"$i\" -lt 12000 ]; do exec 3</etc/hostname; i=$((i+1)); done".into()];
-    let mut zones = zone::zone_service_client::ZoneServiceClient::connect(endpoint.to_string())
+    let mut zones = rauha_common::rpc::connect(endpoint)
         .await
+        .map(zone::zone_service_client::ZoneServiceClient::new)
         .unwrap();
-    let mut containers =
-        container::container_service_client::ContainerServiceClient::connect(endpoint.to_string())
-            .await
-            .unwrap();
+    let mut containers = rauha_common::rpc::connect(endpoint)
+        .await
+        .map(container::container_service_client::ContainerServiceClient::new)
+        .unwrap();
     let name = format!("output-broker-{}", uuid::Uuid::new_v4());
     zones
         .create_zone(zone::CreateZoneRequest {
@@ -424,7 +436,7 @@ async fn broker_records_are_bounded_and_live_only_until_container_deletion(
         .create_container(container::CreateContainerRequest {
             zone_name: name.clone(),
             name: "log-lifetime".into(),
-            image: "alpine:latest".into(),
+            image: test_image(),
             command: command.clone(),
             ..Default::default()
         })
@@ -432,6 +444,15 @@ async fn broker_records_are_bounded_and_live_only_until_container_deletion(
         .unwrap()
         .into_inner()
         .container_id;
+    // A suspended init cannot be stopped through the running-task API;
+    // this genuine shim refusal must reach the caller.
+    assert!(containers
+        .stop_container(container::StopContainerRequest {
+            container_id: id.clone(),
+            timeout_seconds: 10,
+        })
+        .await
+        .is_err());
     containers
         .start_container(container::StartContainerRequest {
             container_id: id.clone(),
@@ -459,14 +480,14 @@ async fn broker_records_are_bounded_and_live_only_until_container_deletion(
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    // A shim refusal must reach the caller, not be turned into a successful stop.
-    assert!(containers
+    // Stopping an already exited task is deliberately idempotent.
+    containers
         .stop_container(container::StopContainerRequest {
             container_id: id.clone(),
             timeout_seconds: 10,
         })
         .await
-        .is_err());
+        .unwrap();
     let dir = logs.join(&id);
     let bytes = std::fs::read(dir.join("broker.log")).unwrap();
     assert!(bytes.len() <= 1024 * 1024);
@@ -501,15 +522,15 @@ async fn broker_records_are_bounded_and_live_only_until_container_deletion(
         !dir.exists(),
         "broker records leaked past container deletion"
     );
-    let mut sandbox =
-        pb::sandbox_service_client::SandboxServiceClient::connect(endpoint.to_string())
-            .await
-            .unwrap();
+    let mut sandbox = rauha_common::rpc::connect(endpoint)
+        .await
+        .map(pb::sandbox_service_client::SandboxServiceClient::new)
+        .unwrap();
     let result = sandbox
         .run_sandbox(pb::RunSandboxRequest {
             task_id: format!("task-{}", uuid::Uuid::new_v4()),
             name: name.clone(),
-            image: "alpine:latest".into(),
+            image: test_image(),
             command,
             timeout_seconds: 30,
             ..Default::default()

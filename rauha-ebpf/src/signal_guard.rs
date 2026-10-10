@@ -6,7 +6,7 @@
 use aya_ebpf::programs::LsmContext;
 
 use crate::{check_cross_zone_task_access, count_decision};
-use rauha_ebpf_common::{PROG_TASK_KILL, HOOK_TASK_KILL};
+use rauha_ebpf_common::{HOOK_TASK_KILL, PROG_TASK_KILL};
 
 /// Called from the task_kill LSM hook.
 ///

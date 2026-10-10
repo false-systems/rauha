@@ -1,4 +1,6 @@
+use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 
 use crate::content::{ContentStore, Digest};
@@ -85,6 +87,8 @@ impl DistributionClient {
             content,
             http: reqwest::Client::builder()
                 .user_agent("rauha/0.1")
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .expect("failed to build HTTP client"),
             tokens: tokio::sync::Mutex::new(HashMap::new()),
@@ -198,7 +202,7 @@ impl DistributionClient {
         registry: &str,
         repository: &str,
         digest: &Digest,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<(), RauhaError>
     where
         F: FnMut(u64, u64),
@@ -219,12 +223,28 @@ impl DistributionClient {
             .authenticated_get_response(&url, registry, repository)
             .await?;
 
+        self.store_blob_response(resp, digest, 4 * 1024 * 1024 * 1024, on_progress)
+            .await
+    }
+
+    async fn store_blob_response<F>(
+        &self,
+        resp: reqwest::Response,
+        digest: &Digest,
+        limit: u64,
+        mut on_progress: F,
+    ) -> Result<(), RauhaError>
+    where
+        F: FnMut(u64, u64),
+    {
         let total = resp.content_length().unwrap_or(0);
+        check_body_size(total, limit)?;
         let mut downloaded: u64 = 0;
 
-        let bytes = {
-            use futures_util::StreamExt;
-            let mut body = Vec::new();
+        let mut file = self.content.temporary_blob()?;
+        let mut hash = Sha256::new();
+        {
+            use tokio_stream::StreamExt;
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| RauhaError::ImagePullError {
@@ -232,21 +252,22 @@ impl DistributionClient {
                     message: format!("download error: {e}"),
                 })?;
                 downloaded += chunk.len() as u64;
-                body.extend_from_slice(&chunk);
+                check_body_size(downloaded, limit)?;
+                hash.update(&chunk);
+                file.write_all(&chunk)?;
                 on_progress(downloaded, total);
             }
-            body
-        };
+        }
 
         // Verify digest.
-        if !digest.validate(&bytes) {
+        if hex::encode(hash.finalize()) != digest.hex() {
             return Err(RauhaError::ContentError {
                 message: format!("digest mismatch for {digest}"),
             });
         }
 
         self.content
-            .put_blob(&bytes)
+            .publish_blob(file, digest)
             .map_err(|e| RauhaError::ContentError {
                 message: format!("failed to store blob: {e}"),
             })?;
@@ -277,12 +298,7 @@ impl DistributionClient {
                 .await?;
 
             if resp.status().is_success() {
-                return resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
-                    RauhaError::ImagePullError {
-                        reference: url.to_string(),
-                        message: format!("read body failed: {e}"),
-                    }
-                });
+                return bounded_body(resp).await;
             }
         }
 
@@ -320,21 +336,9 @@ impl DistributionClient {
                 });
             }
 
-            resp.bytes()
-                .await
-                .map(|b| b.to_vec())
-                .map_err(|e| RauhaError::ImagePullError {
-                    reference: url.to_string(),
-                    message: format!("read body failed: {e}"),
-                })
+            bounded_body(resp).await
         } else if resp.status().is_success() {
-            resp.bytes()
-                .await
-                .map(|b| b.to_vec())
-                .map_err(|e| RauhaError::ImagePullError {
-                    reference: url.to_string(),
-                    message: format!("read body failed: {e}"),
-                })
+            bounded_body(resp).await
         } else {
             Err(RauhaError::ImagePullError {
                 reference: url.to_string(),
@@ -413,11 +417,8 @@ impl DistributionClient {
 
         let url = format!("{realm}?service={service}&scope={scope}");
 
-        let resp: serde_json::Value = self
-            .send_with_rate_limit(self.http.get(&url), &url)
-            .await?
-            .json()
-            .await
+        let response = self.send_with_rate_limit(self.http.get(&url), &url).await?;
+        let resp: serde_json::Value = serde_json::from_slice(&bounded_body(response).await?)
             .map_err(|e| RauhaError::ImagePullError {
                 reference: url,
                 message: format!("invalid token response: {e}"),
@@ -473,6 +474,33 @@ impl DistributionClient {
     }
 }
 
+fn check_body_size(bytes: u64, limit: u64) -> Result<(), RauhaError> {
+    if bytes > limit {
+        return Err(RauhaError::ContentError {
+            message: format!("registry response exceeds {limit} byte limit"),
+        });
+    }
+    Ok(())
+}
+
+async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, RauhaError> {
+    use tokio_stream::StreamExt;
+    check_body_size(response.content_length().unwrap_or(0), 4 * 1024 * 1024)?;
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| RauhaError::ContentError {
+            message: e.to_string(),
+        })?;
+        check_body_size(
+            (body.len() as u64).saturating_add(chunk.len() as u64),
+            4 * 1024 * 1024,
+        )?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn verify_manifest_digest(
     expected: Option<&str>,
     body: &[u8],
@@ -526,15 +554,75 @@ fn extract_param<'a>(header: &'a str, key: &str) -> Option<&'a str> {
     Some(&header[start..end])
 }
 
-// We need futures-util for StreamExt on the bytes stream.
-// reqwest re-exports it, but we reference it explicitly for the streaming blob download.
-mod futures_util {
-    pub use tokio_stream::StreamExt;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    async fn registry_response(response: Vec<u8>) -> reqwest::Response {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let _ = stream.write_all(&response);
+        });
+        reqwest::get(format!("http://{address}/v2/test/blobs/sha256:test"))
+            .await
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn streamed_blobs_verify_digest_and_remove_incomplete_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ContentStore::new(dir.path()).unwrap());
+        let client = DistributionClient::new(store.clone());
+        let digest = Digest::from_data(b"hello world");
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nwrong bytes".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nshort".to_vec(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n8\r\n12345678\r\n0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5000000000\r\n\r\n".to_vec(),
+        ] {
+            assert!(client.store_blob_response(registry_response(response).await, &digest, 11, |_, _| {}).await.is_err());
+            assert!(!store.has_blob(&digest));
+            assert_eq!(std::fs::read_dir(dir.path().join("blobs/sha256")).unwrap().count(), 0);
+        }
+        let response = registry_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n".to_vec()).await;
+        let mut final_progress = 0;
+        client
+            .store_blob_response(response, &digest, 11, |downloaded, _| {
+                final_progress = downloaded
+            })
+            .await
+            .unwrap();
+        assert_eq!(final_progress, 11);
+        assert_eq!(store.get_blob(&digest).unwrap(), b"hello world");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn manifests_reject_oversized_headers_and_chunked_bodies() {
+        let response =
+            registry_response(b"HTTP/1.1 200 OK\r\nContent-Length: 4194305\r\n\r\n".to_vec()).await;
+        assert!(bounded_body(response).await.is_err());
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n400001\r\n".to_vec();
+        response.resize(response.len() + 4 * 1024 * 1024 + 1, b'x');
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert!(bounded_body(registry_response(response).await)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn response_bounds_are_inclusive() {
+        assert!(check_body_size(4, 4).is_ok());
+        assert!(check_body_size(5, 4).is_err());
+    }
 
     #[test]
     fn extract_param_realm() {

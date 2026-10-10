@@ -11,8 +11,10 @@
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, read_kernel_u64, count_decision, emit_deny_event, offsets, ZONE_MEMBERSHIP};
-use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_CGROUP_ATTACH, HOOK_CGROUP_ATTACH};
+use crate::{
+    count_decision, emit_deny_event, lookup_caller_zone, offsets, read_kernel_u64, ZONE_MEMBERSHIP,
+};
+use rauha_ebpf_common::{HOOK_CGROUP_ATTACH, PROG_CGROUP_ATTACH, ZONE_FLAG_GLOBAL};
 
 /// Called from the cgroup_attach_task LSM hook.
 ///
@@ -62,13 +64,27 @@ fn try_cgroup_attach(ctx: &LsmContext) -> Result<i32, i64> {
 
     match dst_zone {
         Some(dst_info) => {
+            if dst_info.flags & rauha_ebpf_common::ZONE_FLAG_RUNTIME_SETUP != 0 {
+                emit_deny_event(
+                    HOOK_CGROUP_ATTACH,
+                    caller.zone_id,
+                    dst_info.zone_id,
+                    dst_cgroup_id,
+                );
+                return Ok(-1);
+            }
             // Destination is a known zone cgroup.
             // Allow if it's the same zone (within-zone subtree move).
             if caller.zone_id == dst_info.zone_id {
                 Ok(0)
             } else {
                 // Moving to a different zone's cgroup → zone escape. Deny.
-                emit_deny_event(HOOK_CGROUP_ATTACH, caller.zone_id, dst_info.zone_id, dst_cgroup_id);
+                emit_deny_event(
+                    HOOK_CGROUP_ATTACH,
+                    caller.zone_id,
+                    dst_info.zone_id,
+                    dst_cgroup_id,
+                );
                 Ok(-1)
             }
         }

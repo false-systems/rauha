@@ -9,7 +9,7 @@ name = "rauha"
 path = "src/main.rs"
 
 [dependencies]
-rauha-common = { path = "../rauha-common" }
+rauha-common = { path = "../rauha-common", features = ["rpc"] }
 rauha-evidence = { path = "../rauha-evidence" }
 sha2 = { workspace = true }
 hex = { workspace = true }

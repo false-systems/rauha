@@ -25,6 +25,14 @@ pub trait IsolationBackend: Send + Sync {
     /// Hot-reload a policy without restarting the zone or its containers.
     fn hot_reload_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()>;
 
+    /// Suspend execution across a multi-store policy transaction. Failure must
+    /// leave execution suspended until reconciliation establishes a full policy.
+    fn set_zone_frozen(&self, _zone: &ZoneHandle, _frozen: bool) -> Result<()> {
+        Err(crate::error::RauhaError::BackendError(
+            "backend cannot safely suspend policy updates".into(),
+        ))
+    }
+
     /// Create a container within a zone.
     fn create_container(&self, zone: &ZoneHandle, spec: &ContainerSpec) -> Result<ContainerHandle>;
 
@@ -33,6 +41,13 @@ pub trait IsolationBackend: Send + Sync {
 
     /// Stop a running container.
     fn stop_container(&self, container: &ContainerHandle) -> Result<()>;
+
+    /// Confirm executor deletion before releasing storage and enforcement ownership.
+    fn delete_container(&self, _zone_name: &str, _container_id: &uuid::Uuid) -> Result<()> {
+        Err(crate::error::RauhaError::BackendError(
+            "backend cannot safely delete container resources".into(),
+        ))
+    }
 
     /// Get runtime statistics for a zone.
     fn zone_stats(&self, zone: &ZoneHandle) -> Result<ZoneStats>;
