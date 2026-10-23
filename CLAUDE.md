@@ -41,7 +41,7 @@ RUST_LOG=rauhad=debug cargo run --bin rauhad
 cargo run --bin rauha -- zone create --name test
 cargo run --bin rauha -- zone list
 cargo run --bin rauha -- image pull alpine:latest
-cargo run --bin rauha -- run --zone test alpine:latest /bin/echo hello
+cargo run --bin rauha -- run --zone test alpine:latest /bin/echo hello   # container run (ps/stop/delete) — not the planned agent `run`
 
 # Agent sandbox task (primary product shape; implemented end to end)
 cargo run --bin rauha -- sandbox --image alpine:latest -- /bin/echo hello
@@ -53,7 +53,10 @@ cargo run --bin rauha -- events                      # stream zone enforcement e
 cargo run --bin rauha -- logs <container>            # stream container stdout/stderr
 cargo run --bin rauha -- exec <container> /bin/sh    # exec in a running container
 
-# Integration tests (Linux only, require root + running rauhad)
+# Integration tests (Linux only, require root + running rauhad). The .sh files are thin
+# launchers; scenarios and assertions live in xtask/src/checks.rs. Equivalent direct form:
+cargo xtask integration sandbox      # image-pull, container-lifecycle, logs, sandbox, broker, exec,
+                                     # host-boundaries, zone-isolation, zone-networking, cgroup-lock
 bash tests/integration/test-image-pull.sh
 bash tests/integration/test-container-lifecycle.sh
 bash tests/integration/test-zone-isolation.sh
@@ -169,6 +172,16 @@ User-facing side (CLI in `rauha-cli/src/commands/trace.rs` + formatting in `outp
 
 `rauhad/src/logs.rs` is separate from the evidence schema: it tails shim-written container log files (`/run/rauha/containers/{id}/stdout.log` and `stderr.log`) in one-shot or follow mode, backing the `rauha logs` command. The runtime dir and every container log (stdout/stderr/broker.log) are root-only (0700 dirs, 0600 files): workload output and judgment records are not for other local users' eyes.
 
+### Run Protocol & Journal (`rauha-common/src/run.rs`, `rauha-evidence/src/journal.rs`, `rauhad/src/server/task_run.rs`)
+
+Groundwork for the planned `rauha run` product, already wired into sandbox tasks. Three layers, each deliberately narrow:
+
+- `run.rs` — pure lifecycle reducer (`RunState`: preparing → running/waiting/frozen/delegated → proving → review → accepted/discarded; `Emitter`). Checks transitions only; performs no action.
+- `journal.rs` — local append-only JSONL storage. The committed prefix is immutable; an uncommitted tail blocks appends until explicit repair; a failed write requires reopen. Single writer. No lifecycle decisions.
+- `task_run.rs` — validate → commit journal → publish state. Journals live at `{root}/runs/<task-id>/journal.jsonl`; the signed receipt carries a `JournalCommitment` (state, manifest hash, sequence, root). Grants no ownership epochs or external-effect authority.
+
+Recovery (`rauhad/src/server/recovery.rs`) resumes from the journal and never replays the command; journal deletion is retryable after crashes.
+
 ### Zone ID Compaction
 
 User-visible zone IDs are UUIDs (stored in redb). Kernel-side zone IDs are compact `u32` (BPF map keys). The Linux backend maintains a `zone_id_map: Mutex<HashMap<Uuid, u32>>` with an atomic counter for allocation. This mapping is rebuilt from redb on daemon startup via `reconcile()`.
@@ -283,7 +296,7 @@ seccomp_notify`) read authoritatively from the file at result time. The
 admitted names live in `rauha_common::zone::BROKERABLE_SYSCALLS` (v1:
 `openat`, `openat2`); a name both denied and brokered is refused at
 policy-build time, and the shim's tests fail if the two crates drift.
-- Tests go in `#[cfg(test)]` modules within source files, not in separate test files.
+- Tests go in `#[cfg(test)]` modules within source files, not in separate test files. The one exception is `containerd-shim-rauha-v2/tests/lifecycle.rs`: a live `ctr` lifecycle test, `#[ignore]`d by default (needs a privileged daemon and an unpacked Alpine fixture), driven by the Linux gate.
 
 ## Workspace Crates
 
