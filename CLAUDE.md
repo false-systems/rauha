@@ -117,5 +117,5 @@ change, delete `{root}/metadata/rauha.redb`.
 
 ## Work tooling
 
-`.toimija/` holds Toimija session packets. Run `toimija verify` before committing.
+Run `toimija enter` at the start and again after HEAD or the branch changes.
 Declare reads outside the packet's workset with `toimija intent "<why>" --scope <path>`.
