@@ -103,9 +103,8 @@ change, delete `{root}/metadata/rauha.redb`.
   capacities, timeouts). They go in the `rauha.toml` schema. The only exempt constants
   are documented security invariants and named physical constants.
 - **No YAML** (TOML only). No premature abstractions, no designing for the future.
-- **Languages:** Rust, or Elixir/Erlang. Never add Python, Go or Node, not even for
-  scripts, CI helpers, tests or glue. A thin shell step in CI is fine; anything with
-  logic is Rust. Existing Python/Node is debt, not precedent.
+- **Languages:** prefer Rust, or Elixir/Erlang. Python and Go are allowed when they
+  clearly fit the job (an existing tool, a library or prior art), not by default.
 - Error messages say what went wrong and what to do (many variants have a `hint`).
 - Linux-only code uses `#[cfg(target_os = "linux")]` with stubs elsewhere.
 - Tests live in `#[cfg(test)]` modules in source files. The exception is
